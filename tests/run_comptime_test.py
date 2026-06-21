@@ -2,9 +2,8 @@ import sys
 import os
 import unittest
 
-# Ensure project root is on sys.path so `src` package is importable when
-# running this script directly from the tests directory.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Ensure the source-layout package is importable when running this script directly.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 
 def main():

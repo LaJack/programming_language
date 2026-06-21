@@ -2,11 +2,11 @@ import sys
 import os
 import unittest
 
-# Ensure project root is importable when running this file directly.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Ensure the source-layout package is importable when running this file directly.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from src.comptime_pass import ComptimePass
-from src.ast_nodes import (
+from jack.comptime_pass import ComptimePass
+from jack.ast_nodes import (
     Declaration,
     Assignment,
     Print,

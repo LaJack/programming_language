@@ -1,8 +1,16 @@
 from typing import Dict, List
-try:
-    from src.ast_nodes import *  # type: ignore
-except Exception:
-    from ast_nodes import *  # type: ignore
+
+from .ast_nodes import (
+    Assignment,
+    CompositeExpression,
+    Declaration,
+    Definition,
+    Expression,
+    Literal,
+    Print,
+    Statement,
+    Variable,
+)
 
 
 class ComptimePass:

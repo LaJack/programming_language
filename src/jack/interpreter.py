@@ -1,8 +1,19 @@
-from typing import Any, Callable, Dict, cast
-try:
-    from src.ast_nodes import *  # type: ignore
-except Exception:
-    from ast_nodes import *  # type: ignore
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Sequence, cast
+
+from .ast_nodes import (
+    Assignment,
+    CompositeExpression,
+    Declaration,
+    Definition,
+    Expression,
+    Field,
+    Literal,
+    Print,
+    Statement,
+    Variable,
+)
+from .parser import parse_sources
 
 
 class SymbolTable:
@@ -94,42 +105,12 @@ class Interpreter:
             obj = getattr(obj, field)
         setattr(obj, fields[-1], value)
 
-# Test the interpreter with sample AST statements
-interpreter = Interpreter()
-interpreter.evaluate([
-    # Int
-    Declaration(False, Variable("x"), "i32"),
-    Declaration(False, Variable("y"), "i32"),
-    Assignment(False, Variable("x"), Literal("i32", "42")),
-    Assignment(False, Variable("y"), Variable("x")),
-    Assignment(False, Variable("y"), Literal("i32", "84")),
-    Print(False,Variable("x")),
-    Print(False,Variable("y")),
-    Print(False, CompositeExpression("+", Variable("x"), Variable("y"))),
 
-    # Point
-    Definition(False, "Point", [Field("x", "i32"), Field("y", "i32")]),
-    Declaration(False, Variable("point"), "Point"),
+def interpret(ast: List[Statement]) -> None:
+    """Interpret an AST."""
+    Interpreter().evaluate(ast)
 
-    Assignment(False, Variable("point.x"), Literal("i32", "5")),
-    Assignment(False, Variable("point.y"), Literal("i32", "10")),
 
-    Print(False, Variable("point.x")),
-    Print(False, Variable("point.y")),
-
-    # Line
-    Definition(False, "Line", [Field("start", "Point"), Field("end", "Point")]),
-    Declaration(False, Variable("line"), "Line"),
-
-    Assignment(False, Variable("line.start.x"), Literal("i32", "50")),
-    Assignment(False, Variable("line.start.y"), Literal("i32", "100")),
-    Assignment(False, Variable("line.end"), Variable("point")),
-
-    Print(False, Variable("line")),
-    Print(False, Variable("line.start")),
-    Print(False, Variable("line.start.x")),
-    Print(False, Variable("line.start.y")),
-    Print(False, Variable("line.end")),
-    Print(False, Variable("line.end.x")),
-    Print(False, Variable("line.end.y")),
-])
+def interpret_sources(sources: Sequence[Path]) -> None:
+    """Parse and interpret source files."""
+    interpret(parse_sources(sources))

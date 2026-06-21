@@ -61,6 +61,10 @@ class Print(Statement):
     expression: Expression
 
 @dataclass
+class ExpressionStatement(Statement):
+    expression: Expression
+
+@dataclass
 class Return(Statement):
     expression: Expression
 

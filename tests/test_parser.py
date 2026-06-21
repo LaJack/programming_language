@@ -8,6 +8,7 @@ from jack.ast_nodes import (
     Assignment,
     CompositeExpression,
     Declaration,
+    ExpressionStatement,
     FunctionCall,
     FunctionDefinition,
     Literal,
@@ -15,7 +16,7 @@ from jack.ast_nodes import (
     Return,
     Variable,
 )
-from jack.parser import parse, parse_sources
+from jack.parser import ParseError, parse, parse_sources
 
 
 class ParserTest(unittest.TestCase):
@@ -50,6 +51,18 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(ast[0].expression.operator, "+")
         self.assertIsInstance(ast[0].expression.second_operand, CompositeExpression)
         self.assertEqual(ast[0].expression.second_operand.operator, "*")
+
+    def test_parse_function_call_expression_statement(self):
+        ast = parse("foo(1);")
+
+        self.assertEqual(len(ast), 1)
+        self.assertIsInstance(ast[0], ExpressionStatement)
+        self.assertIsInstance(ast[0].expression, FunctionCall)
+        self.assertEqual(ast[0].expression.name, "foo")
+
+    def test_top_level_return_is_rejected(self):
+        with self.assertRaises(ParseError):
+            parse("return 1;")
 
 
 if __name__ == "__main__":

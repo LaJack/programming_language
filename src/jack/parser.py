@@ -9,6 +9,7 @@ from .ast_nodes import (
     Assignment,
     CompositeExpression,
     Declaration,
+    ExpressionStatement,
     Expression,
     FunctionCall,
     FunctionDefinition,
@@ -52,6 +53,7 @@ class Parser:
     def __init__(self, tokens: list[Token]):
         self._tokens = tokens
         self._pos = 0
+        self._function_depth = 0
 
     def parse(self) -> list[Statement]:
         statements: list[Statement] = []
@@ -70,6 +72,8 @@ class Parser:
             return [Print(comptime, expression)]
 
         if self._match_keyword("return"):
+            if self._function_depth == 0:
+                raise self._error("'return' is only allowed inside a function")
             expression = self._expression()
             self._consume_value(";", "Expected ';' after return expression")
             return [Return(comptime, expression)]
@@ -78,11 +82,14 @@ class Parser:
             return self._typed_statement(comptime)
 
         if self._check("ID"):
-            target = self._variable_name()
-            self._consume_value("=", "Expected '=' in assignment")
             expression = self._expression()
-            self._consume_value(";", "Expected ';' after assignment")
-            return [Assignment(comptime, Variable(target), expression)]
+            if isinstance(expression, Variable):
+                self._consume_value("=", "Expected '=' in assignment")
+                value = self._expression()
+                self._consume_value(";", "Expected ';' after assignment")
+                return [Assignment(comptime, expression, value)]
+            self._consume_value(";", "Expected ';' after expression statement")
+            return [ExpressionStatement(comptime, expression)]
 
         token = self._peek()
         raise ParseError(f"Unexpected token {token.value!r} at {token.line}:{token.column}")
@@ -95,10 +102,14 @@ class Parser:
             parameters = self._parameters()
             self._consume_value("{", "Expected '{' before function body")
             body: list[Statement] = []
-            while not self._check_value("}"):
-                if self._check("EOF"):
-                    raise ParseError("Unterminated function body")
-                body.extend(self._statement())
+            self._function_depth += 1
+            try:
+                while not self._check_value("}"):
+                    if self._check("EOF"):
+                        raise ParseError("Unterminated function body")
+                    body.extend(self._statement())
+            finally:
+                self._function_depth -= 1
             self._consume_value("}", "Expected '}' after function body")
             return [
                 FunctionDefinition(

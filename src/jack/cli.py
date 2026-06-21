@@ -6,6 +6,7 @@ from typing import Sequence
 
 from .compiler import compile_sources
 from .interpreter import interpret_sources
+from .parser import ParseError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,7 +30,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             interpret_sources(args.sources)
         else:
             compile_sources(args.sources)
-    except NotImplementedError as exc:
+    except (NotImplementedError, ParseError, ValueError, KeyError, OSError) as exc:
         parser.exit(1, f"jack: {exc}\n")
 
     return 0

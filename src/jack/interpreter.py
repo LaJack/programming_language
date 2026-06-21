@@ -6,6 +6,7 @@ from .ast_nodes import (
     CompositeExpression,
     Declaration,
     Definition,
+    ExpressionStatement,
     Expression,
     Field,
     FunctionCall,
@@ -39,6 +40,7 @@ class Interpreter:
             Declaration: self.declare,
             Assignment: self.assign,
             Print: self.print,
+            ExpressionStatement: self.evaluate_expression_statement,
             FunctionDefinition: self.define_function,
         }
         self._functions: Dict[str, FunctionDefinition] = {}
@@ -95,6 +97,10 @@ class Interpreter:
         value = self.evaluate_expression(print_statement.expression)
         print(value)
 
+    def evaluate_expression_statement(self, statement: ExpressionStatement) -> None:
+        """Evaluate an expression for its side effects."""
+        self.evaluate_expression(statement.expression)
+
     def get_variable_value(self, variable: Variable) -> object:
         """Get the value of a variable, supporting dotted access."""
         fields = variable.name.split(".")
@@ -129,8 +135,7 @@ class Interpreter:
 
         argument_values = [self.evaluate_expression(arg) for arg in call.arguments]
         previous_symbols = self._symbols
-        self._symbols = SymbolTable()
-        self._define_builtin_types()
+        self._symbols = self._create_child_symbols(previous_symbols)
 
         try:
             for parameter, value in zip(definition.parameters, argument_values):
@@ -150,6 +155,12 @@ class Interpreter:
         setattr(self._symbols, "i32", int)
         setattr(self._symbols, "f64", float)
         setattr(self._symbols, "string", str)
+
+    def _create_child_symbols(self, parent: SymbolTable) -> SymbolTable:
+        symbols = SymbolTable()
+        for name, value in vars(parent).items():
+            setattr(symbols, name, value)
+        return symbols
 
 
 def interpret(ast: List[Statement]) -> None:

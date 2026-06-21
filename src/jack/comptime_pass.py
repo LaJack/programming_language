@@ -5,9 +5,13 @@ from .ast_nodes import (
     CompositeExpression,
     Declaration,
     Definition,
+    ExpressionStatement,
     Expression,
+    FunctionCall,
+    FunctionDefinition,
     Literal,
     Print,
+    Return,
     Statement,
     Variable,
 )
@@ -32,6 +36,7 @@ class ComptimePass:
         # Variable environment: variable name -> Python value or dict for
         # composite (user-defined) types.
         self._vars: Dict[str, object] = {}
+        self._functions: Dict[str, FunctionDefinition] = {}
 
     def _value_to_literal(self, value: object) -> Literal:
         if isinstance(value, int):
@@ -120,8 +125,55 @@ class ComptimePass:
                 return left_value / right_value
             else:
                 raise ValueError(f"Unsupported operator: {expression.operator}")
+        elif isinstance(expression, FunctionCall):
+            return self._call_function(expression)
         else:
             raise ValueError(f"Unsupported expression type: {expression.__class__}")
+
+    def _define_function(self, definition: FunctionDefinition) -> None:
+        self._functions[definition.name] = definition
+
+    def _call_function(self, call: FunctionCall) -> object:
+        if call.name not in self._functions:
+            raise ValueError(f"Unknown function: {call.name}")
+
+        definition = self._functions[call.name]
+        if len(call.arguments) != len(definition.parameters):
+            raise ValueError(
+                f"Function {call.name} expects {len(definition.parameters)} arguments, "
+                f"got {len(call.arguments)}"
+            )
+
+        argument_values = [self._evaluate_expression(arg) for arg in call.arguments]
+        previous_vars = self._vars.copy()
+
+        try:
+            for parameter, value in zip(definition.parameters, argument_values):
+                self._vars[parameter.name] = value
+
+            for stmt in definition.body:
+                if isinstance(stmt, Return):
+                    return self._evaluate_expression(stmt.expression)
+                self._execute_statement(stmt)
+        finally:
+            self._vars = previous_vars
+
+        return None
+
+    def _execute_statement(self, stmt: Statement) -> None:
+        if isinstance(stmt, Definition):
+            self._define(stmt)
+        elif isinstance(stmt, FunctionDefinition):
+            self._define_function(stmt)
+        elif isinstance(stmt, Declaration):
+            self._declare(stmt)
+        elif isinstance(stmt, Assignment):
+            value = self._evaluate_expression(stmt.value)
+            self._set_variable_value(stmt.variable, value)
+        elif isinstance(stmt, Print):
+            self._evaluate_expression(stmt.expression)
+        elif isinstance(stmt, ExpressionStatement):
+            self._evaluate_expression(stmt.expression)
 
     def run(self, ast: List[Statement]) -> List[Statement]:
         """
@@ -136,16 +188,23 @@ class ComptimePass:
                 # later comptime expressions can use declarations/definitions.
                 if isinstance(stmt, Definition):
                     self._define(stmt)
+                elif isinstance(stmt, FunctionDefinition):
+                    self._define_function(stmt)
                 elif isinstance(stmt, Declaration):
                     self._declare(stmt)
                 elif isinstance(stmt, Assignment):
                     value = self._evaluate_expression(stmt.value)
                     self._set_variable_value(stmt.variable, value)
+                elif isinstance(stmt, ExpressionStatement):
+                    self._evaluate_expression(stmt.expression)
                 new_ast.append(stmt)
             else:
                 # Statement is marked comptime: evaluate/execute and replace.
                 if isinstance(stmt, Definition):
                     self._define(stmt)
+                    # definition is compile-time only; drop from AST
+                elif isinstance(stmt, FunctionDefinition):
+                    self._define_function(stmt)
                     # definition is compile-time only; drop from AST
                 elif isinstance(stmt, Declaration):
                     self._declare(stmt)
@@ -160,6 +219,8 @@ class ComptimePass:
                     value = self._evaluate_expression(stmt.expression)
                     literal = self._value_to_literal(value)
                     new_ast.append(Print(False, literal))
+                elif isinstance(stmt, ExpressionStatement):
+                    self._evaluate_expression(stmt.expression)
                 else:
                     # Unknown statement at compile time: drop it (no runtime side-effects)
                     pass

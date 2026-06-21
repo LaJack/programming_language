@@ -1,0 +1,14 @@
+
+
+
+i32 a 23;
+
+i32 add(comptime i32 left, i32 right)
+{
+    return left + right;
+}
+
+
+i32 b = add(6, a);
+
+print(b);

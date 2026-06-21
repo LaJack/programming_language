@@ -1,6 +1,8 @@
 from typing import Any, Callable, Dict, cast
-
-from ast.ast import *
+try:
+    from src.ast_nodes import *  # type: ignore
+except Exception:
+    from ast_nodes import *  # type: ignore
 
 
 class SymbolTable:
@@ -51,23 +53,23 @@ class Interpreter:
 
     def evaluate_expression(self, expression: Expression) -> object:
         """Evaluate an expression and return its value."""
-        if expression.__class__ == Literal:
-            return (cast(Callable[[str], object], getattr(self._symbols, cast(Literal, expression).type)))(cast(Literal, expression).value)
-        elif expression.__class__ == Variable:
-            return self.get_variable_value(cast(Variable, expression))
-        elif expression.__class__ == CompositeExpression:
-            left_value = self.evaluate_expression(cast(CompositeExpression, expression).first_operand)
-            right_value = self.evaluate_expression(cast(CompositeExpression, expression).second_operand)
-            if cast(CompositeExpression, expression).operator == "+":
+        if isinstance(expression, Literal):
+            return (cast(Callable[[str], object], getattr(self._symbols, expression.type)))(expression.value)
+        elif isinstance(expression, Variable):
+            return self.get_variable_value(expression)
+        elif isinstance(expression, CompositeExpression):
+            left_value = self.evaluate_expression(expression.first_operand)
+            right_value = self.evaluate_expression(expression.second_operand)
+            if expression.operator == "+":
                 return left_value + right_value
-            elif cast(CompositeExpression, expression).operator == "-":
+            elif expression.operator == "-":
                 return left_value - right_value
-            elif cast(CompositeExpression, expression).operator == "*":
+            elif expression.operator == "*":
                 return left_value * right_value
-            elif cast(CompositeExpression, expression).operator == "/":
+            elif expression.operator == "/":
                 return left_value / right_value
             else:
-                raise ValueError(f"Unsupported operator: {cast(CompositeExpression, expression).operator}")
+                raise ValueError(f"Unsupported operator: {expression.operator}")
         else:
             raise ValueError(f"Unsupported expression type: {expression.__class__}")
 
@@ -96,38 +98,38 @@ class Interpreter:
 interpreter = Interpreter()
 interpreter.evaluate([
     # Int
-    Declaration(Variable("x"), "i32"),
-    Declaration(Variable("y"), "i32"),
-    Assignment(Variable("x"), Literal("i32", "42")),
-    Assignment(Variable("y"), Variable("x")),
-    Assignment(Variable("y"), Literal("i32", "84")),
-    Print(Variable("x")),
-    Print(Variable("y")),
-    Print(CompositeExpression("+", Variable("x"), Variable("y"))),
+    Declaration(False, Variable("x"), "i32"),
+    Declaration(False, Variable("y"), "i32"),
+    Assignment(False, Variable("x"), Literal("i32", "42")),
+    Assignment(False, Variable("y"), Variable("x")),
+    Assignment(False, Variable("y"), Literal("i32", "84")),
+    Print(False,Variable("x")),
+    Print(False,Variable("y")),
+    Print(False, CompositeExpression("+", Variable("x"), Variable("y"))),
 
     # Point
-    Definition("Point", [Field("x", "i32"), Field("y", "i32")]),
-    Declaration(Variable("point"), "Point"),
+    Definition(False, "Point", [Field("x", "i32"), Field("y", "i32")]),
+    Declaration(False, Variable("point"), "Point"),
 
-    Assignment(Variable("point.x"), Literal("i32", "5")),
-    Assignment(Variable("point.y"), Literal("i32", "10")),
+    Assignment(False, Variable("point.x"), Literal("i32", "5")),
+    Assignment(False, Variable("point.y"), Literal("i32", "10")),
 
-    Print(Variable("point.x")),
-    Print(Variable("point.y")),
+    Print(False, Variable("point.x")),
+    Print(False, Variable("point.y")),
 
     # Line
-    Definition("Line", [Field("start", "Point"), Field("end", "Point")]),
-    Declaration(Variable("line"), "Line"),
+    Definition(False, "Line", [Field("start", "Point"), Field("end", "Point")]),
+    Declaration(False, Variable("line"), "Line"),
 
-    Assignment(Variable("line.start.x"), Literal("i32", "50")),
-    Assignment(Variable("line.start.y"), Literal("i32", "100")),
-    Assignment(Variable("line.end"), Variable("point")),
+    Assignment(False, Variable("line.start.x"), Literal("i32", "50")),
+    Assignment(False, Variable("line.start.y"), Literal("i32", "100")),
+    Assignment(False, Variable("line.end"), Variable("point")),
 
-    Print(Variable("line")),
-    Print(Variable("line.start")),
-    Print(Variable("line.start.x")),
-    Print(Variable("line.start.y")),
-    Print(Variable("line.end")),
-    Print(Variable("line.end.x")),
-    Print(Variable("line.end.y")),
+    Print(False, Variable("line")),
+    Print(False, Variable("line.start")),
+    Print(False, Variable("line.start.x")),
+    Print(False, Variable("line.start.y")),
+    Print(False, Variable("line.end")),
+    Print(False, Variable("line.end.x")),
+    Print(False, Variable("line.end.y")),
 ])

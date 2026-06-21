@@ -37,17 +37,10 @@ class ComptimePassTest(unittest.TestCase):
         cp = ComptimePass()
         new_ast = cp.run(ast)
 
-        self.assertEqual(len(new_ast), 3)
+        # Comptime statements are executed and dropped; only the declaration
+        # remains in the runtime AST.
+        self.assertEqual(len(new_ast), 1)
         self.assertIsInstance(new_ast[0], Declaration)
-
-        self.assertIsInstance(new_ast[1], Assignment)
-        self.assertIsInstance(new_ast[1].value, Literal)
-        self.assertEqual(new_ast[1].value.type, "i32")
-        self.assertEqual(new_ast[1].value.value, "5")
-
-        self.assertIsInstance(new_ast[2], Print)
-        self.assertIsInstance(new_ast[2].expression, Literal)
-        self.assertEqual(new_ast[2].expression.value, "5")
 
     def test_comptime_assignment_can_call_parsed_function(self):
         ast = parse(
@@ -62,9 +55,11 @@ class ComptimePassTest(unittest.TestCase):
 
         new_ast = ComptimePass().run(ast)
 
-        self.assertIsInstance(new_ast[-1], Assignment)
-        self.assertIsInstance(new_ast[-1].value, Literal)
-        self.assertEqual(new_ast[-1].value.value, "29")
+        # The comptime assignment is executed at compile time and should not
+        # appear in the runtime AST; ensure the declaration for `b` exists
+        # and there is no runtime assignment to `b`.
+        self.assertTrue(any(isinstance(s, Declaration) and s.variable.name == "b" for s in new_ast))
+        self.assertFalse(any(isinstance(s, Assignment) and s.variable.name == "b" for s in new_ast))
 
     def test_function_specialization_creates_specialized_definition(self):
         ast = parse(
@@ -120,12 +115,10 @@ class ComptimePassTest(unittest.TestCase):
 
         new_ast = ComptimePass().run(ast)
 
-        # Expect declaration + transformed assignment with literal 42
-        self.assertEqual(len(new_ast), 2)
+        # Comptime branch should be executed at compile time and dropped; only
+        # the declaration remains.
+        self.assertEqual(len(new_ast), 1)
         self.assertIsInstance(new_ast[0], Declaration)
-        self.assertIsInstance(new_ast[1], Assignment)
-        self.assertIsInstance(new_ast[1].value, Literal)
-        self.assertEqual(new_ast[1].value.value, "42")
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,7 @@ from .ast_nodes import (
     Variable,
 )
 from .parser import parse_sources
+from .comptime_pass import ComptimePass
 
 
 class SymbolTable:
@@ -210,4 +211,8 @@ def interpret(ast: List[Statement]) -> None:
 
 def interpret_sources(sources: Sequence[Path]) -> None:
     """Parse and interpret source files."""
-    interpret(parse_sources(sources))
+    ast = parse_sources(sources)
+    # Run comptime pass before interpretation so `comptime` statements are
+    # evaluated and removed from the AST consistently with the compiler.
+    ast = ComptimePass().run(ast)
+    interpret(ast)

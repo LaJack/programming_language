@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List
+from typing import Dict, List, Set
 
 from .ast_nodes import (
     Assignment,
@@ -22,9 +22,12 @@ from .ast_nodes import (
 class ComptimePass:
     """
     A compile-time pass that evaluates `comptime` statements and returns a
-    transformed AST. This implementation does not call the runtime
-    `Interpreter` directly; instead it keeps a small internal type/variable
-    registry sufficient to evaluate expressions used at compile time.
+    transformed AST. This pass executes all comptime statements (including
+    function calls marked comptime) and drops them from the emitted AST.
+
+    It also collects values of variables that were declared only for comptime
+    use and substitutes those variable occurrences with `Literal`s in the
+    remaining runtime AST.
     """
 
     def __init__(self):
@@ -41,6 +44,13 @@ class ComptimePass:
         self._functions: Dict[str, FunctionDefinition] = {}
         self._specializations: Dict[tuple[str, tuple[tuple[str, str], ...]], str] = {}
         self._pending_specializations: List[FunctionDefinition] = []
+        # Variables that were declared/evaluated only at compile-time and
+        # must not be emitted into the runtime AST.
+        self._comptime_only_vars: Set[str] = set()
+        # Stack of local comptime variable sets for currently executing
+        # comptime function calls. Each entry is a set of parameter names
+        # that are allowed to be assigned during that call.
+        self._local_comptime_vars: List[Set[str]] = []
 
     def _value_to_literal(self, value: object) -> Literal:
         if isinstance(value, int):
@@ -58,7 +68,6 @@ class ComptimePass:
             return 0.0
         if type_name == "string":
             return ""
-        # user-defined type
         type_def = self._types.get(type_name)
         if type_def is None:
             raise ValueError(f"Unknown type: {type_name}")
@@ -91,7 +100,6 @@ class ComptimePass:
             self._vars[parts[0]] = value
             return
         if parts[0] not in self._vars:
-            # If variable wasn't declared, create a simple entry.
             self._vars[parts[0]] = {}
         obj = self._vars[parts[0]]
         for p in parts[1:-1]:
@@ -119,32 +127,32 @@ class ComptimePass:
         elif isinstance(expression, CompositeExpression):
             left_value = self._evaluate_expression(expression.first_operand)
             right_value = self._evaluate_expression(expression.second_operand)
-            if expression.operator == "+":
+            op = expression.operator
+            if op == "+":
                 return left_value + right_value
-            elif expression.operator == "-":
+            if op == "-":
                 return left_value - right_value
-            elif expression.operator == "*":
+            if op == "*":
                 return left_value * right_value
-            elif expression.operator == "/":
+            if op == "/":
                 return left_value / right_value
-            elif expression.operator == "==":
+            if op == "==":
                 return 1 if left_value == right_value else 0
-            elif expression.operator == "!=":
+            if op == "!=":
                 return 1 if left_value != right_value else 0
-            elif expression.operator == "<":
+            if op == "<":
                 return 1 if left_value < right_value else 0
-            elif expression.operator == "<=":
+            if op == "<=":
                 return 1 if left_value <= right_value else 0
-            elif expression.operator == ">":
+            if op == ">":
                 return 1 if left_value > right_value else 0
-            elif expression.operator == ">=":
+            if op == ">=":
                 return 1 if left_value >= right_value else 0
-            elif expression.operator == "&&":
+            if op == "&&":
                 return 1 if (bool(left_value) and bool(right_value)) else 0
-            elif expression.operator == "||":
+            if op == "||":
                 return 1 if (bool(left_value) or bool(right_value)) else 0
-            else:
-                raise ValueError(f"Unsupported operator: {expression.operator}")
+            raise ValueError(f"Unsupported operator: {op}")
         elif isinstance(expression, FunctionCall):
             return self._call_function(expression)
         else:
@@ -170,6 +178,10 @@ class ComptimePass:
         argument_values = [self._evaluate_expression(arg) for arg in call.arguments]
         previous_vars = self._vars.copy()
 
+        # Push local comptime parameter names for the duration of this call.
+        local_params = set(p.name for p in definition.parameters if p.comptime)
+        self._local_comptime_vars.append(local_params)
+
         try:
             for parameter, value in zip(definition.parameters, argument_values):
                 self._vars[parameter.name] = value
@@ -180,45 +192,9 @@ class ComptimePass:
                 self._execute_statement(stmt)
         finally:
             self._vars = previous_vars
+            self._local_comptime_vars.pop()
 
         return None
-
-    def _transform_statement(self, stmt: Statement) -> Statement:
-        if isinstance(stmt, Assignment):
-            return Assignment(
-                stmt.comptime,
-                stmt.variable,
-                self._transform_expression(stmt.value),
-            )
-        if isinstance(stmt, Print):
-            return Print(stmt.comptime, self._transform_expression(stmt.expression))
-        if isinstance(stmt, ExpressionStatement):
-            return ExpressionStatement(
-                stmt.comptime,
-                self._transform_expression(stmt.expression),
-            )
-        if isinstance(stmt, Return):
-            return Return(stmt.comptime, self._transform_expression(stmt.expression))
-        if isinstance(stmt, FunctionDefinition):
-            return FunctionDefinition(
-                stmt.comptime,
-                stmt.return_type,
-                stmt.name,
-                stmt.parameters,
-                [self._transform_statement(body_stmt) for body_stmt in stmt.body],
-            )
-        if isinstance(stmt, If):
-            return If(
-                stmt.comptime,
-                self._transform_expression(stmt.condition),
-                [self._transform_statement(s) for s in stmt.body],
-                [
-                    (self._transform_expression(cond), [self._transform_statement(s) for s in body])
-                    for cond, body in stmt.elifs
-                ],
-                [self._transform_statement(s) for s in stmt.else_body] if stmt.else_body else None,
-            )
-        return stmt
 
     def _transform_expression(
         self,
@@ -245,13 +221,75 @@ class ComptimePass:
             if expression.name in self._functions and self._has_comptime_parameters(
                 self._functions[expression.name]
             ):
-                return self._specialize_call(
-                    FunctionCall(expression.name, transformed_arguments)
-                )
+                return self._specialize_call(FunctionCall(expression.name, transformed_arguments))
             return FunctionCall(expression.name, transformed_arguments)
         return expression
 
+    def _transform_statement_with_substitutions(
+        self, stmt: Statement, substitutions: Dict[str, Literal]
+    ) -> Statement:
+        if isinstance(stmt, Assignment):
+            return Assignment(
+                stmt.comptime,
+                stmt.variable,
+                self._transform_expression(stmt.value, substitutions),
+            )
+        if isinstance(stmt, Print):
+            return Print(stmt.comptime, self._transform_expression(stmt.expression, substitutions))
+        if isinstance(stmt, ExpressionStatement):
+            return ExpressionStatement(
+                stmt.comptime, self._transform_expression(stmt.expression, substitutions)
+            )
+        if isinstance(stmt, Return):
+            return Return(stmt.comptime, self._transform_expression(stmt.expression, substitutions))
+        if isinstance(stmt, FunctionDefinition):
+            return FunctionDefinition(
+                stmt.comptime,
+                stmt.return_type,
+                stmt.name,
+                stmt.parameters,
+                [self._transform_statement_with_substitutions(s, substitutions) for s in stmt.body],
+            )
+        if isinstance(stmt, If):
+            return If(
+                stmt.comptime,
+                self._transform_expression(stmt.condition, substitutions),
+                [self._transform_statement_with_substitutions(s, substitutions) for s in stmt.body],
+                [
+                    (
+                        self._transform_expression(cond, substitutions),
+                        [self._transform_statement_with_substitutions(s, substitutions) for s in body],
+                    )
+                    for cond, body in stmt.elifs
+                ],
+                [self._transform_statement_with_substitutions(s, substitutions) for s in stmt.else_body]
+                if stmt.else_body
+                else None,
+            )
+        return stmt
+
+    def _specialized_name(self, name: str, values: list[tuple[str, str]]) -> str:
+        suffix = "#".join(f"{type_}_{self._sanitize_specialization_value(value)}" for type_, value in values)
+        return f"{name}#{suffix}"
+
+    def _sanitize_specialization_value(self, value: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9_]", "_", value)
+        if sanitized and sanitized[0].isdigit():
+            return sanitized
+        return sanitized or "empty"
+
+    def _append_pending_specializations(self, ast: List[Statement]) -> None:
+        ast.extend(self._pending_specializations)
+        self._pending_specializations = []
+
     def _specialize_call(self, call: FunctionCall) -> FunctionCall:
+        """Create or reuse a specialized version of a function when some
+        parameters are comptime. Returns a FunctionCall to the specialized
+        function with runtime arguments only.
+        """
+        if call.name not in self._functions:
+            raise ValueError(f"Unknown function: {call.name}")
+
         definition = self._functions[call.name]
         if len(call.arguments) != len(definition.parameters):
             raise ValueError(
@@ -277,98 +315,25 @@ class ComptimePass:
             return FunctionCall(self._specializations[key], runtime_arguments)
 
         specialized_name = self._specialized_name(definition.name, comptime_values)
-        specialized_parameters = [
-            parameter for parameter in definition.parameters if not parameter.comptime
-        ]
-        specialized_body = [
-            self._transform_statement_with_substitutions(stmt, substitutions)
-            for stmt in definition.body
-        ]
-        specialized_definition = FunctionDefinition(
-            False,
-            definition.return_type,
-            specialized_name,
-            specialized_parameters,
-            specialized_body,
-        )
+        specialized_parameters = [p for p in definition.parameters if not p.comptime]
+        specialized_body = [self._transform_statement_with_substitutions(s, substitutions) for s in definition.body]
+        specialized_definition = FunctionDefinition(False, definition.return_type, specialized_name, specialized_parameters, specialized_body)
 
         self._specializations[key] = specialized_name
         self._define_function(specialized_definition)
         self._pending_specializations.append(specialized_definition)
         return FunctionCall(specialized_name, runtime_arguments)
 
-    def _transform_statement_with_substitutions(
-        self,
-        stmt: Statement,
-        substitutions: Dict[str, Literal],
-    ) -> Statement:
-        if isinstance(stmt, Assignment):
-            return Assignment(
-                stmt.comptime,
-                stmt.variable,
-                self._transform_expression(stmt.value, substitutions),
-            )
-        if isinstance(stmt, Print):
-            return Print(
-                stmt.comptime,
-                self._transform_expression(stmt.expression, substitutions),
-            )
-        if isinstance(stmt, ExpressionStatement):
-            return ExpressionStatement(
-                stmt.comptime,
-                self._transform_expression(stmt.expression, substitutions),
-            )
-        if isinstance(stmt, Return):
-            return Return(
-                stmt.comptime,
-                self._transform_expression(stmt.expression, substitutions),
-            )
-        if isinstance(stmt, If):
-            return If(
-                stmt.comptime,
-                self._transform_expression(stmt.condition, substitutions),
-                [
-                    self._transform_statement_with_substitutions(s, substitutions)
-                    for s in stmt.body
-                ],
-                [
-                    (
-                        self._transform_expression(cond, substitutions),
-                        [
-                            self._transform_statement_with_substitutions(s, substitutions)
-                            for s in body
-                        ],
-                    )
-                    for cond, body in stmt.elifs
-                ],
-                [
-                    self._transform_statement_with_substitutions(s, substitutions)
-                    for s in stmt.else_body
-                ]
-                if stmt.else_body
-                else None,
-            )
-        return stmt
-
-    def _specialized_name(self, name: str, values: list[tuple[str, str]]) -> str:
-        # Use a forbidden token (`#`) as the separator between the base
-        # function name and the specialization suffix to reduce collision
-        # risk with normal identifiers.
-        suffix = "#".join(
-            f"{type_}_{self._sanitize_specialization_value(value)}"
-            for type_, value in values
-        )
-        return f"{name}#{suffix}"
-
-    def _sanitize_specialization_value(self, value: str) -> str:
-        sanitized = re.sub(r"[^A-Za-z0-9_]", "_", value)
-        if sanitized and sanitized[0].isdigit():
-            return sanitized
-        return sanitized or "empty"
-
-    def _append_pending_specializations(self, ast: List[Statement]) -> None:
-        ast.extend(self._pending_specializations)
-        self._pending_specializations = []
+    def _current_comptime_substitutions(self) -> Dict[str, Literal]:
+        subs: Dict[str, Literal] = {}
+        for name in self._comptime_only_vars:
+            if name in self._vars:
+                value = self._vars[name]
+                try:
+                    subs[name] = self._value_to_literal(value)
+                except ValueError:
+                    continue
+        return subs
 
     def _execute_statement(self, stmt: Statement) -> None:
         if isinstance(stmt, Definition):
@@ -378,10 +343,22 @@ class ComptimePass:
         elif isinstance(stmt, Declaration):
             self._declare(stmt)
         elif isinstance(stmt, Assignment):
+            # If this assignment is marked comptime, ensure the target is a
+            # comptime-declared variable (either a top-level comptime
+            # declaration or a comptime function parameter currently in
+            # scope). Otherwise this is an error.
+            if getattr(stmt, "comptime", False):
+                base = stmt.variable.name.split(".")[0]
+                allowed = base in self._comptime_only_vars or any(base in s for s in self._local_comptime_vars)
+                if not allowed:
+                    raise ValueError(f"Cannot assign to non-comptime variable: {stmt.variable.name}")
             value = self._evaluate_expression(stmt.value)
             self._set_variable_value(stmt.variable, value)
         elif isinstance(stmt, Print):
-            self._evaluate_expression(stmt.expression)
+            # Execute comptime prints immediately during the pass so the user
+            # sees output when compiling.
+            value = self._evaluate_expression(stmt.expression)
+            print(value)
         elif isinstance(stmt, ExpressionStatement):
             self._evaluate_expression(stmt.expression)
         elif isinstance(stmt, If):
@@ -403,56 +380,50 @@ class ComptimePass:
                     self._execute_statement(s)
 
     def run(self, ast: List[Statement]) -> List[Statement]:
-        """
-        Transform the AST by evaluating `comptime` statements. The transformed
-        AST is returned; no runtime `Interpreter` methods are invoked.
-        """
         new_ast: List[Statement] = []
 
         for stmt in ast:
             if not getattr(stmt, "comptime", False):
-                # Keep runtime statements, but update the internal registry so
-                # later comptime expressions can use declarations/definitions.
+                substitutions = self._current_comptime_substitutions()
+
                 if isinstance(stmt, Definition):
                     self._define(stmt)
                 elif isinstance(stmt, FunctionDefinition):
                     self._define_function(stmt)
                     if self._has_comptime_parameters(stmt):
                         continue
-                    transformed_stmt = self._transform_statement(stmt)
+                    transformed_stmt = self._transform_statement_with_substitutions(stmt, substitutions)
                     self._append_pending_specializations(new_ast)
                     new_ast.append(transformed_stmt)
                     continue
                 elif isinstance(stmt, Declaration):
                     self._declare(stmt)
                 elif isinstance(stmt, Assignment):
-                    stmt = self._transform_statement(stmt)
+                    stmt = self._transform_statement_with_substitutions(stmt, substitutions)
                     value = self._evaluate_expression(stmt.value)
                     self._set_variable_value(stmt.variable, value)
                 elif isinstance(stmt, ExpressionStatement):
-                    stmt = self._transform_statement(stmt)
+                    stmt = self._transform_statement_with_substitutions(stmt, substitutions)
                     self._evaluate_expression(stmt.expression)
                 elif isinstance(stmt, Print):
-                    stmt = self._transform_statement(stmt)
+                    stmt = self._transform_statement_with_substitutions(stmt, substitutions)
                 elif isinstance(stmt, If):
-                    stmt = self._transform_statement(stmt)
+                    stmt = self._transform_statement_with_substitutions(stmt, substitutions)
+
                 self._append_pending_specializations(new_ast)
                 new_ast.append(stmt)
             else:
-                # Statement is marked comptime: evaluate/execute and replace.
+                # comptime: execute and do not emit runtime statements
                 if isinstance(stmt, Definition):
                     self._define(stmt)
-                    # definition is compile-time only; drop from AST
                 elif isinstance(stmt, FunctionDefinition):
                     self._define_function(stmt)
-                    # definition is compile-time only; drop from AST
                 elif isinstance(stmt, Declaration):
                     self._declare(stmt)
-                    # drop from AST
+                    self._comptime_only_vars.add(stmt.variable.name)
                 elif isinstance(stmt, If):
-                    # Evaluate comptime if/elif/else and process selected branch
                     cond_val = self._evaluate_expression(stmt.condition)
-                    selected: list[Statement] | None = None
+                    selected: List[Statement] | None = None
                     if cond_val:
                         selected = stmt.body
                     else:
@@ -463,6 +434,8 @@ class ComptimePass:
                     if selected is None:
                         selected = stmt.else_body or []
 
+                    substitutions = self._current_comptime_substitutions()
+
                     for inner in selected:
                         if isinstance(inner, Definition):
                             self._define(inner)
@@ -470,14 +443,17 @@ class ComptimePass:
                             self._define_function(inner)
                         elif isinstance(inner, Declaration):
                             self._declare(inner)
+                            self._comptime_only_vars.add(inner.variable.name)
                         elif isinstance(inner, Assignment):
                             if inner.comptime:
+                                base = inner.variable.name.split(".")[0]
+                                allowed = base in self._comptime_only_vars or any(base in s for s in self._local_comptime_vars)
+                                if not allowed:
+                                    raise ValueError(f"Cannot assign to non-comptime variable: {inner.variable.name}")
                                 value = self._evaluate_expression(inner.value)
-                                literal = self._value_to_literal(value)
                                 self._set_variable_value(inner.variable, value)
-                                new_ast.append(Assignment(False, inner.variable, literal))
                             else:
-                                transformed = self._transform_statement(inner)
+                                transformed = self._transform_statement_with_substitutions(inner, substitutions)
                                 value = self._evaluate_expression(transformed.value)
                                 self._set_variable_value(transformed.variable, value)
                                 self._append_pending_specializations(new_ast)
@@ -485,42 +461,41 @@ class ComptimePass:
                         elif isinstance(inner, Print):
                             if inner.comptime:
                                 value = self._evaluate_expression(inner.expression)
-                                literal = self._value_to_literal(value)
-                                new_ast.append(Print(False, literal))
+                                print(value)
                             else:
-                                transformed = self._transform_statement(inner)
+                                transformed = self._transform_statement_with_substitutions(inner, substitutions)
                                 self._append_pending_specializations(new_ast)
                                 new_ast.append(transformed)
                         elif isinstance(inner, ExpressionStatement):
                             if inner.comptime:
                                 self._evaluate_expression(inner.expression)
                             else:
-                                transformed = self._transform_statement(inner)
+                                transformed = self._transform_statement_with_substitutions(inner, substitutions)
                                 self._evaluate_expression(transformed.expression)
                                 self._append_pending_specializations(new_ast)
                                 new_ast.append(transformed)
                         else:
-                            # For other statements, if they are comptime execute, otherwise transform and append
                             if getattr(inner, "comptime", False):
                                 self._execute_statement(inner)
                             else:
-                                transformed = self._transform_statement(inner)
+                                transformed = self._transform_statement_with_substitutions(inner, substitutions)
                                 self._append_pending_specializations(new_ast)
                                 new_ast.append(transformed)
                 elif isinstance(stmt, Assignment):
+                    if getattr(stmt, "comptime", False):
+                        base = stmt.variable.name.split(".")[0]
+                        allowed = base in self._comptime_only_vars or any(base in s for s in self._local_comptime_vars)
+                        if not allowed:
+                            raise ValueError(f"Cannot assign to non-comptime variable: {stmt.variable.name}")
                     value = self._evaluate_expression(stmt.value)
-                    literal = self._value_to_literal(value)
-                    # assign in comptime environment and append converted assignment
                     self._set_variable_value(stmt.variable, value)
-                    new_ast.append(Assignment(False, stmt.variable, literal))
                 elif isinstance(stmt, Print):
                     value = self._evaluate_expression(stmt.expression)
-                    literal = self._value_to_literal(value)
-                    new_ast.append(Print(False, literal))
+                    print(value)
                 elif isinstance(stmt, ExpressionStatement):
                     self._evaluate_expression(stmt.expression)
                 else:
-                    # Unknown statement at compile time: drop it (no runtime side-effects)
+                    # drop unknown comptime statements
                     pass
 
         return new_ast

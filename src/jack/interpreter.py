@@ -8,6 +8,8 @@ from .ast_nodes import (
     Definition,
     ExpressionStatement,
     Expression,
+        For,
+        While,
     Field,
     FunctionCall,
     FunctionDefinition,
@@ -44,6 +46,8 @@ class Interpreter:
             Print: self.print,
             ExpressionStatement: self.evaluate_expression_statement,
             If: self.if_statement,
+            While: self.while_statement,
+            For: self.for_statement,
             FunctionDefinition: self.define_function,
         }
         self._functions: Dict[str, FunctionDefinition] = {}
@@ -161,6 +165,39 @@ class Interpreter:
             for st in if_stmt.else_body:
                 callback = self._interpreter_functions[st.__class__]
                 callback(st)
+
+    def while_statement(self, while_stmt: While) -> None:
+        cond = self.evaluate_expression(while_stmt.condition)
+        while cond:
+            for st in while_stmt.body:
+                callback = self._interpreter_functions[st.__class__]
+                callback(st)
+            cond = self.evaluate_expression(while_stmt.condition)
+
+    def for_statement(self, for_stmt: For) -> None:
+        # init
+        for s in for_stmt.init:
+            callback = self._interpreter_functions[s.__class__]
+            callback(s)
+
+        # condition
+        if for_stmt.condition is None:
+            cond = 1
+        else:
+            cond = self.evaluate_expression(for_stmt.condition)
+
+        while cond:
+            for st in for_stmt.body:
+                callback = self._interpreter_functions[st.__class__]
+                callback(st)
+            # post
+            for s in for_stmt.post:
+                callback = self._interpreter_functions[s.__class__]
+                callback(s)
+            if for_stmt.condition is None:
+                cond = 1
+            else:
+                cond = self.evaluate_expression(for_stmt.condition)
 
     def call_function(self, call: FunctionCall) -> object:
         """Call a previously registered function."""

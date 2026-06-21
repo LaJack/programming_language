@@ -82,3 +82,17 @@ class If(Statement):
     body: List[Statement]
     elifs: List[Tuple[Expression, List[Statement]]]
     else_body: List[Statement] | None = None
+
+
+@dataclass
+class While(Statement):
+    condition: Expression
+    body: List[Statement]
+
+
+@dataclass
+class For(Statement):
+    init: List[Statement]
+    condition: Expression | None
+    post: List[Statement]
+    body: List[Statement]

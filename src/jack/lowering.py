@@ -7,6 +7,8 @@ from .ast_nodes import (
     Expression,
     ExpressionStatement,
     If,
+    While,
+    For,
     FunctionCall,
     FunctionDefinition,
     Literal,
@@ -31,6 +33,7 @@ from .ir import (
     IRReturn,
     IRStatement,
     IRIf,
+    IRWhile,
     IRVariable,
 )
 
@@ -74,7 +77,11 @@ class Lowerer:
             if isinstance(stmt, (Declaration, FunctionDefinition)):
                 continue
             lowered = self._lower_statement(stmt, locals_)
-            if lowered is not None:
+            if lowered is None:
+                continue
+            if isinstance(lowered, list):
+                body.extend(lowered)
+            else:
                 body.append(lowered)
 
         body.append(IRReturn(IRLiteral("i32", "0")))
@@ -86,7 +93,11 @@ class Lowerer:
 
         for stmt in definition.body:
             lowered = self._lower_statement(stmt, locals_)
-            if lowered is not None:
+            if lowered is None:
+                continue
+            if isinstance(lowered, list):
+                body.extend(lowered)
+            else:
                 body.append(lowered)
 
         if not body or not isinstance(body[-1], IRReturn):
@@ -145,6 +156,57 @@ class Lowerer:
                 else_body = [IRIf(econdition, e_then, else_body)]
 
             return IRIf(condition, then_body, else_body)
+        if isinstance(stmt, While):
+            condition = self._lower_expression(stmt.condition, locals_)
+            body_stmts: list[IRStatement] = []
+            for s in stmt.body:
+                lowered = self._lower_statement(s, locals_)
+                if lowered is None:
+                    continue
+                if isinstance(lowered, list):
+                    body_stmts.extend(lowered)
+                else:
+                    body_stmts.append(lowered)
+            return IRWhile(condition, body_stmts)
+        if isinstance(stmt, For):
+            seq: list[IRStatement] = []
+            # init
+            for s in stmt.init:
+                lowered = self._lower_statement(s, locals_)
+                if lowered is None:
+                    continue
+                if isinstance(lowered, list):
+                    seq.extend(lowered)
+                else:
+                    seq.append(lowered)
+
+            # condition
+            if stmt.condition is None:
+                cond = self._default_literal("i32")
+            else:
+                cond = self._lower_expression(stmt.condition, locals_)
+
+            # body + post
+            body_stmts: list[IRStatement] = []
+            for s in stmt.body:
+                lowered = self._lower_statement(s, locals_)
+                if lowered is None:
+                    continue
+                if isinstance(lowered, list):
+                    body_stmts.extend(lowered)
+                else:
+                    body_stmts.append(lowered)
+            for s in stmt.post:
+                lowered = self._lower_statement(s, locals_)
+                if lowered is None:
+                    continue
+                if isinstance(lowered, list):
+                    body_stmts.extend(lowered)
+                else:
+                    body_stmts.append(lowered)
+
+            seq.append(IRWhile(cond, body_stmts))
+            return seq
         raise LoweringError(f"Unsupported statement: {stmt.__class__.__name__}")
 
     def _lower_expression(

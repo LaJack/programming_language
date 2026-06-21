@@ -17,6 +17,7 @@ from .ir import (
     IRPrint,
     IRReturn,
     IRIf,
+    IRWhile,
     IRVariable,
 )
 
@@ -173,6 +174,42 @@ class LLVMEmitter:
 
             # end label
             self._lines.append(f"{end_label}:")
+            return False
+        if isinstance(statement, IRWhile):
+            loop_cond = f"loopcond{self._label_id}"
+            loop_body = f"loopbody{self._label_id}"
+            loop_end = f"loopend{self._label_id}"
+            self._label_id += 1
+
+            # jump to condition check
+            self._line(f"br label %{loop_cond}")
+
+            # condition
+            self._lines.append(f"{loop_cond}:")
+            cond_val = self._emit_expression(statement.condition)
+            if cond_val.type == "i32":
+                cmp_tmp = self._temp()
+                self._line(f"{cmp_tmp} = icmp ne i32 {cond_val.value}, 0")
+            elif cond_val.type == "f64":
+                cmp_tmp = self._temp()
+                self._line(f"{cmp_tmp} = fcmp one double {cond_val.value}, 0.0")
+            else:
+                raise LLVMEmitError(f"Unsupported condition type: {cond_val.type}")
+
+            self._line(f"br i1 {cmp_tmp}, label %{loop_body}, label %{loop_end}")
+
+            # body
+            self._lines.append(f"{loop_body}:")
+            body_returned = False
+            for st in statement.body:
+                if body_returned:
+                    break
+                body_returned = self._emit_statement(st)
+            if not body_returned:
+                self._line(f"br label %{loop_cond}")
+
+            # end label
+            self._lines.append(f"{loop_end}:")
             return False
         raise LLVMEmitError(f"Unsupported IR statement: {statement.__class__.__name__}")
 

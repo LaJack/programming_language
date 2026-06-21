@@ -20,6 +20,8 @@ from .ast_nodes import (
     Statement,
     Variable,
     If,
+    While,
+    For,
 )
 
 
@@ -116,6 +118,70 @@ class Parser:
                 self._consume_value("}", "Expected '}' after else body")
 
             return [If(comptime, condition, body, elifs, else_body)]
+
+        if self._match_keyword("while"):
+            self._consume_value("(", "Expected '(' after while")
+            condition = self._expression()
+            self._consume_value(")", "Expected ')' after while condition")
+            self._consume_value("{", "Expected '{' before while body")
+            body: list[Statement] = []
+            while not self._check_value("}"):
+                if self._check("EOF"):
+                    raise ParseError("Unterminated while body")
+                body.extend(self._statement())
+            self._consume_value("}", "Expected '}' after while body")
+            return [While(comptime, condition, body)]
+
+        if self._match_keyword("for"):
+            self._consume_value("(", "Expected '(' after for")
+            # init
+            init: list[Statement] = []
+            if not self._check_value(";"):
+                # try typed declaration
+                if self._check("ID") and self._check("ID", offset=1) and self._peek(offset=2).value != "(":
+                    type_name = self._consume("ID", "Expected type name").value
+                    name = self._consume("ID", "Expected identifier").value
+                    decl = Declaration(comptime, Variable(name), type_name)
+                    if self._match_value("="):
+                        expr = self._expression()
+                        assign = Assignment(comptime, Variable(name), expr)
+                        init.extend([decl, assign])
+                    else:
+                        init.append(decl)
+                else:
+                    expr = self._expression()
+                    if isinstance(expr, Variable) and self._match_value("="):
+                        value = self._expression()
+                        init.append(Assignment(comptime, expr, value))
+                    else:
+                        init.append(ExpressionStatement(comptime, expr))
+            self._consume_value(";", "Expected ';' after for init")
+
+            # condition
+            condition: Expression | None = None
+            if not self._check_value(";"):
+                condition = self._expression()
+            self._consume_value(";", "Expected ';' after for condition")
+
+            # post
+            post: list[Statement] = []
+            if not self._check_value(")"):
+                expr = self._expression()
+                if isinstance(expr, Variable) and self._match_value("="):
+                    value = self._expression()
+                    post.append(Assignment(comptime, expr, value))
+                else:
+                    post.append(ExpressionStatement(comptime, expr))
+
+            self._consume_value(")", "Expected ')' after for clauses")
+            self._consume_value("{", "Expected '{' before for body")
+            body: list[Statement] = []
+            while not self._check_value("}"):
+                if self._check("EOF"):
+                    raise ParseError("Unterminated for body")
+                body.extend(self._statement())
+            self._consume_value("}", "Expected '}' after for body")
+            return [For(comptime, init, condition, post, body)]
 
         if self._check("ID") and self._check("ID", offset=1):
             return self._typed_statement(comptime)

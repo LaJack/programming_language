@@ -71,6 +71,12 @@ class IRIf(IRStatement):
 
 
 @dataclass
+class IRWhile(IRStatement):
+    condition: "IRExpression"
+    body: list["IRStatement"]
+
+
+@dataclass
 class IRExpression:
     type: str
 

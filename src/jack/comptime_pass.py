@@ -298,11 +298,14 @@ class ComptimePass:
         return stmt
 
     def _specialized_name(self, name: str, values: list[tuple[str, str]]) -> str:
-        suffix = "__".join(
+        # Use a forbidden token (`#`) as the separator between the base
+        # function name and the specialization suffix to reduce collision
+        # risk with normal identifiers.
+        suffix = "#".join(
             f"{type_}_{self._sanitize_specialization_value(value)}"
             for type_, value in values
         )
-        return f"{name}__{suffix}"
+        return f"{name}#{suffix}"
 
     def _sanitize_specialization_value(self, value: str) -> str:
         sanitized = re.sub(r"[^A-Za-z0-9_]", "_", value)

@@ -41,11 +41,11 @@ class CompilerTest(unittest.TestCase):
         self.assertIn("declare i32 @printf(i8*, ...)", llvm_ir)
         self.assertIn("@a = global i32 0", llvm_ir)
         # comptime specialization creates specialized versions of `add`
-        self.assertIn("define i32 @add__i32_6(i32 %right)", llvm_ir)
-        self.assertIn("define i32 @add__i32_7(i32 %right)", llvm_ir)
+        self.assertIn('define i32 @"add#i32_6"(i32 %right)', llvm_ir)
+        self.assertIn('define i32 @"add#i32_7"(i32 %right)', llvm_ir)
         self.assertIn("define i32 @main()", llvm_ir)
-        self.assertIn("call i32 @add__i32_6(i32", llvm_ir)
-        self.assertIn("call i32 @add__i32_7(i32", llvm_ir)
+        self.assertIn('call i32 @"add#i32_6"(i32', llvm_ir)
+        self.assertIn('call i32 @"add#i32_7"(i32', llvm_ir)
         self.assertIn("@printf", llvm_ir)
 
     @unittest.skipUnless(shutil.which("clang"), "clang is required")

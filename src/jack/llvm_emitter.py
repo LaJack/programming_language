@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from .ir import (
     IRAssignment,
@@ -66,8 +67,9 @@ class LLVMEmitter:
         )
 
     def _emit_global(self, global_: IRGlobal) -> None:
+        name_repr = self._format_global_name(global_.name)
         self._lines.append(
-            f"@{global_.name} = global {self._llvm_type(global_.type)} "
+            f"{name_repr} = global {self._llvm_type(global_.type)} "
             f"{self._literal_value(global_.initializer)}"
         )
 
@@ -78,8 +80,9 @@ class LLVMEmitter:
             f"{self._llvm_type(param.type)} %{param.name}"
             for param in function.parameters
         )
+        name_repr = self._format_global_name(function.name)
         self._lines.append(
-            f"define {self._llvm_type(function.return_type)} @{function.name}({params}) {{"
+            f"define {self._llvm_type(function.return_type)} {name_repr}({params}) {{"
         )
         self._lines.append("entry:")
 
@@ -155,8 +158,9 @@ class LLVMEmitter:
                 for arg in expression.arguments
             )
             temp = self._temp()
+            name_repr = self._format_global_name(expression.name)
             self._line(
-                f"{temp} = call {self._llvm_type(expression.type)} @{expression.name}({args})"
+                f"{temp} = call {self._llvm_type(expression.type)} {name_repr}({args})"
             )
             return EmittedValue(expression.type, temp)
         raise LLVMEmitError(f"Unsupported IR expression: {expression.__class__.__name__}")
@@ -197,8 +201,18 @@ class LLVMEmitter:
         if name in self._locals:
             return self._locals[name]
         if name in self._globals:
-            return f"@{name}"
+            return self._format_global_name(name)
         raise LLVMEmitError(f"Unknown variable: {name}")
+
+    def _format_global_name(self, name: str) -> str:
+        # LLVM identifiers must be quoted if they contain characters that are
+        # not allowed in plain identifiers. Use a simple check and otherwise
+        # emit a quoted name to ensure validity when names contain '#'.
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_.$]*$", name):
+            return f"@{name}"
+        # Escape any double quotes in the name
+        safe = name.replace('"', '\\"')
+        return f'@"{safe}"'
 
     def _literal_value(self, literal: IRLiteral) -> str:
         if literal.type == "i32":

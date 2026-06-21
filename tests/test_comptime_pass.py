@@ -78,7 +78,7 @@ class ComptimePassTest(unittest.TestCase):
 
         new_ast = ComptimePass().run(ast)
 
-        specialized_name = "add__i32_6"
+        specialized_name = "add#i32_6"
 
         specialized_def = None
         for stmt in new_ast:

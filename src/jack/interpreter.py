@@ -8,8 +8,11 @@ from .ast_nodes import (
     Definition,
     Expression,
     Field,
+    FunctionCall,
+    FunctionDefinition,
     Literal,
     Print,
+    Return,
     Statement,
     Variable,
 )
@@ -36,10 +39,11 @@ class Interpreter:
             Declaration: self.declare,
             Assignment: self.assign,
             Print: self.print,
+            FunctionDefinition: self.define_function,
         }
+        self._functions: Dict[str, FunctionDefinition] = {}
 
-        # Define built-in types
-        setattr(self._symbols, "i32", int)
+        self._define_builtin_types()
 
     def evaluate(self, ast: List[Statement]):
         """Evaluate a list of statements from the AST."""
@@ -81,6 +85,8 @@ class Interpreter:
                 return left_value / right_value
             else:
                 raise ValueError(f"Unsupported operator: {expression.operator}")
+        elif isinstance(expression, FunctionCall):
+            return self.call_function(expression)
         else:
             raise ValueError(f"Unsupported expression type: {expression.__class__}")
 
@@ -104,6 +110,46 @@ class Interpreter:
         for field in fields[:-1]:
             obj = getattr(obj, field)
         setattr(obj, fields[-1], value)
+
+    def define_function(self, definition: FunctionDefinition) -> None:
+        """Register a function definition."""
+        self._functions[definition.name] = definition
+
+    def call_function(self, call: FunctionCall) -> object:
+        """Call a previously registered function."""
+        if call.name not in self._functions:
+            raise ValueError(f"Unknown function: {call.name}")
+
+        definition = self._functions[call.name]
+        if len(call.arguments) != len(definition.parameters):
+            raise ValueError(
+                f"Function {call.name} expects {len(definition.parameters)} arguments, "
+                f"got {len(call.arguments)}"
+            )
+
+        argument_values = [self.evaluate_expression(arg) for arg in call.arguments]
+        previous_symbols = self._symbols
+        self._symbols = SymbolTable()
+        self._define_builtin_types()
+
+        try:
+            for parameter, value in zip(definition.parameters, argument_values):
+                setattr(self._symbols, parameter.name, value)
+
+            for statement in definition.body:
+                if isinstance(statement, Return):
+                    return self.evaluate_expression(statement.expression)
+                callback = self._interpreter_functions[statement.__class__]
+                callback(statement)
+        finally:
+            self._symbols = previous_symbols
+
+        return None
+
+    def _define_builtin_types(self) -> None:
+        setattr(self._symbols, "i32", int)
+        setattr(self._symbols, "f64", float)
+        setattr(self._symbols, "string", str)
 
 
 def interpret(ast: List[Statement]) -> None:

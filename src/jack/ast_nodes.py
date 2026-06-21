@@ -1,5 +1,5 @@
 
-from typing import List, Tuple
+from typing import List
 from dataclasses import dataclass
 
 @dataclass
@@ -26,12 +26,23 @@ class Literal(Expression):
     value: str
 
 @dataclass
+class FunctionCall(Expression):
+    name: str
+    arguments: List[Expression]
+
+@dataclass
 class Declaration(Statement):
     variable: Variable
     type: str
 
 @dataclass
 class Field:
+    name: str
+    type: str
+
+@dataclass
+class FunctionParameter:
+    comptime: bool
     name: str
     type: str
 
@@ -48,3 +59,14 @@ class Assignment(Statement):
 @dataclass
 class Print(Statement):
     expression: Expression
+
+@dataclass
+class Return(Statement):
+    expression: Expression
+
+@dataclass
+class FunctionDefinition(Statement):
+    return_type: str
+    name: str
+    parameters: List[FunctionParameter]
+    body: List[Statement]

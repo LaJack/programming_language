@@ -15,7 +15,12 @@ from .ast_nodes import (
     Statement,
     Variable,
 )
-from .compiler import compile_sources, compile_sources_to_llvm_ir
+from .compiler import (
+    CompileError,
+    compile_sources,
+    compile_sources_to_executable,
+    compile_sources_to_llvm_ir,
+)
 from .comptime_pass import ComptimePass
 from .llvm_emitter import LLVMEmitError, emit_llvm
 from .lowering import LoweringError, lower
@@ -41,7 +46,9 @@ __all__ = [
     "Return",
     "Statement",
     "Variable",
+    "CompileError",
     "compile_sources",
+    "compile_sources_to_executable",
     "compile_sources_to_llvm_ir",
     "emit_llvm",
     "interpret",

@@ -5,8 +5,9 @@ Experimental programming language toolkit.
 ## CLI
 
 ```sh
-jack [-i] SOURCE [SOURCE ...]
+jack [-i] [-o OUTPUT] [--emit-llvm] SOURCE [SOURCE ...]
 ```
 
-By default the CLI calls the compiler entry point. Passing `-i` interprets the
-source instead. Source parsing and compilation are not implemented yet.
+By default the CLI compiles sources to a native executable named `a.out`.
+Passing `-i` interprets the source instead, and `--emit-llvm` writes LLVM IR to
+stdout.

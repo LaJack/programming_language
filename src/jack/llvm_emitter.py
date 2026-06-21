@@ -55,6 +55,8 @@ class LLVMEmitter:
     def _emit_runtime_declarations(self) -> None:
         self._lines.extend(
             [
+                'target triple = "x86_64-pc-linux-gnu"',
+                "",
                 '@.fmt_i32 = private unnamed_addr constant [4 x i8] c"%d\\0A\\00"',
                 '@.fmt_f64 = private unnamed_addr constant [4 x i8] c"%f\\0A\\00"',
                 '@.fmt_string = private unnamed_addr constant [4 x i8] c"%s\\0A\\00"',

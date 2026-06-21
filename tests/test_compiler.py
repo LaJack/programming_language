@@ -1,10 +1,13 @@
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from jack.compiler import compile_sources_to_llvm_ir
+from jack.compiler import compile_sources_to_executable, compile_sources_to_llvm_ir
 from jack.ir import IRAssignment, IRCall, IRGlobal
 from jack.lowering import lower
 from jack.parser import parse
@@ -42,6 +45,24 @@ class CompilerTest(unittest.TestCase):
         self.assertIn("define i32 @main()", llvm_ir)
         self.assertIn("call i32 @add(i32 6,", llvm_ir)
         self.assertIn("@printf", llvm_ir)
+
+    @unittest.skipUnless(shutil.which("clang"), "clang is required")
+    def test_compile_sources_to_executable(self):
+        source = os.path.join(os.path.dirname(__file__), "main.lang")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = os.path.join(temp_dir, "main")
+            compile_sources_to_executable([source], executable)
+
+            result = subprocess.run(
+                [executable],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "29")
 
 
 if __name__ == "__main__":

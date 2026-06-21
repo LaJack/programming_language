@@ -13,6 +13,7 @@ from .ast_nodes import (
     Literal,
     Print,
     Return,
+    If,
     Statement,
     Variable,
 )
@@ -126,6 +127,22 @@ class ComptimePass:
                 return left_value * right_value
             elif expression.operator == "/":
                 return left_value / right_value
+            elif expression.operator == "==":
+                return 1 if left_value == right_value else 0
+            elif expression.operator == "!=":
+                return 1 if left_value != right_value else 0
+            elif expression.operator == "<":
+                return 1 if left_value < right_value else 0
+            elif expression.operator == "<=":
+                return 1 if left_value <= right_value else 0
+            elif expression.operator == ">":
+                return 1 if left_value > right_value else 0
+            elif expression.operator == ">=":
+                return 1 if left_value >= right_value else 0
+            elif expression.operator == "&&":
+                return 1 if (bool(left_value) and bool(right_value)) else 0
+            elif expression.operator == "||":
+                return 1 if (bool(left_value) or bool(right_value)) else 0
             else:
                 raise ValueError(f"Unsupported operator: {expression.operator}")
         elif isinstance(expression, FunctionCall):
@@ -189,6 +206,17 @@ class ComptimePass:
                 stmt.name,
                 stmt.parameters,
                 [self._transform_statement(body_stmt) for body_stmt in stmt.body],
+            )
+        if isinstance(stmt, If):
+            return If(
+                stmt.comptime,
+                self._transform_expression(stmt.condition),
+                [self._transform_statement(s) for s in stmt.body],
+                [
+                    (self._transform_expression(cond), [self._transform_statement(s) for s in body])
+                    for cond, body in stmt.elifs
+                ],
+                [self._transform_statement(s) for s in stmt.else_body] if stmt.else_body else None,
             )
         return stmt
 
@@ -295,6 +323,31 @@ class ComptimePass:
                 stmt.comptime,
                 self._transform_expression(stmt.expression, substitutions),
             )
+        if isinstance(stmt, If):
+            return If(
+                stmt.comptime,
+                self._transform_expression(stmt.condition, substitutions),
+                [
+                    self._transform_statement_with_substitutions(s, substitutions)
+                    for s in stmt.body
+                ],
+                [
+                    (
+                        self._transform_expression(cond, substitutions),
+                        [
+                            self._transform_statement_with_substitutions(s, substitutions)
+                            for s in body
+                        ],
+                    )
+                    for cond, body in stmt.elifs
+                ],
+                [
+                    self._transform_statement_with_substitutions(s, substitutions)
+                    for s in stmt.else_body
+                ]
+                if stmt.else_body
+                else None,
+            )
         return stmt
 
     def _specialized_name(self, name: str, values: list[tuple[str, str]]) -> str:
@@ -331,6 +384,23 @@ class ComptimePass:
             self._evaluate_expression(stmt.expression)
         elif isinstance(stmt, ExpressionStatement):
             self._evaluate_expression(stmt.expression)
+        elif isinstance(stmt, If):
+            cond = self._evaluate_expression(stmt.condition)
+            taken = False
+            if cond:
+                for s in stmt.body:
+                    self._execute_statement(s)
+                taken = True
+            if not taken:
+                for econd, ebody in stmt.elifs:
+                    if self._evaluate_expression(econd):
+                        for s in ebody:
+                            self._execute_statement(s)
+                        taken = True
+                        break
+            if not taken and stmt.else_body:
+                for s in stmt.else_body:
+                    self._execute_statement(s)
 
     def run(self, ast: List[Statement]) -> List[Statement]:
         """
@@ -364,6 +434,8 @@ class ComptimePass:
                     self._evaluate_expression(stmt.expression)
                 elif isinstance(stmt, Print):
                     stmt = self._transform_statement(stmt)
+                elif isinstance(stmt, If):
+                    stmt = self._transform_statement(stmt)
                 self._append_pending_specializations(new_ast)
                 new_ast.append(stmt)
             else:
@@ -377,6 +449,64 @@ class ComptimePass:
                 elif isinstance(stmt, Declaration):
                     self._declare(stmt)
                     # drop from AST
+                elif isinstance(stmt, If):
+                    # Evaluate comptime if/elif/else and process selected branch
+                    cond_val = self._evaluate_expression(stmt.condition)
+                    selected: list[Statement] | None = None
+                    if cond_val:
+                        selected = stmt.body
+                    else:
+                        for econd, ebody in stmt.elifs:
+                            if self._evaluate_expression(econd):
+                                selected = ebody
+                                break
+                    if selected is None:
+                        selected = stmt.else_body or []
+
+                    for inner in selected:
+                        if isinstance(inner, Definition):
+                            self._define(inner)
+                        elif isinstance(inner, FunctionDefinition):
+                            self._define_function(inner)
+                        elif isinstance(inner, Declaration):
+                            self._declare(inner)
+                        elif isinstance(inner, Assignment):
+                            if inner.comptime:
+                                value = self._evaluate_expression(inner.value)
+                                literal = self._value_to_literal(value)
+                                self._set_variable_value(inner.variable, value)
+                                new_ast.append(Assignment(False, inner.variable, literal))
+                            else:
+                                transformed = self._transform_statement(inner)
+                                value = self._evaluate_expression(transformed.value)
+                                self._set_variable_value(transformed.variable, value)
+                                self._append_pending_specializations(new_ast)
+                                new_ast.append(transformed)
+                        elif isinstance(inner, Print):
+                            if inner.comptime:
+                                value = self._evaluate_expression(inner.expression)
+                                literal = self._value_to_literal(value)
+                                new_ast.append(Print(False, literal))
+                            else:
+                                transformed = self._transform_statement(inner)
+                                self._append_pending_specializations(new_ast)
+                                new_ast.append(transformed)
+                        elif isinstance(inner, ExpressionStatement):
+                            if inner.comptime:
+                                self._evaluate_expression(inner.expression)
+                            else:
+                                transformed = self._transform_statement(inner)
+                                self._evaluate_expression(transformed.expression)
+                                self._append_pending_specializations(new_ast)
+                                new_ast.append(transformed)
+                        else:
+                            # For other statements, if they are comptime execute, otherwise transform and append
+                            if getattr(inner, "comptime", False):
+                                self._execute_statement(inner)
+                            else:
+                                transformed = self._transform_statement(inner)
+                                self._append_pending_specializations(new_ast)
+                                new_ast.append(transformed)
                 elif isinstance(stmt, Assignment):
                     value = self._evaluate_expression(stmt.value)
                     literal = self._value_to_literal(value)

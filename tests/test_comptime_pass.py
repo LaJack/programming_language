@@ -16,6 +16,7 @@ from jack.ast_nodes import (
     CompositeExpression,
     FunctionDefinition,
     FunctionCall,
+    If,
 )
 
 
@@ -100,6 +101,31 @@ class ComptimePassTest(unittest.TestCase):
         self.assertIsNotNone(last_assignment)
         self.assertIsInstance(last_assignment.value, FunctionCall)
         self.assertEqual(last_assignment.value.name, specialized_name)
+
+    def test_comptime_if_resolved_at_compile_time(self):
+        ast = [
+            Declaration(False, Variable("a"), "i32"),
+            If(
+                True,
+                Literal("i32", "1"),
+                [
+                    Assignment(True, Variable("a"), Literal("i32", "42")),
+                ],
+                [],
+                [
+                    Assignment(False, Variable("a"), Literal("i32", "0")),
+                ],
+            ),
+        ]
+
+        new_ast = ComptimePass().run(ast)
+
+        # Expect declaration + transformed assignment with literal 42
+        self.assertEqual(len(new_ast), 2)
+        self.assertIsInstance(new_ast[0], Declaration)
+        self.assertIsInstance(new_ast[1], Assignment)
+        self.assertIsInstance(new_ast[1].value, Literal)
+        self.assertEqual(new_ast[1].value.value, "42")
 
 if __name__ == "__main__":
     unittest.main()

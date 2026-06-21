@@ -6,6 +6,7 @@ from .ast_nodes import (
     Declaration,
     Expression,
     ExpressionStatement,
+    If,
     FunctionCall,
     FunctionDefinition,
     Literal,
@@ -29,6 +30,7 @@ from .ir import (
     IRPrint,
     IRReturn,
     IRStatement,
+    IRIf,
     IRVariable,
 )
 
@@ -116,6 +118,33 @@ class Lowerer:
             return IRExpressionStatement(self._lower_expression(stmt.expression, locals_))
         if isinstance(stmt, Return):
             return IRReturn(self._lower_expression(stmt.expression, locals_))
+        if isinstance(stmt, If):
+            condition = self._lower_expression(stmt.condition, locals_)
+
+            then_body: list[IRStatement] = []
+            for s in stmt.body:
+                lowered = self._lower_statement(s, locals_)
+                if lowered is not None:
+                    then_body.append(lowered)
+
+            # Build else/elif chain as nested IRIfs by folding from the back
+            else_body: list[IRStatement] = []
+            if stmt.else_body:
+                for s in stmt.else_body:
+                    lowered = self._lower_statement(s, locals_)
+                    if lowered is not None:
+                        else_body.append(lowered)
+
+            for econd, ebody in reversed(stmt.elifs):
+                econdition = self._lower_expression(econd, locals_)
+                e_then: list[IRStatement] = []
+                for s in ebody:
+                    lowered = self._lower_statement(s, locals_)
+                    if lowered is not None:
+                        e_then.append(lowered)
+                else_body = [IRIf(econdition, e_then, else_body)]
+
+            return IRIf(condition, then_body, else_body)
         raise LoweringError(f"Unsupported statement: {stmt.__class__.__name__}")
 
     def _lower_expression(
@@ -135,6 +164,11 @@ class Lowerer:
                 raise LoweringError(
                     f"Cannot lower binary expression with {left.type} and {right.type}"
                 )
+            # For comparison and logical operators the result is an i32 (0/1)
+            if expression.operator in ("==", "!=", "<", "<=", ">", ">="):
+                return IRBinary("i32", expression.operator, left, right)
+            if expression.operator in ("&&", "||"):
+                return IRBinary("i32", expression.operator, left, right)
             return IRBinary(left.type, expression.operator, left, right)
         if isinstance(expression, FunctionCall):
             if expression.name not in self._functions:

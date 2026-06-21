@@ -64,6 +64,13 @@ class IRReturn(IRStatement):
 
 
 @dataclass
+class IRIf(IRStatement):
+    condition: "IRExpression"
+    then_body: list["IRStatement"]
+    else_body: list["IRStatement"]
+
+
+@dataclass
 class IRExpression:
     type: str
 

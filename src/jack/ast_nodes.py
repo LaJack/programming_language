@@ -1,5 +1,5 @@
 
-from typing import List
+from typing import List, Tuple
 from dataclasses import dataclass
 
 @dataclass
@@ -74,3 +74,11 @@ class FunctionDefinition(Statement):
     name: str
     parameters: List[FunctionParameter]
     body: List[Statement]
+
+
+@dataclass
+class If(Statement):
+    condition: Expression
+    body: List[Statement]
+    elifs: List[Tuple[Expression, List[Statement]]]
+    else_body: List[Statement] | None = None

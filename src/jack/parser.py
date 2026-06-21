@@ -19,6 +19,7 @@ from .ast_nodes import (
     Return,
     Statement,
     Variable,
+    If,
 )
 
 
@@ -42,7 +43,7 @@ TOKEN_PATTERN = re.compile(
     |(?P<I32>\d+)
     |(?P<STRING>"(?:\\.|[^"\\])*")
     |(?P<ID>[A-Za-z_][A-Za-z0-9_]*)
-    |(?P<SYMBOL>==|!=|<=|>=|[{}(),;.=+\-*/])
+    |(?P<SYMBOL>==|!=|<=|>=|\|\||&&|[{}(),;.=+\-*/<>!&|])
     |(?P<MISMATCH>.)
     """,
     re.VERBOSE,
@@ -77,6 +78,44 @@ class Parser:
             expression = self._expression()
             self._consume_value(";", "Expected ';' after return expression")
             return [Return(comptime, expression)]
+
+        if self._match_keyword("if"):
+            self._consume_value("(", "Expected '(' after if")
+            condition = self._expression()
+            self._consume_value(")", "Expected ')' after if condition")
+            self._consume_value("{", "Expected '{' before if body")
+            body: list[Statement] = []
+            while not self._check_value("}"):
+                if self._check("EOF"):
+                    raise ParseError("Unterminated if body")
+                body.extend(self._statement())
+            self._consume_value("}", "Expected '}' after if body")
+
+            elifs: list[tuple[Expression, list[Statement]]] = []
+            while self._match_keyword("elif"):
+                self._consume_value("(", "Expected '(' after elif")
+                econd = self._expression()
+                self._consume_value(")", "Expected ')' after elif condition")
+                self._consume_value("{", "Expected '{' before elif body")
+                ebody: list[Statement] = []
+                while not self._check_value("}"):
+                    if self._check("EOF"):
+                        raise ParseError("Unterminated elif body")
+                    ebody.extend(self._statement())
+                self._consume_value("}", "Expected '}' after elif body")
+                elifs.append((econd, ebody))
+
+            else_body: list[Statement] | None = None
+            if self._match_keyword("else"):
+                self._consume_value("{", "Expected '{' before else body")
+                else_body = []
+                while not self._check_value("}"):
+                    if self._check("EOF"):
+                        raise ParseError("Unterminated else body")
+                    else_body.extend(self._statement())
+                self._consume_value("}", "Expected '}' after else body")
+
+            return [If(comptime, condition, body, elifs, else_body)]
 
         if self._check("ID") and self._check("ID", offset=1):
             return self._typed_statement(comptime)
@@ -149,7 +188,39 @@ class Parser:
             self._consume_value(",", "Expected ',' between parameters")
 
     def _expression(self) -> Expression:
-        return self._term()
+        return self._logical_or()
+
+    def _logical_or(self) -> Expression:
+        expression = self._logical_and()
+        while self._match_value("||"):
+            operator = self._previous().value
+            right = self._logical_and()
+            expression = CompositeExpression(operator, expression, right)
+        return expression
+
+    def _logical_and(self) -> Expression:
+        expression = self._equality()
+        while self._match_value("&&"):
+            operator = self._previous().value
+            right = self._equality()
+            expression = CompositeExpression(operator, expression, right)
+        return expression
+
+    def _equality(self) -> Expression:
+        expression = self._comparison()
+        while self._match_value("==") or self._match_value("!="):
+            operator = self._previous().value
+            right = self._comparison()
+            expression = CompositeExpression(operator, expression, right)
+        return expression
+
+    def _comparison(self) -> Expression:
+        expression = self._term()
+        while self._match_value("<") or self._match_value(">") or self._match_value("<=") or self._match_value(">="):
+            operator = self._previous().value
+            right = self._term()
+            expression = CompositeExpression(operator, expression, right)
+        return expression
 
     def _term(self) -> Expression:
         expression = self._factor()

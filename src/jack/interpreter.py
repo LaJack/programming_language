@@ -14,6 +14,7 @@ from .ast_nodes import (
     Literal,
     Print,
     Return,
+    If,
     Statement,
     Variable,
 )
@@ -41,6 +42,7 @@ class Interpreter:
             Assignment: self.assign,
             Print: self.print,
             ExpressionStatement: self.evaluate_expression_statement,
+            If: self.if_statement,
             FunctionDefinition: self.define_function,
         }
         self._functions: Dict[str, FunctionDefinition] = {}
@@ -85,6 +87,22 @@ class Interpreter:
                 return left_value * right_value
             elif expression.operator == "/":
                 return left_value / right_value
+            elif expression.operator == "==":
+                return 1 if left_value == right_value else 0
+            elif expression.operator == "!=":
+                return 1 if left_value != right_value else 0
+            elif expression.operator == "<":
+                return 1 if left_value < right_value else 0
+            elif expression.operator == "<=":
+                return 1 if left_value <= right_value else 0
+            elif expression.operator == ">":
+                return 1 if left_value > right_value else 0
+            elif expression.operator == ">=":
+                return 1 if left_value >= right_value else 0
+            elif expression.operator == "&&":
+                return 1 if (bool(left_value) and bool(right_value)) else 0
+            elif expression.operator == "||":
+                return 1 if (bool(left_value) or bool(right_value)) else 0
             else:
                 raise ValueError(f"Unsupported operator: {expression.operator}")
         elif isinstance(expression, FunctionCall):
@@ -120,6 +138,28 @@ class Interpreter:
     def define_function(self, definition: FunctionDefinition) -> None:
         """Register a function definition."""
         self._functions[definition.name] = definition
+
+    def if_statement(self, if_stmt: If) -> None:
+        """Evaluate an if/elif/else statement at runtime."""
+        cond = self.evaluate_expression(if_stmt.condition)
+        taken = False
+        if cond:
+            for st in if_stmt.body:
+                callback = self._interpreter_functions[st.__class__]
+                callback(st)
+            taken = True
+        if not taken:
+            for econd, ebody in if_stmt.elifs:
+                if self.evaluate_expression(econd):
+                    for st in ebody:
+                        callback = self._interpreter_functions[st.__class__]
+                        callback(st)
+                    taken = True
+                    break
+        if not taken and if_stmt.else_body:
+            for st in if_stmt.else_body:
+                callback = self._interpreter_functions[st.__class__]
+                callback(st)
 
     def call_function(self, call: FunctionCall) -> object:
         """Call a previously registered function."""

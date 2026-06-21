@@ -14,6 +14,8 @@ from jack.ast_nodes import (
     Variable,
     Literal,
     CompositeExpression,
+    FunctionDefinition,
+    FunctionCall,
 )
 
 
@@ -63,6 +65,41 @@ class ComptimePassTest(unittest.TestCase):
         self.assertIsInstance(new_ast[-1].value, Literal)
         self.assertEqual(new_ast[-1].value.value, "29")
 
+    def test_function_specialization_creates_specialized_definition(self):
+        ast = parse(
+            """
+            i32 add(comptime i32 left, i32 right) {
+                return left + right;
+            }
+            i32 x;
+            x = add(6, 7);
+            """
+        )
+
+        new_ast = ComptimePass().run(ast)
+
+        specialized_name = "add__i32_6"
+
+        specialized_def = None
+        for stmt in new_ast:
+            if isinstance(stmt, FunctionDefinition) and stmt.name == specialized_name:
+                specialized_def = stmt
+                break
+
+        self.assertIsNotNone(specialized_def)
+        self.assertEqual(len(specialized_def.parameters), 1)
+        self.assertEqual(specialized_def.parameters[0].name, "right")
+
+        # Ensure the assignment uses the specialized function
+        last_assignment = None
+        for stmt in reversed(new_ast):
+            if isinstance(stmt, Assignment) and stmt.variable.name == "x":
+                last_assignment = stmt
+                break
+
+        self.assertIsNotNone(last_assignment)
+        self.assertIsInstance(last_assignment.value, FunctionCall)
+        self.assertEqual(last_assignment.value.name, specialized_name)
 
 if __name__ == "__main__":
     unittest.main()

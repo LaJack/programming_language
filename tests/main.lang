@@ -10,5 +10,7 @@ i32 add(comptime i32 left, i32 right)
 
 
 i32 b = add(6, a);
+i32 c = add(7, a);
 
 print(b);
+print(c);

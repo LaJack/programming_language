@@ -40,10 +40,12 @@ class CompilerTest(unittest.TestCase):
 
         self.assertIn("declare i32 @printf(i8*, ...)", llvm_ir)
         self.assertIn("@a = global i32 0", llvm_ir)
-        self.assertIn("define i32 @add(i32 %left, i32 %right)", llvm_ir)
-        self.assertIn("%t3 = add i32 %t1, %t2", llvm_ir)
+        # comptime specialization creates specialized versions of `add`
+        self.assertIn("define i32 @add__i32_6(i32 %right)", llvm_ir)
+        self.assertIn("define i32 @add__i32_7(i32 %right)", llvm_ir)
         self.assertIn("define i32 @main()", llvm_ir)
-        self.assertIn("call i32 @add(i32 6,", llvm_ir)
+        self.assertIn("call i32 @add__i32_6(i32", llvm_ir)
+        self.assertIn("call i32 @add__i32_7(i32", llvm_ir)
         self.assertIn("@printf", llvm_ir)
 
     @unittest.skipUnless(shutil.which("clang"), "clang is required")
@@ -62,7 +64,8 @@ class CompilerTest(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.strip(), "29")
+        # main.lang prints two values after specialization
+        self.assertEqual(result.stdout.strip(), "29\n30")
 
 
 if __name__ == "__main__":

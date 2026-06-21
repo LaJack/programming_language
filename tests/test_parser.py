@@ -23,7 +23,8 @@ class ParserTest(unittest.TestCase):
     def test_parse_main_language_sample(self):
         ast = parse_sources([os.path.join(os.path.dirname(__file__), "main.lang")])
 
-        self.assertEqual(len(ast), 6)
+        # main.lang contains declarations for `a`, `b`, and `c`, plus two prints
+        self.assertEqual(len(ast), 9)
         self.assertEqual(ast[0], Declaration(False, Variable("a"), "i32"))
         self.assertEqual(ast[1], Assignment(False, Variable("a"), Literal("i32", "23")))
 
@@ -40,7 +41,14 @@ class ParserTest(unittest.TestCase):
         self.assertIsInstance(ast[4], Assignment)
         self.assertIsInstance(ast[4].value, FunctionCall)
         self.assertEqual(ast[4].value.name, "add")
-        self.assertIsInstance(ast[5], Print)
+
+        self.assertEqual(ast[5], Declaration(False, Variable("c"), "i32"))
+        self.assertIsInstance(ast[6], Assignment)
+        self.assertIsInstance(ast[6].value, FunctionCall)
+        self.assertEqual(ast[6].value.name, "add")
+
+        self.assertIsInstance(ast[7], Print)
+        self.assertIsInstance(ast[8], Print)
 
     def test_parse_precedence_and_print(self):
         ast = parse("print(1 + 2 * 3);")

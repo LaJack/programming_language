@@ -51,7 +51,8 @@ class CliTest(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        self.assertEqual(run_result.stdout.strip(), "29")
+        # main.lang prints two values after comptime specialization
+        self.assertEqual(run_result.stdout.strip(), "29\n30")
 
 
 if __name__ == "__main__":

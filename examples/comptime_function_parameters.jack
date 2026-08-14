@@ -1,0 +1,20 @@
+
+
+i32 add(comptime i32 a, i32 b)
+{
+    return a+b;
+}
+
+i32 a = add(12, 5);
+print(a);
+
+
+i32 b = add(12, 9);
+print(b);
+
+
+i32 c = add(14, 9);
+print(c);
+
+comptime i32 d = add(18, 17);
+print(d); 

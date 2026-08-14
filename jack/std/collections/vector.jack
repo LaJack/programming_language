@@ -1,0 +1,47 @@
+module std.collections.vector;
+
+pub struct StaticAllocator(comptime type T, comptime usize N) {
+    T[N] storage;
+    usize next;
+
+    init(&inout self) {
+        self.next = 0;
+    }
+
+    &inout T[] allocate(&inout self, usize count) {
+        usize start = self.next;
+        self.next = self.next + count;
+        return &inout self.storage[start..self.next];
+    }
+}
+
+pub struct Vector(comptime type T, comptime type Allocator) {
+    Allocator allocator;
+    &inout T[] items;
+    usize length;
+    usize capacity;
+
+    init(&inout self, usize capacity) {
+        self.allocator.init();
+        self.items = self.allocator.allocate(capacity);
+        self.length = 0;
+        self.capacity = capacity;
+    }
+
+    bool push(&inout self, T value) {
+        if (self.length < self.capacity) {
+            self.items[self.length] = value;
+            self.length = self.length + usize(1);
+            return true;
+        }
+        return false;
+    }
+
+    T get(&inout self, usize index) {
+        return self.items[index];
+    }
+
+    usize len(&inout self) {
+        return self.length;
+    }
+}

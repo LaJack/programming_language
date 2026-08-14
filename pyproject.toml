@@ -5,16 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jack-lang"
 version = "0.1.0"
-description = "A small experimental programming language toolkit."
+description = "A small experimental language with explicit comptime evaluation."
 readme = "README.md"
-requires-python = ">=3.10"
-license = { file = "LICENSE" }
+requires-python = ">=3.11"
 
 [project.scripts]
 jack = "jack.cli:main"
-
-[tool.setuptools.package-dir]
-"" = "src"
+jack-lsp = "jack.lsp_server:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+include = ["jack*"]
+
+[tool.setuptools.package-data]
+jack = ["std/*.jack", "c_runtime/*"]

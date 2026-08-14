@@ -1,0 +1,58 @@
+struct AccessError {
+    i32 code;
+}
+
+struct ExampleDriver(comptime type Accessor)
+{
+    Accessor device;
+
+    init(&inout self, Accessor device)
+    {
+        print(f"Example driver init.");
+        self.device = device;
+    }
+
+    deinit(&inout self)
+    {
+        print(f"Example driver deinit.");
+    }
+
+    void do_stuff(&inout self) raises
+    {
+        be_i32 max_power_value = be_i32(45);
+        be_i32 default_power_value = be_i32(25);
+        self.device.write(0, b32(max_power_value));
+        self.device.write(4, b32(default_power_value));
+    }
+}
+
+struct CanAccessor
+{
+    i32 slave_address;
+
+    init(&inout self, i32 slave_address)
+    {
+        print(f"CanAccessor init.");
+        self.slave_address = slave_address;
+    }
+    
+    deinit(&inout self)
+    {
+        print(f"CanAccessor deinit.");
+    }
+
+    void write(&inout self, u32 address, b32 value) raises AccessError
+    {
+        print(f"[CAN] - Writing {value} at {address}");
+        raise AccessError { code = 1 };
+    }
+}
+
+try{
+    CanAccessor example_device(5);
+    ExampleDriver(CanAccessor) example_driver(example_device);
+    example_driver.do_stuff();
+}
+catch AccessError err {
+    print(f"Access error occured: {err.code}.");
+}

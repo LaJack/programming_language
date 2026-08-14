@@ -1,0 +1,8 @@
+client/node_modules/**
+client/out/**/*.map
+node_modules/**
+*.vsix
+**/*.pyc
+**/__pycache__/**
+.vscode/**
+scripts/**

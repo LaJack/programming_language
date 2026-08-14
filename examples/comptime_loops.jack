@@ -1,0 +1,9 @@
+
+
+
+
+comptime for(i32 a = 0 ; a < 5 ; a=a+1)
+{
+    comptime print(a);
+    print(a);
+}

@@ -1,0 +1,35 @@
+module editor.sample;
+
+import std.io;
+import protocol.frame.{Frame, Id};
+
+struct AccessError {
+    i32 code;
+}
+
+struct Driver(comptime type Accessor) {
+    Accessor device;
+
+    init(&inout self, Accessor device) {
+        self.device = device;
+    }
+
+    void read_status(&inout self, &inout u8[] dst) raises AccessError {
+        usize count = self.device.read(&inout dst[..]);
+        if (count == 0) {
+            raise AccessError { code = 1 };
+        }
+    }
+}
+
+comptime str path = "io.txt";
+File file(path);
+u8[8] buffer;
+
+try {
+    usize bytes_read = file.read(&inout buffer[..]);
+    print(f"read {bytes_read} byte(s) from {path}");
+}
+catch AccessError err {
+    print(f"access error: {err.code}");
+}

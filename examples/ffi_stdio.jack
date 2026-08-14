@@ -1,0 +1,14 @@
+extern "c" type FILE;
+extern "c" &inout FILE stdout;
+extern "c" usize fwrite(&in c_void data, usize size, usize count, &inout FILE stream);
+
+u8[6] message;
+message[0] = 104;
+message[1] = 101;
+message[2] = 108;
+message[3] = 108;
+message[4] = 111;
+message[5] = 10;
+
+usize written = fwrite(&in message[0], 1, len(message), stdout);
+print(written);

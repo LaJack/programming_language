@@ -1,0 +1,15 @@
+import std.io;
+
+comptime str path = "io.txt";
+comptime File file(path);
+
+comptime u8[8] buffer;
+comptime usize bytes_read = file.read(&inout buffer[..]);
+comptime i32 close_status = file.close();
+
+print(bytes_read);
+print(buffer[0]);
+print(buffer[1]);
+print(buffer[2]);
+print(buffer[3]);
+print(close_status);

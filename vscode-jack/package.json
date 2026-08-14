@@ -1,0 +1,81 @@
+{
+  "name": "jack-lang",
+  "displayName": "Jack Language",
+  "description": "Syntax highlighting and editor basics for the experimental Jack language.",
+  "version": "0.1.0",
+  "publisher": "jack-lang",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "jack",
+    "comptime",
+    "language"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "jack",
+        "aliases": [
+          "Jack",
+          "jack"
+        ],
+        "extensions": [
+          ".jack",
+          ".jk"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "jack",
+        "scopeName": "source.jack",
+        "path": "./syntaxes/jack.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Jack",
+      "properties": {
+        "jack.lsp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the experimental Jack language server."
+        },
+        "jack.lsp.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python executable used to launch the Jack language server."
+        },
+        "jack.lsp.serverArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "-m",
+            "jack.lsp_server"
+          ],
+          "description": "Arguments passed to the Python executable when starting the Jack language server."
+        },
+        "jack.lsp.trace.server": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write raw language server messages to the Jack output channel."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package:vsix": "node ./scripts/package-vsix.cjs"
+  },
+  "main": "./client/extension.js",
+  "activationEvents": [
+    "onLanguage:jack"
+  ]
+}

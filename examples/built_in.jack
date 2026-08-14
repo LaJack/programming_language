@@ -1,0 +1,23 @@
+i32 native_value = 1234;
+be_i32 big_value = be_i32(1234);
+le_i32 little_value = le_i32(1234);
+
+b32 native_raw = b32(native_value);
+b32 big_raw = b32(big_value);
+b32 little_raw = b32(little_value);
+
+print(native_raw);
+print(big_raw);
+print(little_raw);
+if (native_raw == big_raw)
+{
+    print(f"The machine is using big-endian convention !");
+}
+elif (native_raw == little_raw)
+{
+    print(f"The machine is using little-endian convention !");
+}
+else
+{
+    print(f"The machine is using ... a weird endian convention !");
+}

@@ -1,0 +1,513 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Jack",
+  "scopeName": "source.jack",
+  "fileTypes": [
+    "jack",
+    "jk"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#formatted-strings"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#module-declarations"
+    },
+    {
+      "include": "#struct-literals"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#extern-abi"
+    },
+    {
+      "include": "#builtin-functions"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#builtins"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#function-calls"
+    },
+    {
+      "include": "#fields"
+    },
+    {
+      "include": "#operators"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.jack",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.jack",
+          "begin": "/\\*",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.begin.jack"
+            }
+          },
+          "end": "\\*/",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.end.jack"
+            }
+          }
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.jack",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.jack"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.jack"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escapes"
+            }
+          ]
+        }
+      ]
+    },
+    "formatted-strings": {
+      "patterns": [
+        {
+          "name": "string.interpolated.jack",
+          "begin": "\\bf\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.jack"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.jack"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escapes"
+            },
+            {
+              "name": "constant.character.escape.brace.jack",
+              "match": "\\{\\{|\\}\\}"
+            },
+            {
+              "name": "meta.interpolation.jack",
+              "begin": "\\{",
+              "beginCaptures": {
+                "0": {
+                  "name": "punctuation.section.interpolation.begin.jack"
+                }
+              },
+              "end": "\\}",
+              "endCaptures": {
+                "0": {
+                  "name": "punctuation.section.interpolation.end.jack"
+                }
+              },
+              "patterns": [
+                {
+                  "include": "#comments"
+                },
+                {
+                  "include": "#strings"
+                },
+                {
+                  "include": "#builtin-functions"
+                },
+                {
+                  "include": "#keywords"
+                },
+                {
+                  "include": "#builtins"
+                },
+                {
+                  "include": "#constants"
+                },
+                {
+                  "include": "#numbers"
+                },
+                {
+                  "include": "#function-calls"
+                },
+                {
+                  "include": "#fields"
+                },
+                {
+                  "include": "#operators"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.jack",
+          "match": "\\\\[\\\\\"nrt0]"
+        },
+        {
+          "name": "invalid.illegal.unknown-escape.jack",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "module-declarations": {
+      "patterns": [
+        {
+          "name": "meta.import.selective.jack",
+          "begin": "\\b(import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)\\s*\\.\\s*(\\{)",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.control.import.jack"
+            },
+            "2": {
+              "name": "entity.name.namespace.jack"
+            },
+            "3": {
+              "name": "punctuation.section.import.begin.jack"
+            }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.import.end.jack"
+            }
+          },
+          "patterns": [
+            {
+              "name": "entity.name.type.imported.jack",
+              "match": "\\b[A-Z_][A-Za-z0-9_]*\\b"
+            },
+            {
+              "name": "variable.other.imported.jack",
+              "match": "\\b[a-z_][A-Za-z0-9_]*\\b"
+            },
+            {
+              "name": "punctuation.separator.comma.jack",
+              "match": ","
+            }
+          ]
+        },
+        {
+          "name": "meta.module.jack",
+          "match": "\\b(module|import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.import.jack"
+            },
+            "2": {
+              "name": "entity.name.namespace.jack"
+            }
+          }
+        },
+        {
+          "name": "meta.import.alias.jack",
+          "match": "\\b(as)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.other.alias.jack"
+            },
+            "2": {
+              "name": "entity.name.namespace.alias.jack"
+            }
+          }
+        }
+      ]
+    },
+    "extern-abi": {
+      "patterns": [
+        {
+          "name": "meta.extern-abi.jack",
+          "match": "\\b(extern)\\s+(\"(?:\\\\.|[^\"\\\\])*\")",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.extern.jack"
+            },
+            "2": {
+              "name": "string.quoted.double.jack"
+            }
+          }
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "name": "meta.struct.declaration.jack",
+          "match": "\\b(struct)\\s+([A-Z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.struct.jack"
+            },
+            "2": {
+              "name": "entity.name.type.struct.jack"
+            }
+          }
+        },
+        {
+          "name": "meta.view.declaration.jack",
+          "match": "\\b(view)\\s+([A-Z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.view.jack"
+            },
+            "2": {
+              "name": "entity.name.type.view.jack"
+            }
+          }
+        },
+        {
+          "name": "meta.extern-function.declaration.jack",
+          "match": "\\b(extern)(?:\\s+(\"(?:\\\\.|[^\"\\\\])*\"))?\\s+((?:[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?:\\s*\\([^;{}]*\\))?(?:\\s*\\[\\s*(?:[^\\]]*)\\s*\\])?|&\\s*(?:inout|in|out)\\s+[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?:\\s*\\[\\s*(?:[^\\]]*)\\s*\\])?))\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.extern.jack"
+            },
+            "2": {
+              "name": "string.quoted.double.jack"
+            },
+            "3": {
+              "name": "storage.type.return.jack"
+            },
+            "4": {
+              "name": "entity.name.function.jack"
+            }
+          }
+        },
+        {
+          "name": "meta.constructed-variable.declaration.jack",
+          "match": "\\b((?:[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?:\\s*\\([^;{}]*\\))?(?:\\s*\\[\\s*(?:[^\\]]*)\\s*\\])?|&\\s*(?:inout|in|out)\\s+[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?:\\s*\\[\\s*(?:[^\\]]*)\\s*\\])?))\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\([^;{}]*\\)\\s*;)",
+          "captures": {
+            "1": {
+              "name": "storage.type.jack"
+            },
+            "2": {
+              "name": "variable.other.declaration.jack"
+            }
+          }
+        },
+        {
+          "name": "meta.function.declaration.jack",
+          "match": "\\b((?:[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?:\\s*\\([^;{}]*\\))?(?:\\s*\\[\\s*(?:[^\\]]*)\\s*\\])?|&\\s*(?:inout|in|out)\\s+[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?:\\s*\\[\\s*(?:[^\\]]*)\\s*\\])?))\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\([^;{}]*\\)\\s*(?:raises\\b|\\{))",
+          "captures": {
+            "1": {
+              "name": "storage.type.return.jack"
+            },
+            "2": {
+              "name": "entity.name.function.jack"
+            }
+          }
+        },
+        {
+          "name": "meta.special-method.declaration.jack",
+          "match": "\\b(init|deinit)\\s*(?=\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.constructor.jack"
+            }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.jack",
+          "match": "\\b(?:if|elif|else|for|while|try|catch|return|raise|rethrow)\\b"
+        },
+        {
+          "name": "keyword.other.jack",
+          "match": "\\b(?:as|raises|print)\\b"
+        },
+        {
+          "name": "storage.modifier.jack",
+          "match": "\\b(?:pub|comptime|extern|in|out|inout)\\b"
+        },
+        {
+          "name": "storage.type.jack",
+          "match": "\\b(?:struct|view|type)\\b"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "name": "storage.type.primitive.jack",
+          "match": "\\b(?:i64|i32|i16|i8|usize|u64|u32|u16|u8|b64|b32|b16|b8|f64|f32|bool|void|str|c_char|c_void|be_i32|le_i32)\\b"
+        },
+        {
+          "name": "entity.name.type.jack",
+          "match": "\\b[A-Z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.jack",
+          "match": "\\b(?:true|false)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.jack",
+          "match": "(?<![A-Za-z0-9_])(?:[0-9]+\\.[0-9]+)(?![A-Za-z0-9_])"
+        },
+        {
+          "name": "constant.numeric.integer.jack",
+          "match": "(?<![A-Za-z0-9_])(?:[0-9]+)(?![A-Za-z0-9_])"
+        }
+      ]
+    },
+    "function-calls": {
+      "patterns": [
+        {
+          "name": "meta.function-call.jack",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)?)\\s*(?=\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.call.jack"
+            }
+          }
+        }
+      ]
+    },
+    "fields": {
+      "patterns": [
+        {
+          "name": "variable.other.member.jack",
+          "match": "(?<=\\.)[A-Za-z_][A-Za-z0-9_]*"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.comparison.jack",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.assignment.jack",
+          "match": "="
+        },
+        {
+          "name": "keyword.operator.arithmetic.jack",
+          "match": "\\+|-|\\*|/|%"
+        },
+        {
+          "name": "keyword.operator.borrow.jack",
+          "match": "&"
+        },
+        {
+          "name": "keyword.operator.range.jack",
+          "match": "\\.\\."
+        }
+      ]
+    },
+    "struct-literals": {
+      "patterns": [
+        {
+          "name": "meta.struct-literal.jack",
+          "begin": "\\b([A-Z_][A-Za-z0-9_]*(?:\\s*\\([^;{}]*\\))?)\\s*(\\{)",
+          "beginCaptures": {
+            "1": {
+              "name": "entity.name.type.struct.jack"
+            },
+            "2": {
+              "name": "punctuation.section.block.begin.jack"
+            }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.block.end.jack"
+            }
+          },
+          "patterns": [
+            {
+              "name": "variable.other.member.literal.jack",
+              "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b\\s*(?==)"
+            },
+            {
+              "include": "#formatted-strings"
+            },
+            {
+              "include": "#strings"
+            },
+            {
+              "include": "#builtin-functions"
+            },
+            {
+              "include": "#keywords"
+            },
+            {
+              "include": "#builtins"
+            },
+            {
+              "include": "#constants"
+            },
+            {
+              "include": "#numbers"
+            },
+            {
+              "include": "#function-calls"
+            },
+            {
+              "include": "#fields"
+            },
+            {
+              "include": "#operators"
+            }
+          ]
+        }
+      ]
+    },
+    "builtin-functions": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.jack",
+          "match": "\\b(?:len|sizeof|alignof)\\s*(?=\\()"
+        }
+      ]
+    }
+  }
+}

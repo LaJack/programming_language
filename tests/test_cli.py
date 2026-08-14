@@ -1,59 +1,241 @@
-import contextlib
 import io
-import os
-import shutil
-import subprocess
-import sys
 import tempfile
 import unittest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 
 from jack.cli import main
 
 
-class CliTest(unittest.TestCase):
-    def test_parse_error_is_reported_without_traceback(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".jack") as source:
-            source.write("return 1;")
-            source.flush()
+class CliTests(unittest.TestCase):
+    def test_interpreter_mode_runs_source_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('''
+                comptime i32 offset;
+                comptime offset = 2;
+                comptime offset = offset + 5;
+                i32 y = offset;
+                print(y);
+            ''')
 
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
-                main(["-i", source.name])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(['-i', str(source)])
 
-        self.assertEqual(raised.exception.code, 1)
-        self.assertIn("jack:", stderr.getvalue())
-        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertEqual(0, status)
+        self.assertEqual('y = 7\n', output.getvalue())
 
-    def test_emit_llvm_writes_ir_to_stdout(self):
-        source = os.path.join(os.path.dirname(__file__), "main.lang")
-        stdout = io.StringIO()
+    def test_interpreter_mode_runs_comptime_prints(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('''
+                comptime i32 offset = 7;
+                comptime print(offset);
+                i32 y = offset;
+                print(y);
+            ''')
 
-        with contextlib.redirect_stdout(stdout):
-            result = main(["--emit-llvm", source])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(['-i', str(source)])
 
-        self.assertEqual(result, 0)
-        self.assertIn("define i32 @main()", stdout.getvalue())
+        self.assertEqual(0, status)
+        self.assertEqual('offset = 7\ny = 7\n', output.getvalue())
 
-    @unittest.skipUnless(shutil.which("clang"), "clang is required")
-    def test_compile_writes_executable(self):
-        source = os.path.join(os.path.dirname(__file__), "main.lang")
+    def test_c_mode_emits_c_source_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('''\n                comptime i32 offset;\n                comptime offset = 7;\n                i32 y = offset;\n                print(y);\n            ''')
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            executable = os.path.join(temp_dir, "main")
-            result = main(["-o", executable, source])
-            run_result = subprocess.run(
-                [executable],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(['-c', str(source)])
 
-        self.assertEqual(result, 0)
-        # main.lang prints two values after comptime specialization
-        self.assertEqual(run_result.stdout.strip(), "29\n30")
+        self.assertEqual(0, status)
+        self.assertIn('#include "jack_runtime.h"', output.getvalue())
+        self.assertIn('    y = 7;', output.getvalue())
+        self.assertIn('    printf("y = %" PRId32 "\\n", (int32_t)(y));', output.getvalue())
+
+    def test_c_mode_with_output_directory_writes_split_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            module = root / 'math' / 'ops.jack'
+            module.parent.mkdir()
+            module.write_text('''
+                module math.ops;
+
+                pub i32 add(i32 left, i32 right) {
+                    return left + right;
+                }
+            ''')
+            source = root / 'program.jk'
+            source.write_text('''
+                import math.ops;
+
+                i32 y = add(2, 3);
+            ''')
+            output_dir = root / 'c_out'
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(['-c', str(source), '-o', str(output_dir)])
+
+            main_c = output_dir / 'main.c'
+            module_c = output_dir / 'math_ops.c'
+            module_h = output_dir / 'math_ops.h'
+
+            self.assertEqual(0, status)
+            self.assertEqual('', output.getvalue())
+            self.assertTrue(main_c.is_file())
+            self.assertTrue(module_c.is_file())
+            self.assertTrue(module_h.is_file())
+            self.assertTrue((output_dir / 'jack_runtime.h').is_file())
+            self.assertTrue((output_dir / 'jack_std_io.c').is_file())
+            self.assertIn('#include "math_ops.h"', main_c.read_text())
+            self.assertIn('int32_t math_ops_add(int32_t left, int32_t right) {', module_c.read_text())
+
+    def test_c_mode_sends_comptime_prints_to_stderr(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('''
+                comptime i32 offset = 7;
+                comptime print(offset);
+                i32 y = offset;
+            ''')
+
+            output = io.StringIO()
+            errors = io.StringIO()
+            with redirect_stdout(output), redirect_stderr(errors):
+                status = main(['-c', str(source)])
+
+        self.assertEqual(0, status)
+        self.assertIn('#include "jack_runtime.h"', output.getvalue())
+        self.assertIn('    y = 7;', output.getvalue())
+        self.assertNotIn('offset = 7', output.getvalue())
+        self.assertEqual('offset = 7\n', errors.getvalue())
+
+    def test_emit_jack_after_comptime_prints_runtime_ast(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('''
+                comptime i32 offset = 7;
+                comptime print(offset);
+                i32 y = offset;
+                print(y);
+            ''')
+
+            output = io.StringIO()
+            errors = io.StringIO()
+            with redirect_stdout(output), redirect_stderr(errors):
+                status = main(['--emit-jack', str(source), '--after', 'comptime'])
+
+        self.assertEqual(0, status)
+        self.assertEqual('offset = 7\n', errors.getvalue())
+        self.assertIn('i32 y = 7;', output.getvalue())
+        self.assertIn('print(y);', output.getvalue())
+        self.assertNotIn('comptime', output.getvalue())
+
+    def test_emit_jack_after_parse_prints_loaded_source_ast(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('''
+                module app.main;
+                i32 y = 3;
+            ''')
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(['--emit-jack', str(source), '--after', 'parse'])
+
+        self.assertEqual(0, status)
+        self.assertIn('module app.main;', output.getvalue())
+        self.assertIn('i32 y = 3;', output.getvalue())
+
+    def test_after_is_rejected_without_emit_jack(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('i32 y = 3;')
+
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                status = main(['--after', 'comptime', '-i', str(source)])
+
+        self.assertNotEqual(0, status)
+        self.assertIn('--after can only be used with --emit-jack', errors.getvalue())
+
+    def test_interpreter_mode_runs_stdio_extern_bindings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('''
+                extern "c" type FILE;
+                extern "c" &inout FILE stdout;
+                extern "c" usize fwrite(&in c_void data, usize size, usize count, &inout FILE stream);
+
+                u8[3] message;
+                message[0] = 104;
+                message[1] = 105;
+                message[2] = 10;
+
+                usize written = fwrite(&in message[0], 1, len(message), stdout);
+                print(written);
+            ''')
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(['-i', str(source)])
+
+        self.assertEqual(0, status)
+        self.assertEqual('hi\nwritten = 3\n', output.getvalue())
+
+    def test_interpreter_error_reports_source_span(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('i32 value = 1;\n&in i32 ref = &in value;\nvalue = 2;\n')
+
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                status = main(['-i', str(source)])
+
+        self.assertEqual(1, status)
+        diagnostic = errors.getvalue()
+        self.assertIn(f'jack: {source}:3:1:', diagnostic)
+        self.assertIn('overlaps live &in borrow', diagnostic)
+        self.assertIn('value = 2;', diagnostic)
+        self.assertIn('^', diagnostic)
+
+    def test_comptime_error_reports_source_span(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('comptime i32 value = missing;\n')
+
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                status = main(['-i', str(source)])
+
+        self.assertEqual(1, status)
+        diagnostic = errors.getvalue()
+        self.assertIn(f'jack: {source}:1:1:', diagnostic)
+        self.assertIn('Comptime expression references runtime name "missing"', diagnostic)
+        self.assertIn('comptime i32 value = missing;', diagnostic)
+        self.assertIn('^', diagnostic)
+
+    def test_parse_error_reports_source_span(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('i32 value = ;\n')
+
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                status = main(['--emit-jack', str(source), '--after', 'parse'])
+
+        self.assertEqual(1, status)
+        diagnostic = errors.getvalue()
+        self.assertIn(f'jack: {source}:1:13:', diagnostic)
+        self.assertIn('Expected expression.', diagnostic)
+        self.assertIn('i32 value = ;', diagnostic)
+        self.assertIn('^', diagnostic)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

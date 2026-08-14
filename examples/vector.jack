@@ -1,0 +1,22 @@
+import std.collections.vector;
+
+Vector(i32, StaticAllocator(i32, 4)) values(3);
+
+bool pushed0 = values.push(10);
+bool pushed1 = values.push(20);
+bool pushed2 = values.push(30);
+bool pushed3 = values.push(40);
+
+usize length = values.len();
+i32 first = values.get(0);
+i32 second = values.get(1);
+i32 third = values.get(2);
+
+print(pushed0);
+print(pushed1);
+print(pushed2);
+print(pushed3);
+print(length);
+print(first);
+print(second);
+print(third);

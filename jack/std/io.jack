@@ -1,0 +1,22 @@
+module std.io;
+
+extern "c" type FILE;
+extern "c" &inout FILE jack_std_io_open_read(str path);
+extern "c" usize fread(&inout c_void data, usize size, usize count, &inout FILE stream);
+extern "c" i32 fclose(&inout FILE stream);
+
+pub struct File {
+    &inout FILE handle;
+
+    init(&inout self, str path) {
+        self.handle = jack_std_io_open_read(path);
+    }
+
+    usize read(&inout self, &inout u8[] dst) {
+        return fread(&inout dst[0], 1, usize(len(dst)), self.handle);
+    }
+
+    i32 close(&inout self) {
+        return fclose(self.handle);
+    }
+}

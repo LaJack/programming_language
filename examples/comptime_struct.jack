@@ -1,0 +1,13 @@
+struct Point(comptime type t) {
+    t x;
+    t y;
+}
+
+comptime Point(i32) point;
+comptime point.x = 3;
+comptime point.y = point.x + 4;
+comptime print(point);
+
+i32 x = point.x;
+i32 y = point.y;
+print(point.x);

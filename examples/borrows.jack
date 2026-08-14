@@ -1,0 +1,106 @@
+// Borrow examples:
+// - &in borrows are readable views.
+// - &out borrows are write-only destinations.
+// - &inout borrows can be read and written.
+// - Views can expose only selected fields with selected access modes.
+
+u8 max_value(&in u8 a, &in u8 b) {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+&in u8 max_ref(&in u8 a, &in u8 b) {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+void fill(&out u8[] dst) {
+    dst[0] = 10;
+    dst[1] = 20;
+}
+
+void copy_first_two(&in u8[] src, &out u8[] dst) {
+    dst[0] = src[0];
+    dst[1] = src[1];
+}
+
+void bump_first(&inout u8[] data) {
+    u8 one = 1;
+    data[0] = data[0] + one;
+}
+
+void set_third(&inout u8[4] data) {
+    data[2] = 99;
+}
+
+struct Packet {
+    i32 header;
+    i32 checksum;
+    u8 flags;
+}
+
+view PacketChecksumView {
+    in i32 header;
+    out i32 checksum;
+}
+
+view PacketHeaderView {
+    inout i32 header;
+}
+
+view PacketFlagsView {
+    inout u8 flags;
+}
+
+void refresh_checksum(&inout PacketChecksumView packet) {
+    i32 header = packet.header;
+    packet.checksum = header + 1;
+}
+
+void mutate_disjoint_views(&inout PacketHeaderView header, &inout PacketFlagsView flags) {
+    u8 one = 1;
+    header.header = header.header + 10;
+    flags.flags = flags.flags + one;
+}
+
+u8 left = 8;
+u8 right = 9;
+
+u8 biggest_value = max_value(&in left, &in right);
+print(biggest_value);
+
+&in u8 biggest_ref = max_ref(&in left, &in right);
+print(biggest_ref);
+
+u8[4] source;
+u8[4] destination;
+
+fill(&out source[..]);
+copy_first_two(&in source[..], &out destination[..]);
+bump_first(&inout destination[..]);
+set_third(&inout destination);
+
+print(destination[0]);
+print(destination[1]);
+print(destination[2]);
+print(destination[3]);
+
+Packet packet;
+packet.header = 41;
+packet.flags = 3;
+
+refresh_checksum(&inout packet);
+print(packet.checksum);
+
+mutate_disjoint_views(&inout packet, &inout packet);
+print(packet.header);
+print(packet.flags);
+
+// Rejected examples worth keeping in mind:
+// - reading from an &out borrow: u8 value = dst[0];
+// - writing through an &in borrow: src[0] = 1;
+// - writing the owner while a live &in borrow may still point to it.

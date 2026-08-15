@@ -122,6 +122,12 @@
           "default": false,
           "description": "Write raw language server messages to the Jack output channel."
         },
+        "jack.lsp.analysisDelay": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 200,
+          "description": "Delay in milliseconds before project semantic analysis starts after an edit."
+        },
         "jack.compiler.path": {
           "type": "string",
           "default": "jack",

@@ -4,10 +4,10 @@ This extension provides editor basics for the experimental Jack language:
 
 - language registration for `.jack` and `.jk`
 - TextMate syntax highlighting
-- experimental parse diagnostics through a Python LSP server
+- project-aware parse, comptime, and semantic diagnostics through a Python LSP server
 - document symbols for Outline and Breadcrumbs
-- hover information for declarations and built-in types
-- same-document go-to-definition for parsed symbols
+- semantic hover and cross-file go-to-definition
+- lexical and member completion, references, and project-wide rename
 - Linux x86-64 source debugging through CodeLLDB
 - comments, brackets, indentation, and string pairing rules
 
@@ -85,4 +85,14 @@ The package intentionally has no build step yet. The first LSP client is plain J
 
 ## LSP Notes
 
-The language server currently reports parser errors using parser-provided source spans and builds a lightweight per-document symbol index for document symbols, hover, and same-document go-to-definition. Semantic diagnostics, cross-file resolution, and completion replacement ranges still need later passes and richer symbol indexes to preserve or consume those spans.
+The language server indexes `.jack` and `.jk` files in every open workspace and
+configured `jack.compiler.moduleRoots`. Open editor contents override files on
+disk throughout the import graph, so hover, definitions, completion, references,
+and rename work across unsaved changes and imported modules.
+
+Analysis starts after `jack.lsp.analysisDelay` milliseconds. While typing, pure
+comptime code is evaluated without printing; comptime host extern calls are
+deferred and the last complete semantic snapshot remains available. Saving runs
+the complete configured comptime analysis. Rename is deliberately conservative:
+builtins, extern ABI names, module names, import aliases, and generated
+specializations cannot be renamed.

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 try:
     from .ast_nodes import (
@@ -89,6 +90,32 @@ class LoadedModule:
 
 
 @dataclass(frozen=True)
+class SourceModule:
+    name: str
+    path: Path
+    imports: tuple[str, ...]
+    ast: tuple[Statement, ...]
+
+
+@dataclass(frozen=True)
+class LoadedSourceGraph:
+    ast: list[Statement]
+    modules: dict[str, SourceModule]
+    dependencies: dict[str, tuple[str, ...]]
+
+    @property
+    def reverse_dependencies(self) -> dict[str, tuple[str, ...]]:
+        reverse: dict[str, set[str]] = {name: set() for name in self.modules}
+        for owner, dependencies in self.dependencies.items():
+            for dependency in dependencies:
+                reverse.setdefault(dependency, set()).add(owner)
+        return {
+            name: tuple(sorted(dependents))
+            for name, dependents in sorted(reverse.items())
+        }
+
+
+@dataclass(frozen=True)
 class NameRewriteContext:
     local_symbols: dict[str, str]
     imported_symbols: dict[str, str]
@@ -116,9 +143,30 @@ def load_source_file(
     path: Path,
     import_overrides: dict[str, str] | None = None,
     search_roots: list[Path] | None = None,
+    source_overlays: Mapping[Path, str] | None = None,
 ) -> list[Statement]:
-    resolver = ModuleResolver(path.parent, import_overrides or {}, search_roots)
-    return resolver.load_entry(path)
+    return load_source_graph(
+        path,
+        import_overrides=import_overrides,
+        search_roots=search_roots,
+        source_overlays=source_overlays,
+    ).ast
+
+
+def load_source_graph(
+    path: Path,
+    import_overrides: dict[str, str] | None = None,
+    search_roots: list[Path] | None = None,
+    source_overlays: Mapping[Path, str] | None = None,
+) -> LoadedSourceGraph:
+    resolver = ModuleResolver(
+        path.parent,
+        import_overrides or {},
+        search_roots,
+        source_overlays=source_overlays,
+    )
+    ast = resolver.load_entry(path)
+    return LoadedSourceGraph(ast, dict(resolver.modules), dict(resolver.dependencies))
 
 
 class ModuleResolver:
@@ -129,6 +177,7 @@ class ModuleResolver:
         entry_root: Path,
         import_overrides: dict[str, str],
         search_roots: list[Path] | None,
+        source_overlays: Mapping[Path, str] | None = None,
     ) -> None:
         roots = [entry_root, *(search_roots or []), *default_module_roots()]
         self.search_roots = []
@@ -141,6 +190,11 @@ class ModuleResolver:
         self.loading: list[str] = []
         self.module_symbols: dict[str, dict[str, str]] = {}
         self.module_public_symbols: dict[str, set[str]] = {}
+        self.source_overlays = {
+            path.resolve(): source for path, source in (source_overlays or {}).items()
+        }
+        self.modules: dict[str, SourceModule] = {}
+        self.dependencies: dict[str, tuple[str, ...]] = {}
 
     def load_entry(self, path: Path) -> list[Statement]:
         return self._load_path(path.resolve(), expected_module=None, is_entry=True)
@@ -161,10 +215,13 @@ class ModuleResolver:
     def _load_path(
         self, path: Path, expected_module: str | None, is_entry: bool
     ) -> list[Statement]:
-        try:
-            source = path.read_text()
-        except OSError as err:
-            raise ModuleLoadError(f'Cannot read module source "{path}".') from err
+        path = path.resolve()
+        source = self.source_overlays.get(path)
+        if source is None:
+            try:
+                source = path.read_text()
+            except OSError as err:
+                raise ModuleLoadError(f'Cannot read module source "{path}".') from err
 
         try:
             ast = parse(source, source_path=path)
@@ -172,6 +229,14 @@ class ModuleResolver:
             raise ModuleLoadError(str(err), getattr(err, 'span', None)) from err
 
         module_name, imports, body = self._split_module_ast(ast, path, expected_module, is_entry)
+        dependency_names = tuple(
+            self._effective_module_name(declaration.module_name)
+            for declaration in imports
+        )
+        self.modules[module_name] = SourceModule(
+            module_name, path, dependency_names, tuple(ast)
+        )
+        self.dependencies[module_name] = dependency_names
         if module_name in self.loaded:
             return []
         if module_name in self.loading:

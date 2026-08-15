@@ -11,12 +11,35 @@ from jack.cleanup_lowering_pass import lower_hir_static_cleanups
 from jack.compile_time_pass import apply_compile_time_pass
 from jack.hir_lowering_pass import lower_to_hir
 from jack.interpreter import Interpreter
-from jack.module_loader import ModuleLoadError, load_source_file
+from jack.module_loader import ModuleLoadError, load_source_file, load_source_graph
 from jack.parser import parse
 from jack.semantic_pass import SemanticError
 
 
 class ModuleLoaderTests(unittest.TestCase):
+    def test_load_source_graph_tracks_dependencies_and_overlays(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            library = root / 'math.jack'
+            library.write_text('module math;\npub i32 disk_value = 1;\n')
+            entry = root / 'main.jack'
+            entry.write_text('module app;\nimport math;\ni32 result = overlay_value;\n')
+
+            graph = load_source_graph(
+                entry,
+                source_overlays={
+                    library: 'module math;\npub i32 overlay_value = 2;\n'
+                },
+            )
+
+        self.assertEqual(('math',), graph.dependencies['app'])
+        self.assertEqual(('app',), graph.reverse_dependencies['math'])
+        self.assertEqual(library.resolve(), graph.modules['math'].path)
+        self.assertIn(
+            'overlay_value',
+            {getattr(node, 'source_name', getattr(node, 'name', None)) for node in graph.ast},
+        )
+
     def test_hir_preserves_module_metadata_for_split_emission(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

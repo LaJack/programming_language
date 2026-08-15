@@ -73,12 +73,38 @@ class JackLanguageClient {
           provideDefinition: (document, position) => this.provideDefinition(document, position),
         },
       ),
+      vscode.languages.registerCompletionItemProvider(
+        { language: JACK_LANGUAGE_ID },
+        {
+          provideCompletionItems: (document, position) => this.provideCompletionItems(document, position),
+        },
+        '.',
+      ),
+      vscode.languages.registerReferenceProvider(
+        { language: JACK_LANGUAGE_ID },
+        {
+          provideReferences: (document, position, context) => this.provideReferences(document, position, context),
+        },
+      ),
+      vscode.languages.registerRenameProvider(
+        { language: JACK_LANGUAGE_ID },
+        {
+          prepareRename: (document, position) => this.prepareRename(document, position),
+          provideRenameEdits: (document, position, newName) => this.provideRenameEdits(document, position, newName),
+        },
+      ),
       vscode.workspace.onDidChangeConfiguration((event) => {
-        if (event.affectsConfiguration('jack.lsp')) {
+        if (
+          event.affectsConfiguration('jack.lsp')
+          || event.affectsConfiguration('jack.compiler.moduleRoots')
+          || event.affectsConfiguration('jack.compiler.stubs')
+        ) {
           vscode.window.showInformationMessage('Reload the window to restart the Jack language server with the new settings.');
         }
       }),
     );
+
+    this.registerFileWatchers();
 
     this.ready = this.initialize();
   }
@@ -98,6 +124,7 @@ class JackLanguageClient {
         name: folder.name,
       })),
       capabilities: {},
+      initializationOptions: this.initializationOptions(),
     }).then(() => {
       this.initialized = true;
       this.sendNotification('initialized', {});
@@ -205,6 +232,80 @@ class JackLanguageClient {
     });
   }
 
+  provideCompletionItems(document, position) {
+    if (!this.isJackDocument(document)) {
+      return [];
+    }
+    return this.ready.then(() => {
+      if (!this.initialized) {
+        return [];
+      }
+      return this.sendRequest('textDocument/completion', {
+        textDocument: { uri: document.uri.toString() },
+        position: this.toLspPosition(position),
+      }).then((items) => (items || []).map((item) => this.toVscodeCompletionItem(item)));
+    }).catch((error) => {
+      this.output.appendLine(`Completion failed: ${error.message}`);
+      return [];
+    });
+  }
+
+  provideReferences(document, position, context) {
+    return this.ready.then(() => {
+      if (!this.initialized) {
+        return [];
+      }
+      return this.sendRequest('textDocument/references', {
+        textDocument: { uri: document.uri.toString() },
+        position: this.toLspPosition(position),
+        context: { includeDeclaration: Boolean(context && context.includeDeclaration) },
+      }).then((locations) => this.toVscodeLocations(locations));
+    }).catch((error) => {
+      this.output.appendLine(`References failed: ${error.message}`);
+      return [];
+    });
+  }
+
+  prepareRename(document, position) {
+    return this.ready.then(() => {
+      if (!this.initialized) {
+        return undefined;
+      }
+      return this.sendRequest('textDocument/prepareRename', {
+        textDocument: { uri: document.uri.toString() },
+        position: this.toLspPosition(position),
+      }).then((result) => {
+        if (!result) {
+          return undefined;
+        }
+        return {
+          range: this.toVscodeRange(result.range || result),
+          placeholder: result.placeholder,
+        };
+      });
+    }).catch((error) => {
+      this.output.appendLine(`Prepare rename failed: ${error.message}`);
+      return undefined;
+    });
+  }
+
+  provideRenameEdits(document, position, newName) {
+    return this.ready.then(() => {
+      if (!this.initialized) {
+        return undefined;
+      }
+      return this.sendRequest('textDocument/rename', {
+        textDocument: { uri: document.uri.toString() },
+        position: this.toLspPosition(position),
+        newName,
+      }).then((edit) => this.toVscodeWorkspaceEdit(edit));
+    }).catch((error) => {
+      vscode.window.showErrorMessage(error.message);
+      this.output.appendLine(`Rename failed: ${error.message}`);
+      return undefined;
+    });
+  }
+
   toVscodeHover(hover) {
     if (!hover) {
       return undefined;
@@ -225,6 +326,52 @@ class JackLanguageClient {
       vscode.Uri.parse(location.uri),
       this.toVscodeRange(location.range),
     ));
+  }
+
+  toVscodeCompletionItem(item) {
+    const completion = new vscode.CompletionItem(
+      item.label || '',
+      this.toVscodeCompletionKind(item.kind),
+    );
+    completion.detail = item.detail;
+    if (item.textEdit) {
+      completion.textEdit = vscode.TextEdit.replace(
+        this.toVscodeRange(item.textEdit.range),
+        item.textEdit.newText || item.label || '',
+      );
+    }
+    return completion;
+  }
+
+  toVscodeWorkspaceEdit(value) {
+    const edit = new vscode.WorkspaceEdit();
+    for (const change of (value && value.documentChanges) || []) {
+      if (!change.textDocument || !change.textDocument.uri) {
+        continue;
+      }
+      edit.set(
+        vscode.Uri.parse(change.textDocument.uri),
+        (change.edits || []).map((item) => vscode.TextEdit.replace(
+          this.toVscodeRange(item.range),
+          item.newText || '',
+        )),
+      );
+    }
+    return edit;
+  }
+
+  toVscodeCompletionKind(kind) {
+    const values = vscode.CompletionItemKind;
+    return {
+      2: values.Method,
+      3: values.Function,
+      5: values.Field,
+      6: values.Variable,
+      7: values.Class,
+      8: values.Interface,
+      9: values.Module,
+      14: values.Keyword,
+    }[kind] || values.Text;
   }
 
   provideDocumentSymbols(document) {
@@ -428,6 +575,38 @@ class JackLanguageClient {
   workspaceRoot() {
     const folders = vscode.workspace.workspaceFolders;
     return folders && folders.length > 0 ? folders[0].uri.fsPath : undefined;
+  }
+
+  initializationOptions() {
+    const compiler = vscode.workspace.getConfiguration('jack.compiler');
+    const lsp = vscode.workspace.getConfiguration('jack.lsp');
+    return {
+      moduleRoots: compiler.get('moduleRoots', []),
+      stubs: compiler.get('stubs', {}),
+      analysisDelay: lsp.get('analysisDelay', 200),
+    };
+  }
+
+  registerFileWatchers() {
+    const roots = [
+      ...(vscode.workspace.workspaceFolders || []).map((folder) => folder.uri.fsPath),
+      ...vscode.workspace.getConfiguration('jack.compiler').get('moduleRoots', []),
+    ];
+    for (const root of [...new Set(roots)]) {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(root, '**/*.{jack,jk}'),
+      );
+      const notify = (uri, type) => this.sendNotification(
+        'workspace/didChangeWatchedFiles',
+        { changes: [{ uri: uri.toString(), type }] },
+      );
+      this.disposables.push(
+        watcher,
+        watcher.onDidCreate((uri) => notify(uri, 1)),
+        watcher.onDidChange((uri) => notify(uri, 2)),
+        watcher.onDidDelete((uri) => notify(uri, 3)),
+      );
+    }
   }
 
   serverEnv() {

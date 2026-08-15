@@ -26,7 +26,12 @@ Run a program with the interpreter instead:
 jack -i source.jk
 ```
 
-Editor support lives in `vscode-jack/`. It currently provides VSCode syntax highlighting, language configuration, experimental parse diagnostics, document symbols, hover, and same-document go-to-definition through `python3 -m jack.lsp_server` for `.jack` and `.jk` files.
+Editor support lives in `vscode-jack/`. It provides VSCode syntax highlighting,
+project-aware diagnostics, semantic hover, cross-file definition, completion,
+references, and project-wide rename through `python3 -m jack.lsp_server` for
+`.jack` and `.jk` files. The semantic index includes open workspaces and
+configured module roots, with unsaved editor buffers taking precedence over
+disk contents.
 On Linux x86-64, the extension also provides CodeLLDB source debugging: press
 `F5` in a Jack file to build it with `-g -O0`, stop on Jack breakpoints, step
 through statements, and inspect LLVM-backed parameters and locals.

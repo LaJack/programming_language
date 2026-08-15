@@ -191,6 +191,9 @@ class LspProtocolTests(unittest.TestCase):
         self.assertTrue(result['capabilities']['documentSymbolProvider'])
         self.assertTrue(result['capabilities']['hoverProvider'])
         self.assertTrue(result['capabilities']['definitionProvider'])
+        self.assertEqual(['.'], result['capabilities']['completionProvider']['triggerCharacters'])
+        self.assertTrue(result['capabilities']['referencesProvider'])
+        self.assertTrue(result['capabilities']['renameProvider']['prepareProvider'])
 
     def test_hover_and_definition_requests_use_open_document_text(self):
         server = LanguageServer(None, None, None)

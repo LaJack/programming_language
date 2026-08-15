@@ -1,6 +1,6 @@
 import std.io;
 
-comptime str path = "io.txt";
+comptime str path = "examples/io.txt";
 comptime File file(path);
 
 comptime u8[8] buffer;

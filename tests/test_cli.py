@@ -5,10 +5,16 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from jack.cli import main
+from jack.cli import build_parser, main
 
 
 class CliTests(unittest.TestCase):
+    def test_parser_accepts_compact_optimization_flags(self):
+        for level in range(4):
+            with self.subTest(level=level):
+                args = build_parser().parse_args([f'-O{level}', 'program.jack'])
+                self.assertEqual(level, args.optimization)
+
     def test_interpreter_mode_runs_source_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / 'program.jk'

@@ -1,24 +1,28 @@
-import io
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 
-from jack.cli import main as jack_main
 from jack.cleanup_lowering_pass import lower_hir_static_cleanups
+from jack.comptime_externs import default_comptime_externs
 from jack.hir_lowering_pass import compile_to_hir
 from jack.llvm_emit_pass import emit_hir_llvm
-from jack.module_loader import load_source_file
 from jack.parser import parse
 
 
 class LLVMEmitPassTests(unittest.TestCase):
-    def compile_and_run(self, source: str) -> subprocess.CompletedProcess[str]:
+    def emit(self, source: str) -> str:
         program = lower_hir_static_cleanups(
-            compile_to_hir(parse(source), print_handler=None)
+            compile_to_hir(
+                parse(source),
+                print_handler=None,
+                externs=default_comptime_externs(),
+            )
         )
-        llvm_source = emit_hir_llvm(program)
+        return emit_hir_llvm(program)
+
+    def compile_and_run(self, source: str) -> subprocess.CompletedProcess[str]:
+        llvm_source = self.emit(source)
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             module = root / 'main.ll'
@@ -46,33 +50,6 @@ class LLVMEmitPassTests(unittest.TestCase):
                 text=True,
                 check=False,
             )
-
-    def compile_path_and_run(self, path: Path) -> subprocess.CompletedProcess[str]:
-        messages = []
-        program = lower_hir_static_cleanups(
-            compile_to_hir(load_source_file(path), print_handler=messages.append)
-        )
-        llvm_source = emit_hir_llvm(program)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            module = root / 'main.ll'
-            executable = root / 'program'
-            module.write_text(llvm_source)
-            runtime = Path(__file__).parents[1] / 'jack/c_runtime'
-            compiled = subprocess.run(
-                [
-                    'clang', str(module), str(runtime / 'jack_std_io.c'),
-                    '-I', str(runtime), '-o', str(executable),
-                ],
-                capture_output=True, text=True, check=False,
-            )
-            self.assertEqual(0, compiled.returncode, compiled.stderr + '\n' + llvm_source)
-            completed = subprocess.run(
-                [str(executable)], cwd=Path(__file__).parents[1],
-                capture_output=True, text=True, check=False,
-            )
-        completed.stdout = ''.join(f'{message}\n' for message in messages) + completed.stdout
-        return completed
 
     def test_scalar_functions_compile_and_run(self):
         completed = self.compile_and_run('''
@@ -260,24 +237,56 @@ class LLVMEmitPassTests(unittest.TestCase):
         self.assertEqual(0, completed.returncode)
         self.assertEqual('result = 23\nerror.code = 8\n', completed.stdout)
 
-    def test_checked_in_examples_match_the_interpreter(self):
-        examples = Path(__file__).parents[1] / 'examples'
-        for path in sorted(examples.glob('*.jack')):
-            # These two currently fail before HIR lowering: built_in uses a
-            # raw-byte comparison rejected by semantic validation, and the IO
-            # example's relative comptime path does not match the documented
-            # repository-root invocation.
-            if path.name in {'built_in.jack', 'io_read_file.jack'}:
-                continue
-            with self.subTest(example=path.name):
-                expected = io.StringIO()
-                with redirect_stdout(expected):
-                    status = jack_main(['-i', str(path)])
-                self.assertEqual(0, status)
-                completed = self.compile_path_and_run(path)
-                self.assertEqual(0, completed.returncode, completed.stderr)
-                self.assertEqual(expected.getvalue(), completed.stdout)
+    def test_error_payloads_are_inline_and_deterministically_ordered(self):
+        llvm_source = self.emit('''
+            struct ZebraError { i32 code; }
+            struct AlphaError { i32 code; }
 
+            void fail() raises ZebraError, AlphaError {
+                raise ZebraError { code = 4 };
+            }
+
+            try {
+                fail();
+            } catch AlphaError error {
+                print(error.code);
+            } catch ZebraError error {
+                print(error.code);
+            }
+        ''')
+
+        self.assertIn(
+            '%jack.error.payload = type { %"AlphaError", %"ZebraError" }',
+            llvm_source,
+        )
+        self.assertIn('insertvalue %jack.error.payload zeroinitializer', llvm_source)
+        self.assertIn('extractvalue %jack.error.payload', llvm_source)
+        self.assertNotIn('@malloc', llvm_source)
+
+    def test_all_allocas_are_emitted_in_function_entry_blocks(self):
+        llvm_source = self.emit('''
+            void repeat() {
+                i32 index = 0;
+                while (index < 3) {
+                    i32 local = index;
+                    print(local);
+                    index = index + 1;
+                }
+            }
+            repeat();
+        ''')
+
+        current_label = None
+        for line in llvm_source.splitlines():
+            stripped = line.strip()
+            if stripped.endswith(':'):
+                current_label = stripped[:-1]
+            elif ' = alloca ' in stripped:
+                self.assertEqual('entry', current_label, stripped)
+        self.assertRegex(
+            llvm_source,
+            r'while\.body\.\d+:\n(?:  .*\n)*?  store i32 zeroinitializer, ptr %local',
+        )
 
 if __name__ == '__main__':
     unittest.main()

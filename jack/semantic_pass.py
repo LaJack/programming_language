@@ -1087,6 +1087,7 @@ class SemanticPass:
             if not (
                 is_numeric_type(left_name)
                 or is_bool_type(left_name)
+                or is_raw_byte_type(left_name)
                 or self._is_str_type(left_type)
             ):
                 raise SemanticError(f'Operator "{expression.operator}" is not implemented for type "{left_name}".')

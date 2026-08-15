@@ -14,6 +14,8 @@ from .compiler_driver import (
 from .comptime_externs import default_comptime_externs
 from .interpreter import Interpreter, InterpreterError
 from .hir_lowering_pass import HIRLoweringError
+from .hir_validation_pass import HIRValidationError
+from .llvm_ir import LLVMValidationError
 from .llvm_lowering_pass import LLVMLoweringError
 from .module_loader import ModuleLoadError, load_source_file
 from .parser import ParseError
@@ -144,6 +146,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help='preserve generated backend and runtime files in DIR',
     )
+    parser.add_argument(
+        '-O',
+        dest='optimization',
+        type=int,
+        choices=range(4),
+        default=0,
+        metavar='LEVEL',
+        help='set native optimization level from 0 through 3',
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         '-i',
@@ -234,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
                     import_overrides=import_overrides,
                     save_temps=args.save_temps,
                     clang=args.cc,
+                    optimization=args.optimization,
                 ),
             )
     except OSError as err:
@@ -245,6 +257,8 @@ def main(argv: list[str] | None = None) -> int:
         CompileTimeError,
         SemanticError,
         HIRLoweringError,
+        HIRValidationError,
+        LLVMValidationError,
         LLVMLoweringError,
         CleanupLoweringError,
         CEmitError,

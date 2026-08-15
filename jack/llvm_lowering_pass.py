@@ -42,7 +42,9 @@ from .source_model import TypeReference
 
 
 class LLVMLoweringError(Exception):
-    pass
+    def __init__(self, message: str, span=None) -> None:
+        super().__init__(message)
+        self.span = span
 
 
 @dataclass(frozen=True)
@@ -61,9 +63,11 @@ class FunctionBuilder:
         self.terminated = False
         self.counter = 0
         self.label_counter = 0
+        self.entry_alloca_count = 0
         self.env: dict[str, tuple[str, TypeReference]] = dict(lowerer.global_env)
         self.error_handlers: list[str] = []
         self.caught_errors: list[tuple[str, str]] = []
+        self.has_error_slots = False
 
     def temp(self, prefix: str = 'v') -> str:
         self.counter += 1
@@ -93,8 +97,13 @@ class FunctionBuilder:
 
     def alloca(self, type_name: str, prefix: str = 'slot') -> str:
         value = self.temp(prefix)
-        self.emit(f'{value} = alloca {type_name}')
+        self.named_alloca(value, type_name)
         return value
+
+    def named_alloca(self, value: str, type_name: str) -> None:
+        entry = self.blocks[0][1]
+        entry.insert(self.entry_alloca_count, f'{value} = alloca {type_name}')
+        self.entry_alloca_count += 1
 
 
 class LLVMLoweringPass:
@@ -106,6 +115,7 @@ class LLVMLoweringPass:
         self.global_env: dict[str, tuple[str, TypeReference]] = {}
         self.string_globals: dict[bytes, str] = {}
         self.error_tags: dict[str, int] = {}
+        self.error_payload_indices: dict[str, int] = {}
         self.result_types: dict[str, str] = {}
         self.builder: FunctionBuilder | None = None
 
@@ -128,6 +138,7 @@ class LLVMLoweringPass:
         self._collect_error_tags(program)
         self._declare_runtime()
         self._declare_types()
+        self._declare_error_payload()
         self._declare_globals(program)
         self._declare_functions(program)
         for declaration in program.declarations:
@@ -143,7 +154,6 @@ class LLVMLoweringPass:
         self.module.type_definitions.append('%jack.str = type { ptr, i32 }')
         self.module.declarations.extend([
             'declare i32 @printf(ptr, ...)',
-            'declare ptr @malloc(i64)',
             'declare void @abort() noreturn',
             'declare i32 @memcmp(ptr, ptr, i64)',
             'declare i16 @llvm.bswap.i16(i16)',
@@ -166,6 +176,16 @@ class LLVMLoweringPass:
             self.module.type_definitions.append(
                 f'{self._named_type(declaration.name)} = type {{ {fields} }}'
             )
+
+    def _declare_error_payload(self) -> None:
+        names = sorted(self.error_tags)
+        self.error_payload_indices = {
+            name: index for index, name in enumerate(names)
+        }
+        fields = ', '.join(self._named_type(name) for name in names) or 'i8'
+        self.module.type_definitions.append(
+            f'%jack.error.payload = type {{ {fields} }}'
+        )
 
     def _declare_globals(self, program: HIRProgram) -> None:
         for declaration in program.declarations:
@@ -306,12 +326,15 @@ class LLVMLoweringPass:
             return
         if isinstance(statement, HIRRaise):
             value = self._expression(statement.expr, env)
-            payload = self._heap_copy(value)
+            value = self._coerce(value, statement.error_type)
+            payload = self._error_payload(value, statement.error_type.name)
             self._propagate_error(str(self.error_tags[statement.error_type.name]), payload)
             return
         if isinstance(statement, HIRRethrow):
             if not self._b.caught_errors:
-                raise LLVMLoweringError('rethrow reached LLVM lowering outside a catch.')
+                raise LLVMLoweringError(
+                    'rethrow reached LLVM lowering outside a catch.', statement.span
+                )
             tag, payload = self._b.caught_errors[-1]
             self._propagate_error(tag, payload)
             return
@@ -330,7 +353,9 @@ class LLVMLoweringPass:
         if isinstance(statement, HIRTry):
             self._try(statement, env)
             return
-        raise LLVMLoweringError(f'Unsupported HIR statement {type(statement).__name__}.')
+        raise LLVMLoweringError(
+            f'Unsupported HIR statement {type(statement).__name__}.', statement.span
+        )
 
     def _if(self, statement: HIRIf, env) -> None:
         merge = self._b.label('if.end')
@@ -389,6 +414,7 @@ class LLVMLoweringPass:
     def _try(self, statement: HIRTry, env) -> None:
         handler = self._b.label('try.error')
         merge = self._b.label('try.end')
+        self._ensure_error_slots()
         self._b.error_handlers.append(handler)
         self._statements(statement.body, dict(env))
         self._b.error_handlers.pop()
@@ -396,8 +422,10 @@ class LLVMLoweringPass:
         self._b.start(handler)
         tag = self._b.temp('error.tag')
         payload = self._b.temp('error.payload')
-        self._b.emit(f'{tag} = load i32, ptr %jack.error.tag')
-        self._b.emit(f'{payload} = load ptr, ptr %jack.error.payload')
+        self._b.emit(f'{tag} = load i32, ptr %jack.error.tag.slot')
+        self._b.emit(
+            f'{payload} = load %jack.error.payload, ptr %jack.error.payload.slot'
+        )
         for catch in statement.catches:
             body_label = self._b.label('catch.body')
             next_label = self._b.label('catch.next')
@@ -410,7 +438,11 @@ class LLVMLoweringPass:
                 type_name = self._type(catch.error_type)
                 slot = self._b.alloca(type_name, 'caught')
                 value = self._b.temp('caught')
-                self._b.emit(f'{value} = load {type_name}, ptr {payload}')
+                payload_index = self.error_payload_indices[catch.error_type.name]
+                self._b.emit(
+                    f'{value} = extractvalue %jack.error.payload {payload}, '
+                    f'{payload_index}'
+                )
                 self._b.emit(f'store {type_name} {value}, ptr {slot}')
                 catch_env[catch.name] = (slot, catch.error_type)
             self._b.caught_errors.append((tag, payload))
@@ -463,7 +495,9 @@ class LLVMLoweringPass:
             return self._call(expression, env)
         if isinstance(expression, HIRStructLiteralExpression):
             return self._struct_literal(expression, env)
-        raise LLVMLoweringError(f'Unsupported HIR expression {type(expression).__name__}.')
+        raise LLVMLoweringError(
+            f'Unsupported HIR expression {type(expression).__name__}.', expression.span
+        )
 
     def _lvalue(self, expression: HIRExpression, env) -> tuple[str, TypeReference]:
         if isinstance(expression, HIRVariableExpression):
@@ -472,7 +506,9 @@ class LLVMLoweringPass:
             target_ptr, target_type = self._lvalue_target(expression.target, env)
             owner = self.views.get(expression.owner_type_name) or self.types.get(expression.owner_type_name)
             if owner is None:
-                raise LLVMLoweringError(f'Unknown field owner {expression.owner_type_name}.')
+                raise LLVMLoweringError(
+                    f'Unknown field owner {expression.owner_type_name}.', expression.span
+                )
             fields = owner.fields
             index = next(i for i, field in enumerate(fields) if field.name == expression.field_name)
             pointer = self._b.temp('field.ptr')
@@ -508,7 +544,9 @@ class LLVMLoweringPass:
             else:
                 self._b.emit(f'{pointer} = getelementptr {self._type(element_type)}, ptr {target_ptr}, i64 {index_operand}')
             return pointer, element_type
-        raise LLVMLoweringError(f'Expression {type(expression).__name__} is not assignable.')
+        raise LLVMLoweringError(
+            f'Expression {type(expression).__name__} is not assignable.', expression.span
+        )
 
     def _lvalue_target(self, expression: HIRExpression, env) -> tuple[str, TypeReference]:
         if (
@@ -570,7 +608,9 @@ class LLVMLoweringPass:
         if call.target.kind == 'method':
             if call.implicit_self_argument is not None:
                 if call.target.self_parameter is None:
-                    raise LLVMLoweringError(f'Method {call.target.name} has no self parameter.')
+                    raise LLVMLoweringError(
+                        f'Method {call.target.name} has no self parameter.', call.span
+                    )
                 arguments.append(
                     self._argument(
                         call.implicit_self_argument,
@@ -761,7 +801,8 @@ class LLVMLoweringPass:
         target_spec = BUILTIN_TYPE_SPECS.get(target_ref.name)
         if source_spec is None or target_spec is None:
             raise LLVMLoweringError(
-                f'Cannot coerce {value.type_name} to {target_type} during LLVM lowering.'
+                f'Cannot coerce {value.type_name} to {target_type} during LLVM lowering.',
+                target_ref.span,
             )
         if value.operand.lstrip('-').isdigit() and target_spec.family != 'float':
             return LLVMValue(target_type, value.operand, target_ref)
@@ -880,21 +921,22 @@ class LLVMLoweringPass:
         self._b.emit(f'{length} = extractvalue %jack.str {value.operand}, 1')
         return data, length
 
-    def _heap_copy(self, value: LLVMValue) -> str:
-        size_ptr = self._b.temp('size.ptr')
-        size = self._b.temp('size')
+    def _error_payload(self, value: LLVMValue, error_name: str) -> str:
         payload = self._b.temp('payload')
-        self._b.emit(f'{size_ptr} = getelementptr {value.type_name}, ptr null, i32 1')
-        self._b.emit(f'{size} = ptrtoint ptr {size_ptr} to i64')
-        self._b.emit(f'{payload} = call ptr @malloc(i64 {size})')
-        self._b.emit(f'store {value.type_name} {value.operand}, ptr {payload}')
+        index = self.error_payload_indices[error_name]
+        self._b.emit(
+            f'{payload} = insertvalue %jack.error.payload zeroinitializer, '
+            f'{value.type_name} {value.operand}, {index}'
+        )
         return payload
 
     def _propagate_error(self, tag: str, payload: str) -> None:
         if self._b.error_handlers:
             self._ensure_error_slots()
-            self._b.emit(f'store i32 {tag}, ptr %jack.error.tag')
-            self._b.emit(f'store ptr {payload}, ptr %jack.error.payload')
+            self._b.emit(f'store i32 {tag}, ptr %jack.error.tag.slot')
+            self._b.emit(
+                f'store %jack.error.payload {payload}, ptr %jack.error.payload.slot'
+            )
             self._b.terminate(f'br label %{self._b.error_handlers[-1]}')
             return
         declaration = self._b.declaration
@@ -908,7 +950,10 @@ class LLVMLoweringPass:
         third = self._b.temp('error.result')
         self._b.emit(f'{first} = insertvalue {result_type} zeroinitializer, i1 false, 0')
         self._b.emit(f'{second} = insertvalue {result_type} {first}, i32 {tag}, 1')
-        self._b.emit(f'{third} = insertvalue {result_type} {second}, ptr {payload}, 2')
+        self._b.emit(
+            f'{third} = insertvalue {result_type} {second}, '
+            f'%jack.error.payload {payload}, 2'
+        )
         self._b.terminate(f'ret {result_type} {third}')
 
     def _return_success(self, value: LLVMValue | None) -> None:
@@ -933,12 +978,11 @@ class LLVMLoweringPass:
         self._b.terminate(f'ret {result_type} {current}')
 
     def _ensure_error_slots(self) -> None:
-        # Error slots are function-local names. LLVM permits their entry-block
-        # allocas to be referenced from later blocks.
-        entry = self._b.blocks[0][1]
-        if not any('%jack.error.tag = alloca' in line for line in entry):
-            entry.insert(0, '%jack.error.payload = alloca ptr')
-            entry.insert(0, '%jack.error.tag = alloca i32')
+        if self._b.has_error_slots:
+            return
+        self._b.named_alloca('%jack.error.tag.slot', 'i32')
+        self._b.named_alloca('%jack.error.payload.slot', '%jack.error.payload')
+        self._b.has_error_slots = True
 
     def _collect_error_tags(self, program: HIRProgram) -> None:
         functions = list(self.functions.values())
@@ -956,7 +1000,9 @@ class LLVMLoweringPass:
         name = self.result_types.get(key)
         if name is None:
             name = f'%jack.result.{len(self.result_types)}'
-            fields = 'i1, i32, ptr' + (f', {value_type}' if value_type != 'void' else '')
+            fields = 'i1, i32, %jack.error.payload'
+            if value_type != 'void':
+                fields += f', {value_type}'
             self.module.type_definitions.append(f'{name} = type {{ {fields} }}')
             self.result_types[key] = name
         return name

@@ -4,7 +4,21 @@ Jack is a small experimental language for exploring explicit `comptime` evaluati
 
 For a compact description of the current language, see [the language reference](docs/language-reference.md).
 
-Run a program with the interpreter:
+Build a native executable with the LLVM backend:
+
+```bash
+jack source.jk
+./source
+```
+
+Choose the output path or the C backend explicitly:
+
+```bash
+jack source.jk -o build/source
+jack --backend c source.jk -o build/source-c
+```
+
+Run a program with the interpreter instead:
 
 ```bash
 jack -i source.jk
@@ -12,19 +26,22 @@ jack -i source.jk
 
 Editor support lives in `vscode-jack/`. It currently provides VSCode syntax highlighting, language configuration, experimental parse diagnostics, document symbols, hover, and same-document go-to-definition through `python3 -m jack.lsp_server` for `.jack` and `.jk` files.
 
-Emit C instead:
+Emit C for inspection:
 
 ```bash
 jack -c source.jk
 ```
 
-The default C output is a single bundled translation unit for quick inspection. For separate compilation of imported Jack modules, write split output to a directory:
+The emitted C output is a single bundled translation unit by default. For separate compilation of imported Jack modules, write split output to a directory:
 
 ```bash
 jack -c source.jk -o build/c
 ```
 
 Split output writes `main.c`, one `.h`/`.c` pair per imported Jack module, and copies the small C runtime files into the output directory. The generated files include `jack_runtime.h`; programs using `std.io` also include and compile `jack_std_io.c`.
+
+Normal native builds keep intermediates in a temporary directory. Preserve the
+textual LLVM IR or generated C inputs with `--save-temps DIR`.
 
 
 Modules can declare their source name and import other files before the compile-time pass runs. Module paths are resolved from the entry file directory and module roots by mapping `foo.bar` to `foo/bar.jack` or `foo/bar.jk`; the current implementation flattens loaded declarations into the program AST, then uses module metadata to enforce import visibility.

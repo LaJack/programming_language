@@ -1,7 +1,22 @@
 from .c_emit_pass import CEmitError, CEmitFeatureNotImplemented, emit_c, emit_c_files, emit_hir_c, emit_hir_c_files, emit_runtime_c, emit_runtime_c_files
 from .cleanup_lowering_pass import lower_hir_static_cleanups
 from .compile_time_pass import CompileTimeError, CompileTimeFeatureNotImplemented, apply_compile_time_pass
+from .compiler_driver import (
+    BackendArtifacts,
+    BackendNotFoundError,
+    CBackend,
+    CompilationOptions,
+    CompilationResult,
+    CompilerBackend,
+    CompilerDriver,
+    CompilerDriverError,
+    LLVMBackend,
+    ToolchainError,
+    compile_executable,
+)
 from .hir_lowering_pass import HIRLoweringError, compile_to_hir, lower_to_hir
+from .llvm_emit_pass import emit_hir_llvm
+from .llvm_lowering_pass import LLVMLoweringError, lower_to_llvm
 from .interpreter import EvaluationError, Interpreter, InterpreterError, NameResolutionError
 from .jack_emit_pass import JackEmitError, emit_jack
 from .ast_nodes import SourceSpan
@@ -19,7 +34,21 @@ __all__ = [
     'CEmitError',
     'CompileTimeError',
     'CompileTimeFeatureNotImplemented',
+    'BackendArtifacts',
+    'BackendNotFoundError',
+    'CBackend',
+    'CompilationOptions',
+    'CompilationResult',
+    'CompilerBackend',
+    'CompilerDriver',
+    'CompilerDriverError',
+    'LLVMBackend',
+    'ToolchainError',
+    'compile_executable',
     'HIRLoweringError',
+    'LLVMLoweringError',
+    'emit_hir_llvm',
+    'lower_to_llvm',
     'compile_to_hir',
     'lower_to_hir',
     'lower_hir_static_cleanups',

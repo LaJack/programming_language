@@ -1,4 +1,5 @@
 import io
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -115,54 +116,102 @@ class CliTests(unittest.TestCase):
         self.assertNotIn('offset = 7', output.getvalue())
         self.assertEqual('offset = 7\n', errors.getvalue())
 
-    def test_emit_jack_after_comptime_prints_runtime_ast(self):
+    def test_default_mode_builds_an_executable(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / 'program.jk'
+            root = Path(tmpdir)
+            source = root / 'program.jk'
+            executable = root / 'program'
             source.write_text('''
                 comptime i32 offset = 7;
-                comptime print(offset);
                 i32 y = offset;
                 print(y);
             ''')
 
-            output = io.StringIO()
-            errors = io.StringIO()
-            with redirect_stdout(output), redirect_stderr(errors):
-                status = main(['--emit-jack', str(source), '--after', 'comptime'])
+            status = main([str(source), '-o', str(executable)])
+            completed = subprocess.run(
+                [str(executable)], capture_output=True, text=True, check=False
+            )
 
         self.assertEqual(0, status)
-        self.assertEqual('offset = 7\n', errors.getvalue())
-        self.assertIn('i32 y = 7;', output.getvalue())
-        self.assertIn('print(y);', output.getvalue())
-        self.assertNotIn('comptime', output.getvalue())
+        self.assertEqual(0, completed.returncode)
+        self.assertEqual('y = 7\n', completed.stdout)
 
-    def test_emit_jack_after_parse_prints_loaded_source_ast(self):
+    def test_default_llvm_build_resolves_imported_modules(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / 'program.jk'
-            source.write_text('''
-                module app.main;
-                i32 y = 3;
+            root = Path(tmpdir)
+            module = root / 'math' / 'ops.jack'
+            module.parent.mkdir()
+            module.write_text('''
+                module math.ops;
+                pub i32 add(i32 left, i32 right) { return left + right; }
             ''')
+            source = root / 'program.jack'
+            source.write_text('''
+                import math.ops;
+                i32 value = add(5, 6);
+                print(value);
+            ''')
+            executable = root / 'program'
+            temps = root / 'temps'
 
-            output = io.StringIO()
-            with redirect_stdout(output):
-                status = main(['--emit-jack', str(source), '--after', 'parse'])
+            status = main([
+                str(source), '-o', str(executable), '--save-temps', str(temps)
+            ])
+            completed = subprocess.run(
+                [str(executable)], capture_output=True, text=True, check=False
+            )
+            llvm_exists = (temps / 'main.ll').is_file()
 
         self.assertEqual(0, status)
-        self.assertIn('module app.main;', output.getvalue())
-        self.assertIn('i32 y = 3;', output.getvalue())
+        self.assertEqual('value = 11\n', completed.stdout)
+        self.assertTrue(llvm_exists)
 
-    def test_after_is_rejected_without_emit_jack(self):
+    def test_native_mode_can_save_c_backend_temps(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / 'program.jk'
+            executable = root / 'program'
+            temps = root / 'temps'
+            source.write_text('i32 y = 3;')
+
+            status = main([
+                '--backend', 'c',
+                '--save-temps', str(temps),
+                '-o', str(executable),
+                str(source),
+            ])
+            executable_exists = executable.is_file()
+            main_c_exists = (temps / 'main.c').is_file()
+            runtime_exists = (temps / 'jack_runtime.h').is_file()
+
+        self.assertEqual(0, status)
+        self.assertTrue(executable_exists)
+        self.assertTrue(main_c_exists)
+        self.assertTrue(runtime_exists)
+
+    def test_interpreter_rejects_native_output_options(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / 'program.jk'
             source.write_text('i32 y = 3;')
 
             errors = io.StringIO()
             with redirect_stderr(errors):
-                status = main(['--after', 'comptime', '-i', str(source)])
+                status = main(['-i', '-o', str(Path(tmpdir) / 'out'), str(source)])
 
         self.assertNotEqual(0, status)
-        self.assertIn('--after can only be used with --emit-jack', errors.getvalue())
+        self.assertIn('--output cannot be used with -i/--interpret', errors.getvalue())
+
+    def test_native_mode_reports_missing_clang(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jk'
+            source.write_text('i32 y = 3;')
+
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                status = main(['--cc', 'missing-jack-clang', str(source)])
+
+        self.assertEqual(1, status)
+        self.assertIn('Cannot find Clang executable', errors.getvalue())
 
     def test_interpreter_mode_runs_stdio_extern_bindings(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -227,7 +276,7 @@ class CliTests(unittest.TestCase):
 
             errors = io.StringIO()
             with redirect_stderr(errors):
-                status = main(['--emit-jack', str(source), '--after', 'parse'])
+                status = main(['-i', str(source)])
 
         self.assertEqual(1, status)
         diagnostic = errors.getvalue()

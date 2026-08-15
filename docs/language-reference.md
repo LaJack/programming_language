@@ -15,11 +15,18 @@ The bootstrap compiler uses this pipeline:
 
 ```text
 source -> module loading -> AST -> comptime -> typed HIR -> runtime consumer
+                                                    |-> interpreter
+                                                    |-> cleanup -> LLVM -> Clang
+                                                    `-> cleanup -> C -> Clang
 ```
 
 `compile_to_hir` is the canonical source-to-runtime boundary. It consumes all
 compile-time constructs, validates the resulting runtime program, and lowers it
 to typed HIR. The interpreter executes `HIRProgram` directly.
+
+`CompilerDriver` owns native compilation and delegates cleaned HIR to a selected
+backend. The dependency-free LLVM backend emits textual opaque-pointer LLVM IR
+and is the default; the C backend remains available with `--backend c`.
 
 `lower_hir_static_cleanups` inserts destructor calls and error-path cleanup in
 HIR. The interpreter and both bundled and split-module C emitters then consume

@@ -70,7 +70,9 @@ except ImportError:
 
 
 class ModuleLoadError(Exception):
-    pass
+    def __init__(self, message: str, span=None) -> None:
+        super().__init__(message)
+        self.span = span
 
 
 def default_module_roots() -> list[Path]:
@@ -167,7 +169,7 @@ class ModuleResolver:
         try:
             ast = parse(source)
         except ParseError as err:
-            raise ModuleLoadError(f'Cannot parse module source "{path}": {err}') from err
+            raise ModuleLoadError(str(err), getattr(err, 'span', None)) from err
 
         module_name, imports, body = self._split_module_ast(ast, path, expected_module, is_entry)
         if module_name in self.loaded:

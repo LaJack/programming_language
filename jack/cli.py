@@ -5,15 +5,20 @@ from pathlib import Path
 from .ast_nodes import SourceSpan
 from .c_emit_pass import CEmitError, emit_c, emit_c_files
 from .cleanup_lowering_pass import CleanupLoweringError
-from .compile_time_pass import CompileTimeError, apply_compile_time_pass
+from .compile_time_pass import CompileTimeError
+from .compiler_driver import (
+    CompilationOptions,
+    CompilerDriver,
+    CompilerDriverError,
+)
 from .comptime_externs import default_comptime_externs
 from .interpreter import Interpreter, InterpreterError
-from .hir_lowering_pass import compile_to_hir
-from .jack_emit_pass import JackEmitError, emit_jack
+from .hir_lowering_pass import HIRLoweringError
+from .llvm_lowering_pass import LLVMLoweringError
 from .module_loader import ModuleLoadError, load_source_file
-from .parser import ParseError, parse
+from .parser import ParseError
 from .runtime_externs import default_runtime_externs
-from .semantic_pass import SemanticError, validate_runtime_ast
+from .semantic_pass import SemanticError
 
 
 def run_interpreter(
@@ -21,9 +26,17 @@ def run_interpreter(
     import_overrides: dict[str, str] | None = None,
     module_roots: list[Path] | None = None,
 ) -> None:
-    ast = load_source_file(path, import_overrides=import_overrides, search_roots=module_roots)
     comptime_externs = default_comptime_externs()
-    program = compile_to_hir(ast, externs=comptime_externs)
+    program = CompilerDriver(
+        print_handler=print,
+        comptime_externs=comptime_externs,
+    ).compile_hir(
+        path,
+        CompilationOptions(
+            module_roots=tuple(module_roots or ()),
+            import_overrides=import_overrides or {},
+        ),
+    )
     Interpreter(
         externs=default_runtime_externs(),
         comptime_externs=comptime_externs,
@@ -59,29 +72,6 @@ def run_c_emitter(
     _copy_c_runtime_files(output_dir)
 
 
-def run_jack_emitter(
-    path: Path,
-    after: str,
-    import_overrides: dict[str, str] | None = None,
-    module_roots: list[Path] | None = None,
-) -> None:
-    if after == 'parse':
-        print(emit_jack(parse(path.read_text())), end='')
-        return
-
-    ast = load_source_file(path, import_overrides=import_overrides, search_roots=module_roots)
-    runtime_ast = apply_compile_time_pass(
-        ast,
-        print_handler=lambda line: print(line, file=sys.stderr),
-        externs=default_comptime_externs(),
-    )
-    if after == 'comptime':
-        print(emit_jack(validate_runtime_ast(runtime_ast)), end='')
-        return
-
-    raise ValueError(f'Unknown Jack emission stage "{after}".')
-
-
 def _copy_c_runtime_files(output_dir: Path) -> None:
     runtime_dir = Path(__file__).resolve().parent / 'c_runtime'
     for path in sorted(runtime_dir.iterdir()):
@@ -103,6 +93,12 @@ def parse_stub_overrides(values: list[str]) -> dict[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='jack')
+    parser.add_argument(
+        'source',
+        metavar='FILE',
+        type=Path,
+        help='entry source file',
+    )
     parser.add_argument(
         '--module-root',
         action='append',
@@ -126,48 +122,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '-o',
         '--output',
-        metavar='DIR',
+        metavar='PATH',
         type=Path,
-        help='write split C output to DIR when used with -c',
+        help='write the executable to PATH, or split C output to PATH with -c',
     )
     parser.add_argument(
-        '--after',
-        choices=['parse', 'comptime'],
-        default=None,
-        help='choose the AST stage printed by --emit-jack',
+        '--backend',
+        choices=['llvm', 'c'],
+        default='llvm',
+        help='select the native code generation backend',
     )
-    mode = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument(
+        '--cc',
+        default='clang',
+        metavar='PATH',
+        help='Clang executable used for native builds',
+    )
+    parser.add_argument(
+        '--save-temps',
+        metavar='DIR',
+        type=Path,
+        help='preserve generated backend and runtime files in DIR',
+    )
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         '-i',
         '--interpret',
-        metavar='FILE',
-        type=Path,
-        help='run FILE with the interpreter',
+        action='store_true',
+        help='run FILE with the interpreter instead of compiling it',
     )
     mode.add_argument(
         '-c',
         '--emit-c',
-        metavar='FILE',
-        type=Path,
+        action='store_true',
         help='emit C for FILE',
-    )
-    mode.add_argument(
-        '--emit-jack',
-        metavar='FILE',
-        type=Path,
-        help='emit Jack source for FILE after a selected compiler stage',
     )
     return parser
 
 
 def _diagnostic_source_path(args: argparse.Namespace) -> Path | None:
-    if args.interpret is not None:
-        return args.interpret
-    if args.emit_c is not None:
-        return args.emit_c
-    if args.emit_jack is not None:
-        return args.emit_jack
-    return None
+    return args.source
 
 
 def _format_error(err: Exception, source_path: Path | None = None) -> str:
@@ -206,32 +200,41 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        if args.output is not None and args.emit_c is None:
-            parser.error('--output can only be used with -c/--emit-c')
-        if args.after is not None and args.emit_jack is None:
-            raise ValueError('--after can only be used with --emit-jack')
+        if args.interpret and args.output is not None:
+            raise ValueError('--output cannot be used with -i/--interpret')
+        if args.interpret and args.save_temps is not None:
+            raise ValueError('--save-temps cannot be used with -i/--interpret')
+        if args.emit_c and args.save_temps is not None:
+            raise ValueError('--save-temps cannot be used with -c/--emit-c')
         import_overrides = parse_stub_overrides(args.stub)
         module_roots = args.module_root or None
         source_path = _diagnostic_source_path(args)
-        if args.interpret is not None:
+        if args.interpret:
             run_interpreter(
-                args.interpret,
+                args.source,
                 import_overrides=import_overrides,
                 module_roots=module_roots,
             )
-        elif args.emit_c is not None:
+        elif args.emit_c:
             run_c_emitter(
-                args.emit_c,
+                args.source,
                 import_overrides=import_overrides,
                 module_roots=module_roots,
                 output_dir=args.output,
             )
         else:
-            run_jack_emitter(
-                args.emit_jack,
-                args.after or 'comptime',
-                import_overrides=import_overrides,
-                module_roots=module_roots,
+            CompilerDriver(
+                print_handler=lambda line: print(line, file=sys.stderr)
+            ).compile_executable(
+                args.source,
+                CompilationOptions(
+                    backend=args.backend,
+                    output=args.output,
+                    module_roots=tuple(module_roots or ()),
+                    import_overrides=import_overrides,
+                    save_temps=args.save_temps,
+                    clang=args.cc,
+                ),
             )
     except OSError as err:
         print(f'jack: {err}', file=sys.stderr)
@@ -241,9 +244,11 @@ def main(argv: list[str] | None = None) -> int:
         ParseError,
         CompileTimeError,
         SemanticError,
+        HIRLoweringError,
+        LLVMLoweringError,
         CleanupLoweringError,
-        JackEmitError,
         CEmitError,
+        CompilerDriverError,
         InterpreterError,
         ModuleLoadError,
     ) as err:

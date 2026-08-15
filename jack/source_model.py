@@ -12,6 +12,7 @@ class SourceSpan:
     end_column: int
     start_offset: int
     end_offset: int
+    source_path: str | None = field(default=None, compare=False)
 
 
 @dataclass

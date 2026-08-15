@@ -17,6 +17,7 @@ Choose the output path or the C backend explicitly:
 jack source.jk -o build/source
 jack --backend c source.jk -o build/source-c
 jack -O2 source.jk -o build/source-optimized
+jack -g source.jk -o build/source-debug
 ```
 
 Run a program with the interpreter instead:
@@ -45,6 +46,8 @@ Normal native builds keep intermediates in a temporary directory. Preserve the
 textual LLVM IR or generated C inputs with `--save-temps DIR`.
 Native optimization defaults to `-O0`; `-O1` through `-O3` are passed directly
 to Clang for both backends.
+Use `-g` to retain Jack function and statement locations in native debug
+information. It can be combined with either backend and any optimization level.
 
 
 Modules can declare their source name and import other files before the compile-time pass runs. Module paths are resolved from the entry file directory and module roots by mapping `foo.bar` to `foo/bar.jack` or `foo/bar.jk`; the current implementation flattens loaded declarations into the program AST, then uses module metadata to enforce import visibility.

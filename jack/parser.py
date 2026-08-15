@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     from .ast_nodes import (
@@ -118,8 +119,11 @@ class Lexer:
     SYMBOLS = set('{}();,+.=<>![]&')
     TWO_CHAR_SYMBOLS = {'==', '!=', '<=', '>=', '..'}
 
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, source_path: str | Path | None = None) -> None:
         self.source = source
+        self.source_path = (
+            None if source_path is None else str(Path(source_path).resolve())
+        )
         self.index = 0
         self.line = 1
         self.column = 1
@@ -312,6 +316,7 @@ class Lexer:
             self.column if end_column is None else end_column,
             start_offset,
             self.index if end_offset is None else end_offset,
+            self.source_path,
         )
 
     def _peek(self) -> str:
@@ -398,6 +403,7 @@ class Parser:
             end_token.span.end_column,
             start_token.span.start_offset,
             end_token.span.end_offset,
+            start_token.span.source_path,
         )
 
     def _declaration(self) -> Statement:
@@ -1366,5 +1372,7 @@ class Parser:
         )
 
 
-def parse(source: str) -> list[Statement]:
-    return Parser(Lexer(source).tokenize()).parse()
+def parse(
+    source: str, source_path: str | Path | None = None
+) -> list[Statement]:
+    return Parser(Lexer(source, source_path=source_path).tokenize()).parse()

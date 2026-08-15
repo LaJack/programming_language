@@ -786,6 +786,21 @@ class CompileTimePass:
     def _apply_expression(
         self, expression: Expression, scope: CompileTimeScope
     ) -> tuple[list[Statement], Expression]:
+        try:
+            prelude, lowered = self._apply_expression_inner(expression, scope)
+        except CompileTimeError as err:
+            self._attach_error_span(err, expression)
+            raise
+        if lowered.span is None:
+            lowered.span = expression.span
+        for statement in prelude:
+            if statement.span is None:
+                statement.span = expression.span
+        return prelude, lowered
+
+    def _apply_expression_inner(
+        self, expression: Expression, scope: CompileTimeScope
+    ) -> tuple[list[Statement], Expression]:
         if type(expression) is LiteralExpression:
             return [], copy.deepcopy(expression)
         if type(expression) is FormattedStringExpression:
@@ -862,7 +877,9 @@ class CompileTimePass:
         for field in expression.fields:
             field_prelude, field_expr = self._apply_expression(field.expr, scope)
             prelude.extend(field_prelude)
-            fields.append(StructLiteralField(field.name, field_expr))
+            fields.append(
+                StructLiteralField(field.name, field_expr, span=field.span)
+            )
         return prelude, StructLiteralExpression(
             self._apply_type_reference(expression.type_ref, scope),
             fields,
@@ -980,6 +997,7 @@ class CompileTimePass:
                 qualified_imports=list(declaration.qualified_imports),
                 raises=self._apply_raises_clause(declaration.raises, body_scope),
                 raises_inferred=declaration.raises_inferred,
+                span=declaration.span,
             )
             self.generated_variants.append(variant)
             self.functions[variant_name] = variant
@@ -1114,6 +1132,7 @@ class CompileTimePass:
         lowered.array_size = self._apply_array_size(type_ref.array_size, scope)
         lowered.is_slice = type_ref.is_slice
         lowered.borrow = type_ref.borrow
+        lowered.span = type_ref.span
         return lowered
 
     def _apply_generic_type_reference(
@@ -1163,11 +1182,12 @@ class CompileTimePass:
                 source_name=declaration.source_name,
                 imports=list(declaration.imports),
                 qualified_imports=list(declaration.qualified_imports),
+                span=declaration.span,
             )
             self.generated_types.append(generated_type)
             self.types[variant_name] = generated_type
 
-        return TypeReference(variant_name)
+        return TypeReference(variant_name, span=type_ref.span)
 
     def _apply_array_size(
         self, expression: Expression | None, scope: CompileTimeScope
@@ -2443,6 +2463,7 @@ class CompileTimePass:
             self_parameter=self._runtime_method_self_parameter(
                 declaration.self_parameter, scope, owner_type, owner_source_name
             ),
+            span=declaration.span,
         )
 
     def _runtime_method_self_parameter(

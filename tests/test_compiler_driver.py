@@ -5,6 +5,7 @@ from pathlib import Path
 from jack.compiler_driver import (
     BackendArtifactError,
     BackendArtifacts,
+    BackendEmissionOptions,
     BackendNotFoundError,
     CompilationOptions,
     CompilerDriver,
@@ -19,9 +20,15 @@ class FakeBackend:
 
     def __init__(self):
         self.program = None
+        self.options = None
 
-    def emit(self, program: HIRProgram) -> BackendArtifacts:
+    def emit(
+        self,
+        program: HIRProgram,
+        options: BackendEmissionOptions | None = None,
+    ) -> BackendArtifacts:
         self.program = program
+        self.options = options
         return BackendArtifacts(
             files={'module.fake': 'backend output'},
             link_inputs=('module.fake',),
@@ -34,7 +41,7 @@ class ArtifactBackend:
     def __init__(self, artifacts):
         self.artifacts = artifacts
 
-    def emit(self, _program):
+    def emit(self, _program, _options=None):
         return self.artifacts
 
 
@@ -70,6 +77,7 @@ class CompilerDriverTests(unittest.TestCase):
             self.assertEqual((temps / 'module.fake',), result.saved_artifacts)
             self.assertEqual(str(temps / 'module.fake'), commands[0][1])
             self.assertIn('-O0', commands[0])
+            self.assertEqual(BackendEmissionOptions(), backend.options)
 
     def test_driver_rejects_unknown_backend(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -122,6 +130,37 @@ class CompilerDriverTests(unittest.TestCase):
                 ),
             )
 
+        self.assertIn('-O2', commands[0])
+
+    def test_driver_passes_debug_options_to_backend_and_clang(self):
+        commands = []
+
+        def run(command):
+            commands.append(tuple(command))
+            Path(command[command.index('-o') + 1]).touch()
+            return ToolchainResult(0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / 'program.jack'
+            source.write_text('i32 value = 7;')
+            backend = FakeBackend()
+            CompilerDriver(
+                [backend], toolchain_runner=run, print_handler=None
+            ).compile_executable(
+                source,
+                CompilationOptions(
+                    backend='fake',
+                    output=root / 'program',
+                    optimization=2,
+                    debug=True,
+                ),
+            )
+
+        self.assertEqual(
+            BackendEmissionOptions(debug=True, optimization=2), backend.options
+        )
+        self.assertIn('-g', commands[0])
         self.assertIn('-O2', commands[0])
 
     def test_driver_rejects_invalid_optimization_level(self):

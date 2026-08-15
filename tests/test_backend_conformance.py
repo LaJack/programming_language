@@ -1,4 +1,5 @@
 import io
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -34,7 +35,12 @@ class BackendConformanceTests(unittest.TestCase):
         return status, stdout.getvalue(), stderr.getvalue()
 
     def run_native(
-        self, entry: Path, root: Path, backend: str, optimization: int = 0
+        self,
+        entry: Path,
+        root: Path,
+        backend: str,
+        optimization: int = 0,
+        debug: bool = False,
     ):
         compile_output = []
         executable = root / f'program-{backend}-O{optimization}'
@@ -45,6 +51,7 @@ class BackendConformanceTests(unittest.TestCase):
                 output=executable,
                 module_roots=(root,),
                 optimization=optimization,
+                debug=debug,
             ),
         )
         completed = subprocess.run(
@@ -57,7 +64,13 @@ class BackendConformanceTests(unittest.TestCase):
         stdout = ''.join(f'{line}\n' for line in compile_output) + completed.stdout
         return completed.returncode, stdout, completed.stderr
 
-    def assert_case(self, case: ConformanceCase, backend: str | None, optimization=0):
+    def assert_case(
+        self,
+        case: ConformanceCase,
+        backend: str | None,
+        optimization=0,
+        debug=False,
+    ):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             entry = self.materialize(root, case)
@@ -66,9 +79,9 @@ class BackendConformanceTests(unittest.TestCase):
                 runtime = 'interpreter'
             else:
                 status, stdout, stderr = self.run_native(
-                    entry, root, backend, optimization
+                    entry, root, backend, optimization, debug
                 )
-                runtime = f'{backend} -O{optimization}'
+                runtime = f'{backend} -O{optimization}' + (' -g' if debug else '')
             self.assertEqual(
                 case.expected_exit_status,
                 status,
@@ -87,6 +100,51 @@ class BackendConformanceTests(unittest.TestCase):
             for backend in ('c', 'llvm'):
                 with self.subTest(case=case.name, backend=backend):
                     self.assert_case(case, backend, optimization=2)
+
+    def test_debug_native_cases_match_at_O0(self):
+        for case in CONFORMANCE_CASES:
+            for backend in ('c', 'llvm'):
+                with self.subTest(case=case.name, backend=backend):
+                    self.assert_case(case, backend, debug=True)
+
+    def test_representative_debug_native_cases_match_at_O2(self):
+        for case in (CONFORMANCE_CASES[0], CONFORMANCE_CASES[3]):
+            for backend in ('c', 'llvm'):
+                with self.subTest(case=case.name, backend=backend):
+                    self.assert_case(
+                        case, backend, optimization=2, debug=True
+                    )
+
+    @unittest.skipUnless(shutil.which('readelf'), 'readelf is not available')
+    def test_debug_executables_contain_jack_line_tables(self):
+        case = CONFORMANCE_CASES[0]
+        for backend in ('c', 'llvm'):
+            with self.subTest(backend=backend):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    root = Path(tmpdir)
+                    entry = self.materialize(root, case)
+                    executable = root / f'program-{backend}'
+                    CompilerDriver(print_handler=None).compile_executable(
+                        entry,
+                        CompilationOptions(
+                            backend=backend,
+                            output=executable,
+                            module_roots=(root,),
+                            debug=True,
+                        ),
+                    )
+                    decoded = subprocess.run(
+                        [
+                            'readelf', '--debug-dump=decodedline',
+                            str(executable),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+
+                self.assertEqual(0, decoded.returncode, decoded.stderr)
+                self.assertIn('main.jack', decoded.stdout)
 
     def test_checked_in_examples_match_all_three_runtimes(self):
         repository = Path(__file__).parents[1]

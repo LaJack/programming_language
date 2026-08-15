@@ -4,6 +4,7 @@ from .compile_time_pass import CompileTimeError, CompileTimeFeatureNotImplemente
 from .compiler_driver import (
     BackendArtifacts,
     BackendArtifactError,
+    BackendEmissionOptions,
     BackendNotFoundError,
     CBackend,
     CompilationOptions,
@@ -39,6 +40,7 @@ __all__ = [
     'CompileTimeFeatureNotImplemented',
     'BackendArtifacts',
     'BackendArtifactError',
+    'BackendEmissionOptions',
     'BackendNotFoundError',
     'CBackend',
     'CompilationOptions',

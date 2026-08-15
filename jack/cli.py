@@ -50,6 +50,8 @@ def run_c_emitter(
     import_overrides: dict[str, str] | None = None,
     module_roots: list[Path] | None = None,
     output_dir: Path | None = None,
+    debug: bool = False,
+    optimization: int = 0,
 ) -> None:
     ast = load_source_file(path, import_overrides=import_overrides, search_roots=module_roots)
     if output_dir is None:
@@ -58,6 +60,8 @@ def run_c_emitter(
                 ast,
                 print_handler=lambda line: print(line, file=sys.stderr),
                 externs=default_comptime_externs(),
+                debug=debug,
+                optimization=optimization,
             ),
             end='',
         )
@@ -68,6 +72,8 @@ def run_c_emitter(
         ast,
         print_handler=lambda line: print(line, file=sys.stderr),
         externs=default_comptime_externs(),
+        debug=debug,
+        optimization=optimization,
     )
     for name, content in files.items():
         (output_dir / name).write_text(content)
@@ -155,6 +161,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar='LEVEL',
         help='set native optimization level from 0 through 3',
     )
+    parser.add_argument(
+        '-g',
+        '--debug',
+        action='store_true',
+        help='emit Jack source locations and native debug information',
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         '-i',
@@ -177,7 +189,12 @@ def _diagnostic_source_path(args: argparse.Namespace) -> Path | None:
 
 def _format_error(err: Exception, source_path: Path | None = None) -> str:
     span = getattr(err, 'span', None)
-    if span is None or source_path is None:
+    if span is None:
+        return f'jack: {err}'
+    span_source_path = getattr(span, 'source_path', None)
+    if span_source_path is not None:
+        source_path = Path(span_source_path)
+    if source_path is None:
         return f'jack: {err}'
     try:
         source = source_path.read_text()
@@ -215,6 +232,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError('--output cannot be used with -i/--interpret')
         if args.interpret and args.save_temps is not None:
             raise ValueError('--save-temps cannot be used with -i/--interpret')
+        if args.interpret and args.debug:
+            raise ValueError('--debug cannot be used with -i/--interpret')
         if args.emit_c and args.save_temps is not None:
             raise ValueError('--save-temps cannot be used with -c/--emit-c')
         import_overrides = parse_stub_overrides(args.stub)
@@ -232,6 +251,8 @@ def main(argv: list[str] | None = None) -> int:
                 import_overrides=import_overrides,
                 module_roots=module_roots,
                 output_dir=args.output,
+                debug=args.debug,
+                optimization=args.optimization,
             )
         else:
             CompilerDriver(
@@ -246,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
                     save_temps=args.save_temps,
                     clang=args.cc,
                     optimization=args.optimization,
+                    debug=args.debug,
                 ),
             )
     except OSError as err:

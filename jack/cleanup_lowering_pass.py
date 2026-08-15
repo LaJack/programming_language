@@ -420,7 +420,9 @@ class HIRStaticCleanupLoweringPass:
     ) -> list[HIRStatement]:
         lowered: list[HIRStatement] = []
         local_deinit_names: list[str] = []
+        cleanup_span = None
         for statement in statements:
+            cleanup_span = statement.span or cleanup_span
             active_deinit_names = [*inherited_deinit_names, *local_deinit_names]
             lowered_statements = self._lower_hir_statement(
                 statement,
@@ -438,7 +440,9 @@ class HIRStaticCleanupLoweringPass:
             if self._hir_ends_with_terminator(lowered_statements):
                 return lowered
 
-        lowered.extend(self._hir_cleanup_calls(local_deinit_names, env))
+        lowered.extend(
+            self._hir_cleanup_calls(local_deinit_names, env, cleanup_span)
+        )
         return lowered
 
     def _lower_hir_statement(
@@ -518,7 +522,12 @@ class HIRStaticCleanupLoweringPass:
             if not active_deinit_names:
                 return [statement]
             if statement.expr is None:
-                return [*self._hir_cleanup_calls(active_deinit_names, env), statement]
+                return [
+                    *self._hir_cleanup_calls(
+                        active_deinit_names, env, statement.span
+                    ),
+                    statement,
+                ]
             if return_type is None:
                 raise CleanupLoweringError(
                     'Return statement reached cleanup lowering outside a function.'
@@ -544,7 +553,9 @@ class HIRStaticCleanupLoweringPass:
             return [
                 temporary,
                 *evaluated,
-                *self._hir_cleanup_calls(active_deinit_names, env),
+                *self._hir_cleanup_calls(
+                    active_deinit_names, env, statement.span
+                ),
                 returned,
             ]
 
@@ -578,12 +589,19 @@ class HIRStaticCleanupLoweringPass:
             return [
                 temporary,
                 *evaluated,
-                *self._hir_cleanup_calls(active_deinit_names, env),
+                *self._hir_cleanup_calls(
+                    active_deinit_names, env, statement.span
+                ),
                 raised,
             ]
 
         if isinstance(statement, HIRRethrow):
-            return [*self._hir_cleanup_calls(active_deinit_names, env), statement]
+            return [
+                *self._hir_cleanup_calls(
+                    active_deinit_names, env, statement.span
+                ),
+                statement,
+            ]
 
         if isinstance(statement, HIRPrint):
             return self._hir_guarded_statements(
@@ -734,7 +752,9 @@ class HIRStaticCleanupLoweringPass:
                             error_type=TypeReference(error_name),
                             name=None,
                             body=[
-                                *self._hir_cleanup_calls(active_deinit_names, env),
+                                *self._hir_cleanup_calls(
+                                    active_deinit_names, env, statement.span
+                                ),
                                 HIRRethrow(span=statement.span),
                             ],
                             span=statement.span,
@@ -965,7 +985,7 @@ class HIRStaticCleanupLoweringPass:
                     *lowered_initializer,
                     *lowered_loop,
                     *self._hir_cleanup_calls(
-                        initializer_cleanup_names, block_env
+                        initializer_cleanup_names, block_env, statement.span
                     ),
                 ],
                 span=statement.span,
@@ -985,7 +1005,9 @@ class HIRStaticCleanupLoweringPass:
                 error_type=TypeReference(error_name),
                 name=None,
                 body=[
-                    *self._hir_cleanup_calls(active_deinit_names, env),
+                    *self._hir_cleanup_calls(
+                        active_deinit_names, env, span
+                    ),
                     HIRRethrow(span=span),
                 ],
                 span=span,
@@ -1020,12 +1042,17 @@ class HIRStaticCleanupLoweringPass:
         ]
 
     def _hir_cleanup_calls(
-        self, names: list[str], env: dict[str, TypeReference]
+        self,
+        names: list[str],
+        env: dict[str, TypeReference],
+        span=None,
     ) -> list[HIRExpressionStatement]:
-        return [self._hir_deinit_call(name, env) for name in reversed(names)]
+        return [
+            self._hir_deinit_call(name, env, span) for name in reversed(names)
+        ]
 
     def _hir_deinit_call(
-        self, name: str, env: dict[str, TypeReference]
+        self, name: str, env: dict[str, TypeReference], span=None
     ) -> HIRExpressionStatement:
         type_ref = env.get(name)
         if type_ref is None:
@@ -1045,13 +1072,14 @@ class HIRStaticCleanupLoweringPass:
             raise CleanupLoweringError(
                 f'Type "{type_decl.name}" has no valid deinit method.'
             )
-        receiver = self._hir_variable(name, type_ref, None)
+        receiver = self._hir_variable(name, type_ref, span)
         self_type = copy.deepcopy(method.self_parameter.type_ref)
         self_borrow = HIRBorrowExpression(
             mode=self_type.borrow or 'inout',
             expr=receiver,
             type_ref=self_type,
             read_type=copy.deepcopy(self_type),
+            span=span,
         )
         target = HIRCallTarget(
             kind='method',
@@ -1070,8 +1098,9 @@ class HIRStaticCleanupLoweringPass:
             implicit_self_argument=self_borrow,
             type_ref=copy.deepcopy(method.return_type),
             read_type=copy.deepcopy(method.return_type),
+            span=span,
         )
-        return HIRExpressionStatement(expr=call)
+        return HIRExpressionStatement(expr=call, span=span)
 
     def _hir_uninitialized_temporary(
         self, name: str, type_ref: TypeReference, span

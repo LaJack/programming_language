@@ -1,6 +1,8 @@
 import io
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 
 from jack.c_emit_pass import CEmitError, CEmitPass, emit_c, emit_hir_c
 from jack.cleanup_lowering_pass import lower_hir_static_cleanups
@@ -10,6 +12,25 @@ from jack.semantic_pass import SemanticError
 
 
 class CEmitPassTests(unittest.TestCase):
+    def test_debug_emission_adds_source_line_directives_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / 'program.jack'
+            source = 'i32 value = 7;\nprint(value);\n'
+            source_path.write_text(source)
+            program = lower_hir_static_cleanups(
+                compile_to_hir(
+                    parse(source, source_path=source_path), print_handler=None
+                )
+            )
+
+            release_source = emit_hir_c(program)
+            debug_source = emit_hir_c(program, debug=True)
+
+        directive = f'#line 1 "{source_path.resolve()}"'
+        self.assertNotIn('#line', release_source)
+        self.assertIn(directive, debug_source)
+        self.assertIn(f'#line 2 "{source_path.resolve()}"', debug_source)
+
     def test_emits_lowered_hir_without_ast_side_tables(self):
         program = lower_hir_static_cleanups(compile_to_hir(parse('''
             i32 add(i32 left, i32 right) {

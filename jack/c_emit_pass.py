@@ -122,49 +122,77 @@ class CEmitFeatureNotImplemented(CEmitError):
     pass
 
 
-def emit_hir_c(program: HIRProgram) -> str:
-    return CEmitPass().emit_hir(program)
+def emit_hir_c(
+    program: HIRProgram, *, debug: bool = False, optimization: int = 0
+) -> str:
+    return CEmitPass(debug=debug, optimization=optimization).emit_hir(program)
 
 
 def emit_hir_c_files(
     program: HIRProgram,
     entry_module: str | None = None,
+    *,
+    debug: bool = False,
+    optimization: int = 0,
 ) -> dict[str, str]:
-    return CEmitPass().emit_hir_files(program, entry_module=entry_module)
+    return CEmitPass(debug=debug, optimization=optimization).emit_hir_files(
+        program, entry_module=entry_module
+    )
 
 
 def emit_c(
     ast: list[Statement],
     print_handler: Callable[[str], None] | None = None,
     externs: dict[str, object] | None = None,
+    *,
+    debug: bool = False,
+    optimization: int = 0,
 ) -> str:
     return emit_runtime_c(
-        apply_compile_time_pass(ast, print_handler=print_handler, externs=externs)
+        apply_compile_time_pass(ast, print_handler=print_handler, externs=externs),
+        debug=debug,
+        optimization=optimization,
     )
 
 
-def emit_runtime_c(ast: list[Statement]) -> str:
+def emit_runtime_c(
+    ast: list[Statement], *, debug: bool = False, optimization: int = 0
+) -> str:
     runtime_hir = lower_to_hir(ast)
     lowered_hir = lower_hir_static_cleanups(runtime_hir)
-    return emit_hir_c(lowered_hir)
+    return emit_hir_c(lowered_hir, debug=debug, optimization=optimization)
 
 
 def emit_c_files(
     ast: list[Statement],
     print_handler: Callable[[str], None] | None = None,
     externs: dict[str, object] | None = None,
+    *,
+    debug: bool = False,
+    optimization: int = 0,
 ) -> dict[str, str]:
     entry_module = _infer_entry_module(ast)
     runtime_ast = apply_compile_time_pass(ast, print_handler=print_handler, externs=externs)
-    return emit_runtime_c_files(runtime_ast, entry_module=entry_module)
+    return emit_runtime_c_files(
+        runtime_ast,
+        entry_module=entry_module,
+        debug=debug,
+        optimization=optimization,
+    )
 
 
 def emit_runtime_c_files(
-    ast: list[Statement], entry_module: str | None = None
+    ast: list[Statement], entry_module: str | None = None, *,
+    debug: bool = False, optimization: int = 0,
 ) -> dict[str, str]:
     runtime_hir = lower_to_hir(ast)
     lowered_hir = lower_hir_static_cleanups(runtime_hir)
-    return emit_hir_c_files(lowered_hir, entry_module=entry_module)
+    return emit_hir_c_files(
+        lowered_hir,
+        entry_module=entry_module,
+        debug=debug,
+        optimization=optimization,
+    )
 
 
 def _infer_entry_module(ast: list[Statement]) -> str | None:
@@ -241,7 +269,9 @@ class CEmitPass:
         'jack_std_io_open_read',
     })
 
-    def __init__(self) -> None:
+    def __init__(self, *, debug: bool = False, optimization: int = 0) -> None:
+        self.debug = debug
+        self.optimization = optimization
         self.names: dict[str, str] = {}
         runtime_slice_names = {
             f'jack_slice_{key}'
@@ -392,8 +422,10 @@ class CEmitPass:
                 raise CEmitError(
                     f'Extern variable "{symbol.name}" must use the "c" ABI.'
                 )
-            return f'extern {declaration_source};'
-        return f'{declaration_source};'
+            line = f'extern {declaration_source};'
+        else:
+            line = f'{declaration_source};'
+        return '\n'.join(self._with_source_directive([line], declaration))
 
     def _emit_hir_main(
         self,
@@ -861,7 +893,9 @@ class CEmitPass:
             self._mangle(symbol.name),
             self.global_variable_types,
         )
-        return f'extern {declaration_source};'
+        return '\n'.join(self._with_source_directive(
+            [f'extern {declaration_source};'], declaration
+        ))
 
     def _emit_hir_global_variable_definition(
         self,
@@ -872,11 +906,12 @@ class CEmitPass:
         if symbol.extern:
             return ''
         prefix = 'static ' if static else ''
-        return prefix + self._emit_declaration(
+        line = prefix + self._emit_declaration(
             symbol.type_ref,
             self._mangle(symbol.name),
             self.global_variable_types,
         ) + ';'
+        return '\n'.join(self._with_source_directive([line], declaration))
 
     def _hir_module_needs_init(self, statements: list[HIRStatement]) -> bool:
         for statement in statements:
@@ -1149,7 +1184,7 @@ class CEmitPass:
             self._ensure_runtime_statement(field)
             lines.append(f'    {self._emit_declaration(field.type, self._mangle(field.name), dict())};')
         lines.append(f'}} {self._mangle(declaration.name)};')
-        return '\n'.join(lines)
+        return '\n'.join(self._with_source_directive(lines, declaration))
 
     def _emit_view_declaration(self, declaration: ViewDeclaration) -> str:
         self._ensure_runtime_statement(declaration)
@@ -1159,7 +1194,7 @@ class CEmitPass:
         for field in declaration.fields:
             lines.append(f'    {self._emit_view_field_declaration(field)};')
         lines.append(f'}} {self._mangle(declaration.name)};')
-        return '\n'.join(lines)
+        return '\n'.join(self._with_source_directive(lines, declaration))
 
     def _emit_view_field_declaration(self, field) -> str:
         field_type = TypeReference(
@@ -1177,14 +1212,16 @@ class CEmitPass:
     ) -> str:
         self._ensure_runtime_statement(declaration)
         prefix = 'static ' if static else ''
-        return f'{prefix}{self._emit_function_signature(declaration)};'
+        lines = [f'{prefix}{self._emit_function_signature(declaration)};']
+        return '\n'.join(self._with_source_directive(lines, declaration))
 
     def _emit_method_prototype(
         self, type_decl: TypeDeclaration, method: FunctionDeclaration, static: bool = False
     ) -> str:
         self._ensure_runtime_statement(method)
         prefix = 'static ' if static else ''
-        return f'{prefix}{self._emit_method_signature(type_decl, method)};'
+        lines = [f'{prefix}{self._emit_method_signature(type_decl, method)};']
+        return '\n'.join(self._with_source_directive(lines, method))
 
     def _emit_function_definition(
         self, declaration: HIRFunctionDeclaration, static: bool = False
@@ -1215,7 +1252,7 @@ class CEmitPass:
             ):
                 lines.append(self._indent(f'return {self._return_zero_value(return_type)};'))
             lines.append('}')
-            return lines
+            return self._with_source_directive(lines, declaration)
         finally:
             self.current_function_raises = previous_raises
             self.current_return_type = previous_return_type
@@ -1264,7 +1301,7 @@ class CEmitPass:
             ):
                 lines.append(self._indent(f'return {self._return_zero_value(return_type)};'))
             lines.append('}')
-            return lines
+            return self._with_source_directive(lines, method)
         finally:
             self.current_function_raises = previous_raises
             self.current_return_type = previous_return_type
@@ -1323,15 +1360,25 @@ class CEmitPass:
                 raise CEmitFeatureNotImplemented(
                     'C emission for raising constructors is not implemented yet.'
                 )
-            return [f'{self._emit_hir_call(statement.constructor_call, env)};']
+            return self._with_source_directive(
+                [f'{self._emit_hir_call(statement.constructor_call, env)};'],
+                statement,
+            )
         if statement.initializer is None:
             return []
-        return [
+        return self._with_source_directive([
             f'{self._mangle(symbol.name)} = '
             f'{self._emit_hir_expression_as_type(statement.initializer, symbol.type_ref, env)};'
-        ]
+        ], statement)
 
     def _emit_hir_statement(
+        self, statement: HIRStatement, env: dict[str, TypeReference]
+    ) -> list[str]:
+        return self._with_source_directive(
+            self._emit_hir_statement_body(statement, env), statement
+        )
+
+    def _emit_hir_statement_body(
         self, statement: HIRStatement, env: dict[str, TypeReference]
     ) -> list[str]:
         if isinstance(statement, HIRVariableDeclaration):
@@ -1359,6 +1406,16 @@ class CEmitPass:
         if isinstance(statement, HIRBlock):
             return self._emit_hir_scoped_block(statement, env)
         raise CEmitError(f'Unknown HIR statement type "{type(statement).__name__}".')
+
+    def _with_source_directive(self, lines: list[str], node: object) -> list[str]:
+        if not self.debug or not lines:
+            return lines
+        span = getattr(node, 'span', None)
+        source_path = getattr(span, 'source_path', None)
+        if span is None or source_path is None:
+            return lines
+        escaped = source_path.replace('\\', '\\\\').replace('"', '\\"')
+        return [f'#line {span.start_line} "{escaped}"', *lines]
 
     def _emit_hir_scoped_block(
         self, statement: HIRBlock, env: dict[str, TypeReference]

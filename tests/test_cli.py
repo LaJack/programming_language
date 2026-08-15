@@ -15,6 +15,11 @@ class CliTests(unittest.TestCase):
                 args = build_parser().parse_args([f'-O{level}', 'program.jack'])
                 self.assertEqual(level, args.optimization)
 
+    def test_parser_accepts_debug_flag(self):
+        args = build_parser().parse_args(['-g', 'program.jack'])
+
+        self.assertTrue(args.debug)
+
     def test_interpreter_mode_runs_source_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / 'program.jk'
@@ -207,6 +212,30 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(0, status)
         self.assertIn('--output cannot be used with -i/--interpret', errors.getvalue())
 
+    def test_interpreter_rejects_debug_information(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jack'
+            source.write_text('i32 value = 7;')
+
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                status = main(['-i', '-g', str(source)])
+
+        self.assertEqual(1, status)
+        self.assertIn('--debug cannot be used with -i/--interpret', errors.getvalue())
+
+    def test_c_mode_debug_output_contains_source_directives(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jack'
+            source.write_text('i32 value = 7;')
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(['-c', '-g', str(source)])
+
+        self.assertEqual(0, status)
+        self.assertIn(f'#line 1 "{source.resolve()}"', output.getvalue())
+
     def test_native_mode_reports_missing_clang(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / 'program.jk'
@@ -290,6 +319,68 @@ class CliTests(unittest.TestCase):
         self.assertIn('Expected expression.', diagnostic)
         self.assertIn('i32 value = ;', diagnostic)
         self.assertIn('^', diagnostic)
+
+    def test_imported_parse_error_reports_imported_source(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            module = root / 'broken.jack'
+            module.write_text('module broken;\ni32 value = ;\n')
+            source = root / 'main.jack'
+            source.write_text('import broken;\n')
+
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                status = main(['-i', str(source)])
+
+        self.assertEqual(1, status)
+        diagnostic = errors.getvalue()
+        self.assertIn(f'jack: {module.resolve()}:2:13:', diagnostic)
+        self.assertIn('i32 value = ;', diagnostic)
+
+    def test_imported_semantic_error_reports_imported_source(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            module = root / 'broken.jack'
+            module.write_text('''
+                module broken;
+                pub i32 value() {
+                    bool flag = true;
+                    return flag + flag;
+                }
+            ''')
+            source = root / 'main.jack'
+            source.write_text('import broken;\n')
+
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                status = main(['-i', str(source)])
+
+        self.assertEqual(1, status)
+        diagnostic = errors.getvalue()
+        self.assertIn(f'jack: {module.resolve()}:5:21:', diagnostic)
+        self.assertIn('return flag + flag;', diagnostic)
+
+    def test_stubbed_module_error_reports_stub_source(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            stub = root / 'tests' / 'stubs' / 'device.jack'
+            stub.parent.mkdir(parents=True)
+            stub.write_text('module tests.stubs.device;\ncomptime i32 value = missing;\n')
+            source = root / 'main.jack'
+            source.write_text('import hw.device;\n')
+
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                status = main([
+                    '--module-root', str(root),
+                    '--stub', 'hw.device=tests.stubs.device',
+                    '-i', str(source),
+                ])
+
+        self.assertEqual(1, status)
+        diagnostic = errors.getvalue()
+        self.assertIn(f'jack: {stub.resolve()}:2:1:', diagnostic)
+        self.assertIn('comptime i32 value = missing;', diagnostic)
 
 
 if __name__ == '__main__':

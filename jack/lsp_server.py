@@ -415,6 +415,7 @@ def _module_name_span(tokens: list[Token], span: SourceSpan, name: str) -> Sourc
                 scoped_tokens[cursor].span.end_column,
                 token.span.start_offset,
                 scoped_tokens[cursor].span.end_offset,
+                token.span.source_path,
             )
     return None
 

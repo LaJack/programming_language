@@ -27,6 +27,9 @@ to typed HIR. The interpreter executes `HIRProgram` directly.
 `CompilerDriver` owns native compilation and delegates cleaned HIR to a selected
 backend. The dependency-free LLVM backend emits textual opaque-pointer LLVM IR
 and is the default; the C backend remains available with `--backend c`.
+Source spans retain their canonical module path through this pipeline. Native
+builds requested with `-g` emit function and statement locations for Jack
+sources through LLVM debug metadata or C `#line` directives.
 
 `lower_hir_static_cleanups` inserts destructor calls and error-path cleanup in
 HIR. The interpreter and both bundled and split-module C emitters then consume

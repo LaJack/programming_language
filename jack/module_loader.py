@@ -167,7 +167,7 @@ class ModuleResolver:
             raise ModuleLoadError(f'Cannot read module source "{path}".') from err
 
         try:
-            ast = parse(source)
+            ast = parse(source, source_path=path)
         except ParseError as err:
             raise ModuleLoadError(str(err), getattr(err, 'span', None)) from err
 

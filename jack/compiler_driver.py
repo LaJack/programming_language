@@ -60,10 +60,20 @@ class BackendArtifacts:
     link_inputs: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class BackendEmissionOptions:
+    debug: bool = False
+    optimization: int = 0
+
+
 class CompilerBackend(Protocol):
     name: str
 
-    def emit(self, program: HIRProgram) -> BackendArtifacts:
+    def emit(
+        self,
+        program: HIRProgram,
+        options: BackendEmissionOptions | None = None,
+    ) -> BackendArtifacts:
         ...
 
 
@@ -76,6 +86,7 @@ class CompilationOptions:
     save_temps: Path | None = None
     clang: str = 'clang'
     optimization: int = 0
+    debug: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,8 +109,17 @@ ToolchainRunner = Callable[[Sequence[str]], ToolchainResult]
 class CBackend:
     name = 'c'
 
-    def emit(self, program: HIRProgram) -> BackendArtifacts:
-        files = dict(emit_hir_c_files(program))
+    def emit(
+        self,
+        program: HIRProgram,
+        options: BackendEmissionOptions | None = None,
+    ) -> BackendArtifacts:
+        options = options or BackendEmissionOptions()
+        files = dict(emit_hir_c_files(
+            program,
+            debug=options.debug,
+            optimization=options.optimization,
+        ))
         runtime_dir = Path(__file__).resolve().parent / 'c_runtime'
         for path in sorted(runtime_dir.iterdir()):
             if path.is_file():
@@ -113,8 +133,17 @@ class CBackend:
 class LLVMBackend:
     name = 'llvm'
 
-    def emit(self, program: HIRProgram) -> BackendArtifacts:
-        files = {'main.ll': emit_hir_llvm(program)}
+    def emit(
+        self,
+        program: HIRProgram,
+        options: BackendEmissionOptions | None = None,
+    ) -> BackendArtifacts:
+        options = options or BackendEmissionOptions()
+        files = {'main.ll': emit_hir_llvm(
+            program,
+            debug=options.debug,
+            optimization=options.optimization,
+        )}
         runtime_dir = Path(__file__).resolve().parent / 'c_runtime'
         for runtime_name in ('jack_runtime.h', 'jack_std_io.h', 'jack_std_io.c'):
             path = runtime_dir / runtime_name
@@ -180,7 +209,13 @@ class CompilerDriver:
             raise CompilerDriverError('Optimization level must be an integer from 0 to 3.')
 
         program = self.backend_hir(entry, options)
-        artifacts = backend.emit(program)
+        artifacts = backend.emit(
+            program,
+            BackendEmissionOptions(
+                debug=options.debug,
+                optimization=options.optimization,
+            ),
+        )
         self._validate_artifacts(artifacts)
         output = (options.output or (Path.cwd() / entry.stem)).resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -274,6 +309,7 @@ class CompilerDriver:
                 temporary_output,
                 options.clang,
                 options.optimization,
+                options.debug,
             )
             if not temporary_output.is_file():
                 raise ToolchainError(
@@ -291,6 +327,7 @@ class CompilerDriver:
         output: Path,
         clang: str,
         optimization: int,
+        debug: bool,
     ) -> None:
         artifact_paths = tuple(build_dir / name for name in artifacts.link_inputs)
         compiler = shutil.which(clang)
@@ -306,6 +343,7 @@ class CompilerDriver:
             '-I',
             str(build_dir),
             f'-O{optimization}',
+            *(['-g'] if debug else []),
             '-o',
             str(output),
         ]

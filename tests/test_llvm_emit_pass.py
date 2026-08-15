@@ -11,15 +11,24 @@ from jack.parser import parse
 
 
 class LLVMEmitPassTests(unittest.TestCase):
-    def emit(self, source: str) -> str:
+    def emit(
+        self,
+        source: str,
+        *,
+        source_path: Path | None = None,
+        debug: bool = False,
+        optimization: int = 0,
+    ) -> str:
         program = lower_hir_static_cleanups(
             compile_to_hir(
-                parse(source),
+                parse(source, source_path=source_path),
                 print_handler=None,
                 externs=default_comptime_externs(),
             )
         )
-        return emit_hir_llvm(program)
+        return emit_hir_llvm(
+            program, debug=debug, optimization=optimization
+        )
 
     def compile_and_run(self, source: str) -> subprocess.CompletedProcess[str]:
         llvm_source = self.emit(source)
@@ -287,6 +296,59 @@ class LLVMEmitPassTests(unittest.TestCase):
             llvm_source,
             r'while\.body\.\d+:\n(?:  .*\n)*?  store i32 zeroinitializer, ptr %local',
         )
+
+    def test_debug_ir_contains_deterministic_source_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / 'program.jack'
+            source = '''
+                i32 add(i32 left, i32 right) {
+                    return left + right;
+                }
+                i32 value = add(2, 3);
+                print(value);
+            '''
+            source_path.write_text(source)
+            release_ir = self.emit(source, source_path=source_path)
+            debug_ir = self.emit(
+                source, source_path=source_path, debug=True
+            )
+            repeated_ir = self.emit(
+                source, source_path=source_path, debug=True
+            )
+
+        self.assertNotIn('!llvm.dbg.cu', release_ir)
+        self.assertNotIn('!dbg', release_ir)
+        self.assertEqual(debug_ir, repeated_ir)
+        self.assertIn('!llvm.dbg.cu', debug_ir)
+        self.assertIn('!DICompileUnit(language: DW_LANG_C11', debug_ir)
+        self.assertIn('!DIFile(filename: "program.jack"', debug_ir)
+        self.assertIn('!DISubprogram(name: "add"', debug_ir)
+        self.assertIn('!DILocation(', debug_ir)
+        self.assertIn('isOptimized: false', debug_ir)
+
+    def test_optimized_debug_ir_is_accepted_by_clang(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_path = root / 'program.jack'
+            source_path.write_text('i32 value = 7;\nprint(value);\n')
+            llvm_source = self.emit(
+                source_path.read_text(),
+                source_path=source_path,
+                debug=True,
+                optimization=2,
+            )
+            module = root / 'main.ll'
+            output = root / 'main.o'
+            module.write_text(llvm_source)
+            completed = subprocess.run(
+                ['clang', '-x', 'ir', '-c', str(module), '-o', str(output)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(0, completed.returncode, completed.stderr + llvm_source)
+        self.assertIn('isOptimized: true', llvm_source)
 
 if __name__ == '__main__':
     unittest.main()

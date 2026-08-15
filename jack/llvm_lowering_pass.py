@@ -37,7 +37,7 @@ from .hir_nodes import (
     HIRViewDeclaration,
     HIRWhile,
 )
-from .llvm_ir import LLVMFunction, LLVMModule, quoted
+from .llvm_ir import LLVMFunction, LLVMInstruction, LLVMModule, quoted
 from .source_model import TypeReference
 
 
@@ -58,7 +58,7 @@ class FunctionBuilder:
     def __init__(self, lowerer: 'LLVMLoweringPass', declaration: HIRFunctionDeclaration | None):
         self.lowerer = lowerer
         self.declaration = declaration
-        self.blocks: list[tuple[str, list[str]]] = [('entry', [])]
+        self.blocks: list[tuple[str, list[LLVMInstruction]]] = [('entry', [])]
         self.block = self.blocks[0][1]
         self.terminated = False
         self.counter = 0
@@ -68,6 +68,7 @@ class FunctionBuilder:
         self.error_handlers: list[str] = []
         self.caught_errors: list[tuple[str, str]] = []
         self.has_error_slots = False
+        self.current_span = declaration.span if declaration is not None else None
 
     def temp(self, prefix: str = 'v') -> str:
         self.counter += 1
@@ -80,7 +81,7 @@ class FunctionBuilder:
     def emit(self, instruction: str) -> None:
         if self.terminated:
             return
-        self.block.append(instruction)
+        self.block.append(LLVMInstruction(instruction, self.current_span))
 
     def terminate(self, instruction: str) -> None:
         self.emit(instruction)
@@ -102,13 +103,16 @@ class FunctionBuilder:
 
     def named_alloca(self, value: str, type_name: str) -> None:
         entry = self.blocks[0][1]
-        entry.insert(self.entry_alloca_count, f'{value} = alloca {type_name}')
+        entry.insert(
+            self.entry_alloca_count,
+            LLVMInstruction(f'{value} = alloca {type_name}'),
+        )
         self.entry_alloca_count += 1
 
 
 class LLVMLoweringPass:
-    def __init__(self) -> None:
-        self.module = LLVMModule()
+    def __init__(self, *, debug: bool = False, optimization: int = 0) -> None:
+        self.module = LLVMModule(debug=debug, optimization=optimization)
         self.types: dict[str, HIRTypeDeclaration] = {}
         self.views: dict[str, HIRViewDeclaration] = {}
         self.functions: dict[str, HIRFunctionDeclaration] = {}
@@ -146,7 +150,13 @@ class LLVMLoweringPass:
                 self.module.functions.append(self._function(declaration))
             elif isinstance(declaration, HIRTypeDeclaration):
                 for method in declaration.methods:
-                    self.module.functions.append(self._function(method, declaration.name))
+                    self.module.functions.append(
+                        self._function(
+                            method,
+                            declaration.name,
+                            declaration.source_name or declaration.name,
+                        )
+                    )
         self.module.functions.append(self._main(program))
         return self.module
 
@@ -217,7 +227,12 @@ class LLVMLoweringPass:
                     f'declare {return_type} @{quoted(name)}({params})'
                 )
 
-    def _function(self, declaration: HIRFunctionDeclaration, owner: str | None = None) -> LLVMFunction:
+    def _function(
+        self,
+        declaration: HIRFunctionDeclaration,
+        owner: str | None = None,
+        debug_owner: str | None = None,
+    ) -> LLVMFunction:
         builder = FunctionBuilder(self, declaration)
         self.builder = builder
         parameters: list[tuple[str, str]] = []
@@ -240,14 +255,32 @@ class LLVMLoweringPass:
             self._function_return_type(declaration),
             tuple(parameters),
             tuple((label, tuple(lines)) for label, lines in builder.blocks),
+            span=declaration.span,
+            debug_name=(
+                f'{debug_owner or owner}.{declaration.source_name or declaration.name}'
+                if owner is not None
+                else declaration.source_name or declaration.name
+            ),
         )
         self.builder = None
         return function
 
     def _main(self, program: HIRProgram) -> LLVMFunction:
         builder = FunctionBuilder(self, None)
+        main_span = next(
+            (
+                statement.span
+                for statement in program.top_level
+                if statement.span is not None
+                and statement.span.source_path is not None
+            ),
+            None,
+        )
+        builder.current_span = main_span
         self.builder = builder
         for statement in program.top_level:
+            previous_span = builder.current_span
+            builder.current_span = statement.span or previous_span
             if isinstance(statement, HIRGlobalVariable):
                 if statement.initializer is not None:
                     value = self._expression(statement.initializer, builder.env)
@@ -258,6 +291,7 @@ class LLVMLoweringPass:
                     self._expression(statement.constructor_call, builder.env)
             elif not isinstance(statement, HIRDeclaration):
                 self._statement(statement, builder.env)
+            builder.current_span = previous_span
         if not builder.terminated:
             for declaration in reversed(program.declarations):
                 if not isinstance(declaration, HIRGlobalVariable) or declaration.symbol.extern:
@@ -279,6 +313,8 @@ class LLVMLoweringPass:
         function = LLVMFunction(
             'main', 'i32', (),
             tuple((label, tuple(lines)) for label, lines in builder.blocks),
+            span=main_span,
+            debug_name='main',
         )
         self.builder = None
         return function
@@ -290,6 +326,16 @@ class LLVMLoweringPass:
             self._statement(statement, env)
 
     def _statement(self, statement: HIRStatement, env: dict[str, tuple[str, TypeReference]]) -> None:
+        previous_span = self._b.current_span
+        self._b.current_span = statement.span or previous_span
+        try:
+            self._statement_body(statement, env)
+        finally:
+            self._b.current_span = previous_span
+
+    def _statement_body(
+        self, statement: HIRStatement, env: dict[str, tuple[str, TypeReference]]
+    ) -> None:
         if isinstance(statement, HIRVariableDeclaration):
             type_name = self._type(statement.symbol.type_ref)
             slot = self._b.alloca(type_name, 'local')
@@ -1130,5 +1176,9 @@ class LLVMLoweringPass:
         return self.builder
 
 
-def lower_to_llvm(program: HIRProgram) -> LLVMModule:
-    return LLVMLoweringPass().lower(program)
+def lower_to_llvm(
+    program: HIRProgram, *, debug: bool = False, optimization: int = 0
+) -> LLVMModule:
+    return LLVMLoweringPass(
+        debug=debug, optimization=optimization
+    ).lower(program)

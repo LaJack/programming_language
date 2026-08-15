@@ -146,6 +146,82 @@ class BackendConformanceTests(unittest.TestCase):
                 self.assertEqual(0, decoded.returncode, decoded.stderr)
                 self.assertIn('main.jack', decoded.stdout)
 
+    @unittest.skipUnless(shutil.which('readelf'), 'readelf is not available')
+    def test_llvm_debug_executable_contains_jack_locals_and_types(self):
+        source = '''
+            struct Point {
+                i32 x;
+                init(&inout self, i32 value) { self.x = value; }
+            }
+            i32 inspect(i32 input) {
+                Point point(input);
+                i32 local = point.x;
+                return local;
+            }
+            print(inspect(7));
+        '''
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            entry = root / 'main.jack'
+            entry.write_text(source)
+            executable = root / 'program'
+            CompilerDriver(print_handler=None).compile_executable(
+                entry,
+                CompilationOptions(
+                    backend='llvm', output=executable, debug=True
+                ),
+            )
+            decoded = subprocess.run(
+                ['readelf', '--debug-dump=info', str(executable)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(0, decoded.returncode, decoded.stderr)
+        self.assertIn('DW_TAG_formal_parameter', decoded.stdout)
+        self.assertIn('DW_TAG_variable', decoded.stdout)
+        for name in ('input', 'point', 'local', 'Point'):
+            self.assertIn(name, decoded.stdout)
+
+    @unittest.skipUnless(shutil.which('lldb'), 'LLDB is not available')
+    def test_lldb_can_break_in_jack_and_print_a_parameter(self):
+        source = '''
+            i32 inspect(i32 input) {
+                i32 local = input + 1;
+                return local;
+            }
+            print(inspect(7));
+        '''
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            entry = root / 'main.jack'
+            entry.write_text(source)
+            executable = root / 'program'
+            CompilerDriver(print_handler=None).compile_executable(
+                entry,
+                CompilationOptions(
+                    backend='llvm', output=executable, debug=True
+                ),
+            )
+            debugged = subprocess.run(
+                [
+                    'lldb', '--batch',
+                    '-o', 'breakpoint set --name inspect',
+                    '-o', 'run',
+                    '-o', 'frame variable input',
+                    str(executable),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(0, debugged.returncode, debugged.stderr)
+        self.assertIn('main.jack', debugged.stdout)
+        self.assertRegex(debugged.stdout, r'\(i32\) input = 7')
+
     def test_checked_in_examples_match_all_three_runtimes(self):
         repository = Path(__file__).parents[1]
         for entry in sorted((repository / 'examples').glob('*.jack')):

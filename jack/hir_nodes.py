@@ -36,6 +36,7 @@ class HIRVariableSymbol(HIRNode):
     source_name: str | None = None
     extern: bool = False
     abi: str | None = None
+    synthetic: bool = False
 
     @property
     def type(self) -> TypeReference:

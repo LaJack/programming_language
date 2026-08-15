@@ -1,6 +1,7 @@
 const cp = require('child_process');
 const path = require('path');
 const vscode = require('vscode');
+const { JackDebugSupport } = require('./debug');
 
 const JACK_LANGUAGE_ID = 'jack';
 
@@ -472,8 +473,11 @@ class JackLanguageClient {
 }
 
 let client;
+let debugSupport;
 
 function activate(context) {
+  debugSupport = new JackDebugSupport(vscode, context);
+  debugSupport.register();
   client = new JackLanguageClient(context);
   context.subscriptions.push(client);
   client.start();
@@ -484,6 +488,7 @@ function deactivate() {
     client.dispose();
     client = undefined;
   }
+  debugSupport = undefined;
 }
 
 module.exports = {

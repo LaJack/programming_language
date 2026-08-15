@@ -8,7 +8,65 @@ This extension provides editor basics for the experimental Jack language:
 - document symbols for Outline and Breadcrumbs
 - hover information for declarations and built-in types
 - same-document go-to-definition for parsed symbols
+- Linux x86-64 source debugging through CodeLLDB
 - comments, brackets, indentation, and string pairing rules
+
+## Debugging
+
+Install the extension and open a local Jack file inside a workspace. Press `F5`
+to save it, compile it with `jack --backend llvm -g -O0`, and launch it through
+CodeLLDB. Breakpoints, statement stepping, Jack stack frames, parameters, and
+local values are available in entry and imported source files. Debug executables
+are written below `.jack/debug/`.
+
+The zero-configuration workflow uses `jack.compiler.*` for compiler and module
+settings and `jack.debug.*` for the debuggee arguments, environment, and working
+directory.
+
+For a persistent project build, add this task to `.vscode/tasks.json`:
+
+```json
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "jack: build debug app",
+      "type": "jack",
+      "entry": "${workspaceFolder}/src/main.jack",
+      "output": "${workspaceFolder}/.jack/debug/app",
+      "backend": "llvm",
+      "optimization": 0,
+      "moduleRoots": ["${workspaceFolder}/modules"],
+      "stubs": {}
+    }
+  ]
+}
+```
+
+Launch it with CodeLLDB from `.vscode/launch.json`:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Jack app",
+      "type": "lldb",
+      "request": "launch",
+      "preLaunchTask": "jack: build debug app",
+      "program": "${workspaceFolder}/.jack/debug/app",
+      "cwd": "${workspaceFolder}",
+      "args": [],
+      "env": {},
+      "terminal": "integrated"
+    }
+  ]
+}
+```
+
+Debugging currently targets local Linux x86-64. LLVM provides Jack-aware local
+types; C-backend debugging uses the information Clang can recover from generated
+C and is best effort. Optimized builds may move statements or omit values.
 
 ## Development
 

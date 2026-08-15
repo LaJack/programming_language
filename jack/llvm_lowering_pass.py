@@ -37,8 +37,16 @@ from .hir_nodes import (
     HIRViewDeclaration,
     HIRWhile,
 )
-from .llvm_ir import LLVMFunction, LLVMInstruction, LLVMModule, quoted
-from .source_model import TypeReference
+from .llvm_ir import (
+    LLVMDebugMember,
+    LLVMDebugType,
+    LLVMDebugVariable,
+    LLVMFunction,
+    LLVMInstruction,
+    LLVMModule,
+    quoted,
+)
+from .source_model import SourceSpan, TypeReference
 
 
 class LLVMLoweringError(Exception):
@@ -69,6 +77,9 @@ class FunctionBuilder:
         self.caught_errors: list[tuple[str, str]] = []
         self.has_error_slots = False
         self.current_span = declaration.span if declaration is not None else None
+        self.current_scope = 0
+        self.debug_scopes: list[tuple[int, int, SourceSpan]] = []
+        self.scope_counter = 0
 
     def temp(self, prefix: str = 'v') -> str:
         self.counter += 1
@@ -81,7 +92,36 @@ class FunctionBuilder:
     def emit(self, instruction: str) -> None:
         if self.terminated:
             return
-        self.block.append(LLVMInstruction(instruction, self.current_span))
+        self.block.append(LLVMInstruction(
+            instruction, self.current_span, self.current_scope
+        ))
+
+    def declare_debug_variable(
+        self,
+        name: str,
+        type_ref: TypeReference,
+        slot: str,
+        span,
+        argument: int = 0,
+    ) -> None:
+        if not self.lowerer.module.debug or span is None or span.source_path is None:
+            return
+        type_key = self.lowerer._debug_type(type_ref)
+        self.block.append(LLVMInstruction(
+            '', span, self.current_scope,
+            LLVMDebugVariable(name, type_key, slot, span, argument),
+        ))
+
+    def push_scope(self, span) -> int:
+        previous = self.current_scope
+        if self.lowerer.module.debug and span is not None and span.source_path is not None:
+            self.scope_counter += 1
+            self.current_scope = self.scope_counter
+            self.debug_scopes.append((self.current_scope, previous, span))
+        return previous
+
+    def pop_scope(self, previous: int) -> None:
+        self.current_scope = previous
 
     def terminate(self, instruction: str) -> None:
         self.emit(instruction)
@@ -141,6 +181,10 @@ class LLVMLoweringPass:
         }
         self._collect_error_tags(program)
         self._declare_runtime()
+        if self.module.debug:
+            self.module.declarations.append(
+                'declare void @llvm.dbg.declare(metadata, metadata, metadata)'
+            )
         self._declare_types()
         self._declare_error_payload()
         self._declare_globals(program)
@@ -247,6 +291,14 @@ class LLVMLoweringPass:
             slot = builder.alloca(type_name, 'arg')
             builder.emit(f'store {type_name} %{parameter_name}, ptr {slot}')
             builder.env[symbol.name] = (slot, symbol.type_ref)
+            if not symbol.synthetic:
+                builder.declare_debug_variable(
+                    symbol.source_name or symbol.name,
+                    symbol.type_ref,
+                    slot,
+                    symbol.span or declaration.span,
+                    index + 1,
+                )
         self._statements(declaration.body, builder.env)
         if not builder.terminated:
             self._return_success(None)
@@ -261,6 +313,7 @@ class LLVMLoweringPass:
                 if owner is not None
                 else declaration.source_name or declaration.name
             ),
+            debug_scopes=tuple(builder.debug_scopes),
         )
         self.builder = None
         return function
@@ -315,6 +368,7 @@ class LLVMLoweringPass:
             tuple((label, tuple(lines)) for label, lines in builder.blocks),
             span=main_span,
             debug_name='main',
+            debug_scopes=tuple(builder.debug_scopes),
         )
         self.builder = None
         return function
@@ -324,6 +378,13 @@ class LLVMLoweringPass:
             if self._b.terminated:
                 break
             self._statement(statement, env)
+
+    def _scoped_statements(self, statements, env, span) -> None:
+        previous = self._b.push_scope(span)
+        try:
+            self._statements(statements, env)
+        finally:
+            self._b.pop_scope(previous)
 
     def _statement(self, statement: HIRStatement, env: dict[str, tuple[str, TypeReference]]) -> None:
         previous_span = self._b.current_span
@@ -341,6 +402,13 @@ class LLVMLoweringPass:
             slot = self._b.alloca(type_name, 'local')
             env[statement.symbol.name] = (slot, statement.symbol.type_ref)
             self._b.emit(f'store {type_name} zeroinitializer, ptr {slot}')
+            if not statement.symbol.synthetic:
+                self._b.declare_debug_variable(
+                    statement.symbol.source_name or statement.symbol.name,
+                    statement.symbol.type_ref,
+                    slot,
+                    statement.symbol.span or statement.span,
+                )
             if statement.initializer is not None:
                 value = self._expression(statement.initializer, env)
                 value = self._coerce(value, statement.symbol.type_ref)
@@ -385,7 +453,7 @@ class LLVMLoweringPass:
             self._propagate_error(tag, payload)
             return
         if isinstance(statement, HIRBlock):
-            self._statements(statement.body, dict(env))
+            self._scoped_statements(statement.body, dict(env), statement.span)
             return
         if isinstance(statement, HIRIf):
             self._if(statement, env)
@@ -414,12 +482,12 @@ class LLVMLoweringPass:
             condition = self._expression(branch.condition, env)
             self._b.terminate(f'br i1 {condition.operand}, label %{body_label}, label %{next_test}')
             self._b.start(body_label)
-            self._statements(branch.body, dict(env))
+            self._scoped_statements(branch.body, dict(env), branch.span or statement.span)
             self._b.branch(merge)
         assert next_test is not None
         self._b.start(next_test)
         if statement.else_body is not None:
-            self._statements(statement.else_body, dict(env))
+            self._scoped_statements(statement.else_body, dict(env), statement.span)
         self._b.branch(merge)
         self._b.start(merge)
 
@@ -432,11 +500,18 @@ class LLVMLoweringPass:
         condition = self._expression(statement.condition, env)
         self._b.terminate(f'br i1 {condition.operand}, label %{body_label}, label %{end_label}')
         self._b.start(body_label)
-        self._statements(statement.body, dict(env))
+        self._scoped_statements(statement.body, dict(env), statement.span)
         self._b.branch(condition_label)
         self._b.start(end_label)
 
     def _for(self, statement: HIRFor, env) -> None:
+        previous_scope = self._b.push_scope(statement.span)
+        try:
+            self._for_body(statement, env)
+        finally:
+            self._b.pop_scope(previous_scope)
+
+    def _for_body(self, statement: HIRFor, env) -> None:
         loop_env = dict(env)
         if statement.initializer is not None:
             self._statement(statement.initializer, loop_env)
@@ -462,7 +537,7 @@ class LLVMLoweringPass:
         merge = self._b.label('try.end')
         self._ensure_error_slots()
         self._b.error_handlers.append(handler)
-        self._statements(statement.body, dict(env))
+        self._scoped_statements(statement.body, dict(env), statement.span)
         self._b.error_handlers.pop()
         self._b.branch(merge)
         self._b.start(handler)
@@ -480,20 +555,30 @@ class LLVMLoweringPass:
             self._b.terminate(f'br i1 {matches}, label %{body_label}, label %{next_label}')
             self._b.start(body_label)
             catch_env = dict(env)
-            if catch.name is not None:
-                type_name = self._type(catch.error_type)
-                slot = self._b.alloca(type_name, 'caught')
-                value = self._b.temp('caught')
-                payload_index = self.error_payload_indices[catch.error_type.name]
-                self._b.emit(
-                    f'{value} = extractvalue %jack.error.payload {payload}, '
-                    f'{payload_index}'
-                )
-                self._b.emit(f'store {type_name} {value}, ptr {slot}')
-                catch_env[catch.name] = (slot, catch.error_type)
-            self._b.caught_errors.append((tag, payload))
-            self._statements(catch.body, catch_env)
-            self._b.caught_errors.pop()
+            previous_scope = self._b.push_scope(catch.span or statement.span)
+            try:
+                if catch.name is not None:
+                    type_name = self._type(catch.error_type)
+                    slot = self._b.alloca(type_name, 'caught')
+                    value = self._b.temp('caught')
+                    payload_index = self.error_payload_indices[catch.error_type.name]
+                    self._b.emit(
+                        f'{value} = extractvalue %jack.error.payload {payload}, '
+                        f'{payload_index}'
+                    )
+                    self._b.emit(f'store {type_name} {value}, ptr {slot}')
+                    self._b.declare_debug_variable(
+                        catch.name,
+                        catch.error_type,
+                        slot,
+                        catch.span or statement.span,
+                    )
+                    catch_env[catch.name] = (slot, catch.error_type)
+                self._b.caught_errors.append((tag, payload))
+                self._statements(catch.body, catch_env)
+                self._b.caught_errors.pop()
+            finally:
+                self._b.pop_scope(previous_scope)
             self._b.branch(merge)
             self._b.start(next_label)
         self._propagate_error(tag, payload)
@@ -1099,6 +1184,164 @@ class LLVMLoweringPass:
         if name in {'c_void', 'c_char'}:
             return 'i8'
         return 'ptr'
+
+    def _debug_type(self, type_ref: TypeReference) -> str:
+        key = self._debug_type_key(type_ref)
+        if key in self.module.debug_types:
+            return key
+        self.module.debug_types[key] = LLVMDebugType(
+            key, type_ref.name, 'unspecified'
+        )
+
+        if self._is_slice(type_ref):
+            element = self._element_type(type_ref)
+            element_key = self._debug_type(element)
+            pointer_key = self._debug_pointer_type(element_key)
+            length_key = self._debug_type(TypeReference('i32'))
+            members = (
+                LLVMDebugMember('data', pointer_key, 0),
+                LLVMDebugMember('length', length_key, 64),
+            )
+            self.module.debug_types[key] = LLVMDebugType(
+                key, f'{element.name}[]', 'struct', 128, 64, members=members
+            )
+            return key
+
+        if type_ref.borrow is not None:
+            base = TypeReference(
+                type_ref.name,
+                list(type_ref.arguments),
+                array_size=type_ref.array_size,
+                is_slice=type_ref.is_slice,
+            )
+            base_key = self._debug_type(base)
+            self.module.debug_types[key] = LLVMDebugType(
+                key, f'&{type_ref.borrow} {base.name}', 'pointer', 64, 64,
+                base_key=base_key,
+            )
+            return key
+
+        if type_ref.array_size is not None:
+            element_key = self._debug_type(self._element_type(type_ref))
+            element = self.module.debug_types[element_key]
+            count = int(type_ref.array_size)
+            stride = self._align_to(element.size_bits, element.align_bits)
+            self.module.debug_types[key] = LLVMDebugType(
+                key, f'{type_ref.name}[{count}]', 'array', stride * count,
+                element.align_bits, base_key=element_key, count=count,
+            )
+            return key
+
+        if type_ref.name == 'str':
+            byte_key = self._debug_type(TypeReference('u8'))
+            pointer_key = self._debug_pointer_type(byte_key)
+            length_key = self._debug_type(TypeReference('i32'))
+            self.module.debug_types[key] = LLVMDebugType(
+                key, 'str', 'struct', 128, 64,
+                members=(
+                    LLVMDebugMember('data', pointer_key, 0),
+                    LLVMDebugMember('length', length_key, 64),
+                ),
+            )
+            return key
+
+        spec = BUILTIN_TYPE_SPECS.get(type_ref.name)
+        if spec is not None:
+            encoding = {
+                'signed': 'DW_ATE_signed',
+                'endian_signed': 'DW_ATE_signed',
+                'unsigned': 'DW_ATE_unsigned',
+                'raw': 'DW_ATE_unsigned',
+                'float': 'DW_ATE_float',
+                'bool': 'DW_ATE_boolean',
+            }[spec.family]
+            alignment = 8 if spec.bits < 8 else min(spec.bits, 64)
+            self.module.debug_types[key] = LLVMDebugType(
+                key, type_ref.name, 'basic', spec.bits, alignment,
+                encoding=encoding,
+            )
+            return key
+
+        declaration = self.types.get(type_ref.name)
+        if declaration is not None:
+            fields = [
+                (field.source_name or field.name, self._debug_type(field.type_ref))
+                for field in declaration.fields
+            ]
+            size, alignment, members = self._debug_struct_layout(fields)
+            self.module.debug_types[key] = LLVMDebugType(
+                key, declaration.source_name or declaration.name, 'struct',
+                size, alignment, members=members,
+            )
+            return key
+
+        view = self.views.get(type_ref.name)
+        if view is not None:
+            fields = []
+            for field in view.fields:
+                if self._is_slice(field.type_ref):
+                    field_key = self._debug_type(field.type_ref)
+                else:
+                    base_key = self._debug_type(TypeReference(
+                        field.type_ref.name,
+                        list(field.type_ref.arguments),
+                        array_size=field.type_ref.array_size,
+                        is_slice=field.type_ref.is_slice,
+                    ))
+                    field_key = self._debug_pointer_type(base_key)
+                fields.append((field.name, field_key))
+            size, alignment, members = self._debug_struct_layout(fields)
+            self.module.debug_types[key] = LLVMDebugType(
+                key, view.source_name or view.name, 'struct', size, alignment,
+                members=members,
+            )
+            return key
+
+        self.module.debug_types[key] = LLVMDebugType(
+            key, type_ref.name, 'unspecified'
+        )
+        return key
+
+    def _debug_pointer_type(self, base_key: str) -> str:
+        key = f'ptr:{base_key}'
+        if key not in self.module.debug_types:
+            name = self.module.debug_types[base_key].name
+            self.module.debug_types[key] = LLVMDebugType(
+                key, f'&{name}', 'pointer', 64, 64, base_key=base_key
+            )
+        return key
+
+    def _debug_struct_layout(
+        self, fields: list[tuple[str, str]]
+    ) -> tuple[int, int, tuple[LLVMDebugMember, ...]]:
+        if not fields:
+            return 8, 8, ()
+        offset = 0
+        alignment = 8
+        members = []
+        for name, type_key in fields:
+            descriptor = self.module.debug_types[type_key]
+            field_alignment = max(descriptor.align_bits, 8)
+            offset = self._align_to(offset, field_alignment)
+            members.append(LLVMDebugMember(name, type_key, offset))
+            offset += max(descriptor.size_bits, 8)
+            alignment = max(alignment, field_alignment)
+        return self._align_to(offset, alignment), alignment, tuple(members)
+
+    @staticmethod
+    def _align_to(value: int, alignment: int) -> int:
+        return ((value + alignment - 1) // alignment) * alignment
+
+    @staticmethod
+    def _debug_type_key(type_ref: TypeReference) -> str:
+        suffix = ''
+        if type_ref.array_size is not None:
+            suffix += f'[{int(type_ref.array_size)}]'
+        if type_ref.is_slice:
+            suffix += '[]'
+        if type_ref.borrow is not None:
+            suffix += f'&{type_ref.borrow}'
+        return f'{type_ref.name}{suffix}'
 
     def _slice_type(self, type_ref: TypeReference) -> str:
         key = self._type(self._element_type(type_ref)).replace(' ', '').replace('%', '').replace('"', '')

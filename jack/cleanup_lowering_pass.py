@@ -1109,6 +1109,7 @@ class HIRStaticCleanupLoweringPass:
             symbol=HIRVariableSymbol(
                 name=name,
                 type_ref=copy.deepcopy(type_ref),
+                synthetic=True,
                 span=span,
             ),
             span=span,

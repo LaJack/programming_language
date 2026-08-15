@@ -24,6 +24,7 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+.jack/
 # VSCode extension development
 !vscode-jack/.vscode/
 !vscode-jack/.vscode/launch.json

@@ -350,5 +350,45 @@ class LLVMEmitPassTests(unittest.TestCase):
         self.assertEqual(0, completed.returncode, completed.stderr + llvm_source)
         self.assertIn('isOptimized: true', llvm_source)
 
+    def test_debug_ir_describes_parameters_locals_and_aggregate_types(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / 'locals.jack'
+            source = '''
+                struct Point {
+                    i32 x;
+                    init(&inout self, i32 value) { self.x = value; }
+                }
+
+                i32 inspect(i32 input) {
+                    Point point(input);
+                    u8[2] bytes;
+                    &inout u8[] slice = &inout bytes[..];
+                    if (input == 1) {
+                        i32 nested = point.x;
+                        return nested;
+                    }
+                    return point.x;
+                }
+
+                i32 result = inspect(1);
+                print(result);
+            '''
+            source_path.write_text(source)
+            llvm_source = self.emit(
+                source, source_path=source_path, debug=True
+            )
+
+        self.assertIn('declare void @llvm.dbg.declare', llvm_source)
+        self.assertIn('!DILocalVariable(name: "input", arg: 1', llvm_source)
+        self.assertIn('!DILocalVariable(name: "point"', llvm_source)
+        self.assertIn('!DILocalVariable(name: "bytes"', llvm_source)
+        self.assertIn('!DILocalVariable(name: "slice"', llvm_source)
+        self.assertIn('!DILocalVariable(name: "nested"', llvm_source)
+        self.assertIn('!DICompositeType(tag: DW_TAG_structure_type, name: "Point"', llvm_source)
+        self.assertIn('!DICompositeType(tag: DW_TAG_array_type', llvm_source)
+        self.assertIn('!DIDerivedType(tag: DW_TAG_pointer_type', llvm_source)
+        self.assertIn('distinct !DILexicalBlock(', llvm_source)
+        self.assertNotIn('jack_cleanup_return_value', llvm_source)
+
 if __name__ == '__main__':
     unittest.main()

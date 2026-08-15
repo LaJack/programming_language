@@ -23,6 +23,37 @@ def _is_terminator(instruction: str) -> bool:
 class LLVMInstruction:
     text: str
     span: SourceSpan | None = None
+    scope: int = 0
+    debug_variable: 'LLVMDebugVariable | None' = None
+
+
+@dataclass(frozen=True)
+class LLVMDebugMember:
+    name: str
+    type_key: str
+    offset_bits: int
+
+
+@dataclass(frozen=True)
+class LLVMDebugType:
+    key: str
+    name: str
+    kind: str
+    size_bits: int = 0
+    align_bits: int = 0
+    encoding: str | None = None
+    base_key: str | None = None
+    count: int | None = None
+    members: tuple[LLVMDebugMember, ...] = ()
+
+
+@dataclass(frozen=True)
+class LLVMDebugVariable:
+    name: str
+    type_key: str
+    slot: str
+    span: SourceSpan
+    argument: int = 0
 
 
 @dataclass(frozen=True)
@@ -33,6 +64,7 @@ class LLVMFunction:
     blocks: tuple[tuple[str, tuple[LLVMInstruction | str, ...]], ...]
     span: SourceSpan | None = None
     debug_name: str | None = None
+    debug_scopes: tuple[tuple[int, int, SourceSpan], ...] = ()
 
     def render(self, debug_info: '_LLVMDebugInfo | None' = None) -> str:
         params = ', '.join(f'{type_name} %{name}' for type_name, name in self.parameters)
@@ -61,6 +93,7 @@ class LLVMModule:
     functions: list[LLVMFunction] = field(default_factory=list)
     debug: bool = False
     optimization: int = 0
+    debug_types: dict[str, LLVMDebugType] = field(default_factory=dict)
 
     def validate(self) -> None:
         type_names: set[str] = set()
@@ -192,9 +225,12 @@ class _LLVMDebugInfo:
         self.files: dict[str, int] = {}
         self.compile_units: dict[str, int] = {}
         self.subprograms: dict[str, int] = {}
-        self.locations: dict[tuple[str, str, int, int], int] = {}
-        self.scopes: dict[tuple[str, str], int] = {}
-        self.nodes: list[tuple[int, str]] = []
+        self.locations: dict[tuple[str, int, str, int, int], int] = {}
+        self.scopes: dict[tuple[str, int], int] = {}
+        self.file_scopes: dict[tuple[str, int, str], int] = {}
+        self.type_nodes: dict[str, int] = {}
+        self.variable_nodes: dict[tuple[str, str], int] = {}
+        self.nodes: dict[int, str] = {}
         self.next_id = 0
         for path in sorted(paths):
             source = Path(path)
@@ -229,6 +265,9 @@ class _LLVMDebugInfo:
                 'spFlags: DISPFlagDefinition, '
                 f'unit: !{self.compile_units[span.source_path]})'
             )
+        self._build_types(module.debug_types)
+        self._build_scopes(module.functions)
+        self._build_variables(module.functions)
         for function in module.functions:
             for _, instructions in function.blocks:
                 for instruction in instructions:
@@ -257,8 +296,102 @@ class _LLVMDebugInfo:
     def _add(self, body: str) -> int:
         identifier = self.next_id
         self.next_id += 1
-        self.nodes.append((identifier, body))
+        self.nodes[identifier] = body
         return identifier
+
+    def _reserve(self) -> int:
+        return self._add('!{}')
+
+    def _build_types(self, types: dict[str, LLVMDebugType]) -> None:
+        for key in sorted(types):
+            self.type_nodes[key] = self._reserve()
+        for key in sorted(types):
+            descriptor = types[key]
+            identifier = self.type_nodes[key]
+            if descriptor.kind == 'basic':
+                body = (
+                    f'!DIBasicType(name: "{_metadata_string(descriptor.name)}", '
+                    f'size: {descriptor.size_bits}, encoding: {descriptor.encoding})'
+                )
+            elif descriptor.kind == 'pointer':
+                body = (
+                    '!DIDerivedType(tag: DW_TAG_pointer_type, '
+                    f'baseType: !{self.type_nodes[descriptor.base_key]}, '
+                    f'size: {descriptor.size_bits}, align: {descriptor.align_bits})'
+                )
+            elif descriptor.kind == 'array':
+                subrange = self._add(f'!DISubrange(count: {descriptor.count})')
+                elements = self._add(f'!{{!{subrange}}}')
+                body = (
+                    '!DICompositeType(tag: DW_TAG_array_type, '
+                    f'baseType: !{self.type_nodes[descriptor.base_key]}, '
+                    f'size: {descriptor.size_bits}, align: {descriptor.align_bits}, '
+                    f'elements: !{elements})'
+                )
+            elif descriptor.kind == 'struct':
+                members = []
+                for member in descriptor.members:
+                    member_id = self._add(
+                        '!DIDerivedType(tag: DW_TAG_member, '
+                        f'name: "{_metadata_string(member.name)}", '
+                        f'baseType: !{self.type_nodes[member.type_key]}, '
+                        f'size: {types[member.type_key].size_bits}, '
+                        f'offset: {member.offset_bits})'
+                    )
+                    members.append(f'!{member_id}')
+                elements = self._add(f'!{{{", ".join(members)}}}')
+                body = (
+                    '!DICompositeType(tag: DW_TAG_structure_type, '
+                    f'name: "{_metadata_string(descriptor.name)}", '
+                    f'size: {descriptor.size_bits}, align: {descriptor.align_bits}, '
+                    f'elements: !{elements})'
+                )
+            else:
+                body = (
+                    '!DICompositeType(tag: DW_TAG_structure_type, '
+                    f'name: "{_metadata_string(descriptor.name)}", '
+                    'flags: DIFlagFwdDecl)'
+                )
+            self.nodes[identifier] = body
+
+    def _build_scopes(self, functions: list[LLVMFunction]) -> None:
+        for function in functions:
+            subprogram = self.subprograms.get(function.name)
+            if subprogram is None:
+                continue
+            self.scopes[(function.name, 0)] = subprogram
+            for scope_id, parent_id, span in function.debug_scopes:
+                parent = self.scopes.get((function.name, parent_id), subprogram)
+                file_id = self.files.get(span.source_path or '')
+                if file_id is None:
+                    continue
+                self.scopes[(function.name, scope_id)] = self._add(
+                    'distinct !DILexicalBlock('
+                    f'scope: !{parent}, file: !{file_id}, '
+                    f'line: {span.start_line}, column: {max(span.start_column, 1)})'
+                )
+
+    def _build_variables(self, functions: list[LLVMFunction]) -> None:
+        for function in functions:
+            for _, instructions in function.blocks:
+                for instruction in instructions:
+                    if not isinstance(instruction, LLVMInstruction):
+                        continue
+                    variable = instruction.debug_variable
+                    if variable is None or variable.type_key not in self.type_nodes:
+                        continue
+                    scope = self.scopes.get((function.name, instruction.scope))
+                    path = variable.span.source_path
+                    if scope is None or path is None or path not in self.files:
+                        continue
+                    argument = f', arg: {variable.argument}' if variable.argument else ''
+                    self.variable_nodes[(function.name, variable.slot)] = self._add(
+                        '!DILocalVariable('
+                        f'name: "{_metadata_string(variable.name)}"{argument}, '
+                        f'scope: !{scope}, file: !{self.files[path]}, '
+                        f'line: {variable.span.start_line}, '
+                        f'type: !{self.type_nodes[variable.type_key]})'
+                    )
 
     def _location(
         self, function: LLVMFunction, instruction: LLVMInstruction | str
@@ -270,19 +403,17 @@ class _LLVMDebugInfo:
         subprogram = self.subprograms.get(function.name)
         if path is None or subprogram is None:
             return None
-        scope_key = (function.name, path)
-        scope = self.scopes.get(scope_key)
+        scope = self.scopes.get((function.name, instruction.scope), subprogram)
         function_span = self._function_span(function)
-        if scope is None:
-            if function_span is not None and function_span.source_path == path:
-                scope = subprogram
-            else:
-                scope = self._add(
-                    f'!DILexicalBlockFile(scope: !{subprogram}, '
+        if function_span is None or function_span.source_path != path:
+            file_scope_key = (function.name, instruction.scope, path)
+            if file_scope_key not in self.file_scopes:
+                self.file_scopes[file_scope_key] = self._add(
+                    f'!DILexicalBlockFile(scope: !{scope}, '
                     f'file: !{self.files[path]}, discriminator: 0)'
                 )
-            self.scopes[scope_key] = scope
-        key = (function.name, path, span.start_line, span.start_column)
+            scope = self.file_scopes[file_scope_key]
+        key = (function.name, instruction.scope, path, span.start_line, span.start_column)
         location = self.locations.get(key)
         if location is None:
             location = self._add(
@@ -296,6 +427,14 @@ class _LLVMDebugInfo:
         self, function: LLVMFunction, instruction: LLVMInstruction | str
     ) -> str:
         text = _instruction_text(instruction)
+        if isinstance(instruction, LLVMInstruction) and instruction.debug_variable:
+            variable = instruction.debug_variable
+            variable_id = self.variable_nodes.get((function.name, variable.slot))
+            if variable_id is not None:
+                text = (
+                    f'call void @llvm.dbg.declare(metadata ptr {variable.slot}, '
+                    f'metadata !{variable_id}, metadata !DIExpression())'
+                )
         location = self._location(function, instruction)
         return text if location is None else f'{text}, !dbg !{location}'
 
@@ -309,7 +448,10 @@ class _LLVMDebugInfo:
             f'!llvm.ident = !{{!{self.ident}}}',
             '',
         ]
-        lines.extend(f'!{identifier} = {body}' for identifier, body in self.nodes)
+        lines.extend(
+            f'!{identifier} = {self.nodes[identifier]}'
+            for identifier in sorted(self.nodes)
+        )
         return '\n'.join(lines)
 
 

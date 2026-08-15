@@ -6,6 +6,9 @@
   "publisher": "jack-lang",
   "license": "UNLICENSED",
   "private": true,
+  "extensionDependencies": [
+    "vadimcn.vscode-lldb"
+  ],
   "engines": {
     "vscode": "^1.84.0"
   },
@@ -39,6 +42,57 @@
         "path": "./syntaxes/jack.tmLanguage.json"
       }
     ],
+    "breakpoints": [
+      {
+        "language": "jack"
+      }
+    ],
+    "commands": [
+      {
+        "command": "jack.debugCurrentFile",
+        "title": "Debug Current File",
+        "category": "Jack"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "jack.debugCurrentFile",
+        "key": "f5",
+        "when": "editorLangId == jack && !inDebugMode"
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "jack",
+        "required": [
+          "entry",
+          "output"
+        ],
+        "properties": {
+          "entry": { "type": "string", "description": "Jack entry source file." },
+          "output": { "type": "string", "description": "Debug executable path." },
+          "backend": { "type": "string", "enum": ["llvm", "c"], "default": "llvm" },
+          "optimization": { "type": "integer", "minimum": 0, "maximum": 3, "default": 0 },
+          "moduleRoots": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "stubs": { "type": "object", "additionalProperties": { "type": "string" }, "default": {} },
+          "clang": { "type": "string", "default": "clang" }
+        }
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "jack",
+        "owner": "jack",
+        "fileLocation": "absolute",
+        "pattern": {
+          "regexp": "^jack: (.*):([0-9]+):([0-9]+): (.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "message": 4
+        }
+      }
+    ],
     "configuration": {
       "title": "Jack",
       "properties": {
@@ -67,15 +121,57 @@
           "type": "boolean",
           "default": false,
           "description": "Write raw language server messages to the Jack output channel."
+        },
+        "jack.compiler.path": {
+          "type": "string",
+          "default": "jack",
+          "description": "Jack compiler executable used for builds and debugging."
+        },
+        "jack.compiler.moduleRoots": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Additional module search roots passed to the Jack compiler."
+        },
+        "jack.compiler.stubs": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {},
+          "description": "Module-to-stub overrides used by debug builds."
+        },
+        "jack.compiler.clangPath": {
+          "type": "string",
+          "default": "clang",
+          "description": "Clang executable used to link native debug builds."
+        },
+        "jack.debug.cwd": {
+          "type": "string",
+          "default": "${workspaceFolder}",
+          "description": "Working directory of the debugged program."
+        },
+        "jack.debug.args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Arguments passed to the debugged program."
+        },
+        "jack.debug.env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {},
+          "description": "Environment variables added to the debugged program."
         }
       }
     }
   },
   "scripts": {
-    "package:vsix": "node ./scripts/package-vsix.cjs"
+    "package:vsix": "node ./scripts/package-vsix.cjs",
+    "test": "node --test test/*.test.js"
   },
   "main": "./client/extension.js",
   "activationEvents": [
-    "onLanguage:jack"
+    "onLanguage:jack",
+    "onCommand:jack.debugCurrentFile",
+    "onTaskType:jack"
   ]
 }

@@ -122,6 +122,8 @@ class HIRFunctionDeclaration(HIRDeclaration):
     source_name: str | None = None
     extern: bool = False
     abi: str | None = None
+    interface_name: str | None = None
+    synthetic: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)

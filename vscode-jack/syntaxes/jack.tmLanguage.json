@@ -282,6 +282,23 @@
           }
         },
         {
+          "name": "meta.interface.declaration.jack",
+          "match": "\\b(interface)\\s+([A-Z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.interface.jack" },
+            "2": { "name": "entity.name.type.interface.jack" }
+          }
+        },
+        {
+          "name": "meta.interface.implementation.jack",
+          "match": "\\b([A-Z_][A-Za-z0-9_]*(?:\\s*\\([^{}]*\\))?)\\s+(implements)\\s+([A-Z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "entity.name.type.jack" },
+            "2": { "name": "keyword.other.implements.jack" },
+            "3": { "name": "entity.name.type.interface.jack" }
+          }
+        },
+        {
           "name": "meta.view.declaration.jack",
           "match": "\\b(view)\\s+([A-Z_][A-Za-z0-9_]*)",
           "captures": {
@@ -354,7 +371,7 @@
         },
         {
           "name": "keyword.other.jack",
-          "match": "\\b(?:as|raises|print)\\b"
+          "match": "\\b(?:as|implements|raises|print|use)\\b"
         },
         {
           "name": "storage.modifier.jack",
@@ -362,7 +379,7 @@
         },
         {
           "name": "storage.type.jack",
-          "match": "\\b(?:struct|view|type)\\b"
+          "match": "\\b(?:interface|struct|view|type)\\b"
         }
       ]
     },

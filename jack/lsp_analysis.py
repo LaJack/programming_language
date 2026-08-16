@@ -19,6 +19,8 @@ from .ast_nodes import (
     FunctionCall,
     FunctionDeclaration,
     If,
+    ImplementationDeclaration,
+    InterfaceDeclaration,
     ImportDeclaration,
     IndexExpression,
     LiteralExpression,
@@ -57,10 +59,13 @@ SKIPPED_DIRECTORIES = {
 }
 JACK_KEYWORDS = {
     'as', 'catch', 'comptime', 'else', 'extern', 'false', 'for', 'if',
-    'import', 'in', 'inout', 'module', 'move', 'out', 'print', 'pub', 'raise',
-    'raises', 'rethrow', 'return', 'struct', 'true', 'try', 'view', 'while',
+    'implements', 'import', 'in', 'inout', 'interface', 'module', 'move', 'out',
+    'print', 'pub', 'raise', 'raises', 'rethrow', 'return', 'struct', 'true',
+    'try', 'use', 'view', 'while',
 }
-BUILTIN_TYPES = {'void', 'str', 'c_char', 'c_void', 'type', *BUILTIN_TYPE_SPECS}
+BUILTIN_TYPES = {
+    'void', 'str', 'c_char', 'c_void', 'type', 'Copyable', *BUILTIN_TYPE_SPECS
+}
 BUILTIN_FUNCTIONS = {'len', 'sizeof', 'alignof'}
 
 
@@ -396,7 +401,8 @@ class _GraphIndexBuilder:
             self.tokens[module.path] = Lexer(source, source_path=module.path).tokenize()
             for statement in module.ast:
                 if type(statement) in {
-                    TypeDeclaration, ViewDeclaration, FunctionDeclaration,
+                    TypeDeclaration, ViewDeclaration, InterfaceDeclaration,
+                    FunctionDeclaration,
                     VariableDeclaration,
                 }:
                     self._declare_top(module_name, statement)
@@ -439,6 +445,8 @@ class _GraphIndexBuilder:
         if isinstance(node, (TypeDeclaration, ViewDeclaration)):
             self.type_declarations[getattr(node, 'name')] = node
             self._declare_members(symbol, node)
+        elif isinstance(node, InterfaceDeclaration):
+            self._declare_interface_members(symbol, node)
         elif isinstance(node, FunctionDeclaration):
             self.functions[node.name] = node
 
@@ -476,6 +484,22 @@ class _GraphIndexBuilder:
                 self._add_symbol(symbol)
                 self.model.members.setdefault(owner.id, []).append(symbol_id)
 
+    def _declare_interface_members(
+        self, owner: SemanticSymbol, node: InterfaceDeclaration
+    ) -> None:
+        for method in node.methods:
+            selection = self._declaration_selection(method, method.name)
+            symbol_id = f'{owner.id}::method::{method.name}'
+            symbol = SemanticSymbol(
+                symbol_id, method.name, 'method', _type_label(method.return_type),
+                _function_signature(method, method.name), method.span, selection,
+                owner.module_name, owner.public, False, True, owner.id,
+                selection.start_offset, resolved_type=method.return_type.name,
+                parameter_labels=_parameter_labels(method, omit_self=True),
+            )
+            self._add_symbol(symbol)
+            self.model.members.setdefault(owner.id, []).append(symbol_id)
+
     def _add_symbol(self, symbol: SemanticSymbol) -> None:
         self.model.symbols[symbol.id] = symbol
         self.model.occurrences.append(SemanticOccurrence(
@@ -500,6 +524,8 @@ class _GraphIndexBuilder:
             type_env = dict(env)
             for parameter in node.parameters:
                 self._type_reference(parameter.type, type_env)
+                for constraint in parameter.constraints:
+                    self._type_reference(constraint, type_env)
                 symbol = self._declare_local(
                     parameter, module_name, type_scope, 'parameter'
                 )
@@ -510,6 +536,42 @@ class _GraphIndexBuilder:
                     self._expression(field.expr, type_env)
             for method in node.methods:
                 self._function(method, module_name, type_env, owner_id)
+            return
+        if isinstance(node, InterfaceDeclaration):
+            owner_id = self.top_by_internal.get(node.name)
+            for method in node.methods:
+                self._function(method, module_name, dict(env), owner_id)
+            return
+        if isinstance(node, ImplementationDeclaration):
+            self._type_reference(node.interface, env)
+            impl_env = dict(env)
+            for parameter in node.parameters:
+                self._type_reference(parameter.type, impl_env)
+                for constraint in parameter.constraints:
+                    self._type_reference(constraint, impl_env)
+                symbol = self._declare_local(parameter, module_name, scope, 'parameter')
+                impl_env[parameter.name] = symbol.id
+            owner_id = self.top_by_internal.get(node.type_name)
+            interface_id = self.top_by_internal.get(node.interface.name)
+            for use in node.uses:
+                if owner_id is not None:
+                    target_id = f'{owner_id}::method::{use.name}'
+                    if target_id in self.model.symbols:
+                        span = self._declaration_selection(use, use.name)
+                        self.model.occurrences.append(
+                            SemanticOccurrence(target_id, span, False, 'reference')
+                        )
+            for method in node.methods:
+                if interface_id is not None:
+                    requirement_id = f'{interface_id}::method::{method.name}'
+                    if requirement_id in self.model.symbols:
+                        span = self._declaration_selection(method, method.name)
+                        self.model.occurrences.append(
+                            SemanticOccurrence(
+                                requirement_id, span, False, 'definition'
+                            )
+                        )
+                self._function(method, module_name, impl_env, owner_id)
             return
         if isinstance(node, ViewDeclaration):
             for field in node.fields:
@@ -886,7 +948,7 @@ class _GraphIndexBuilder:
         symbol_id = (env or {}).get(type_ref.name) or self.top_by_internal.get(type_ref.name)
         symbol = self.model.symbols.get(symbol_id or '')
         if symbol is not None and (
-            symbol.kind in {'type', 'view'} or symbol.resolved_type == 'type'
+            symbol.kind in {'type', 'view', 'interface'} or symbol.resolved_type == 'type'
         ):
             self._occurrence_for_symbol(type_ref.span, symbol, prefer_last=True)
         elif (
@@ -907,7 +969,7 @@ class _GraphIndexBuilder:
     def _type_symbol_id(self, name: str) -> str | None:
         symbol_id = self.top_by_internal.get(name)
         symbol = self.model.symbols.get(symbol_id or '')
-        return symbol_id if symbol is not None and symbol.kind in {'type', 'view'} else None
+        return symbol_id if symbol is not None and symbol.kind in {'type', 'view', 'interface'} else None
 
     def _member(
         self, owner_id: str, name: str, kind: str | None = None
@@ -985,6 +1047,8 @@ def _declaration_kind(node: Statement) -> str:
         return 'type'
     if isinstance(node, ViewDeclaration):
         return 'view'
+    if isinstance(node, InterfaceDeclaration):
+        return 'interface'
     if isinstance(node, FunctionDeclaration):
         return 'function'
     return 'global'
@@ -995,7 +1059,7 @@ def _declaration_type_label(node: Statement) -> str | None:
         return _type_label(node.return_type)
     if isinstance(node, VariableDeclaration):
         return _type_label(node.type)
-    if isinstance(node, (TypeDeclaration, ViewDeclaration)):
+    if isinstance(node, (TypeDeclaration, ViewDeclaration, InterfaceDeclaration)):
         return node.source_name or node.name
     return None
 
@@ -1005,6 +1069,8 @@ def _declaration_signature(node: Statement, name: str) -> str:
         return f'{'pub ' if node.public else ''}struct {name}'
     if isinstance(node, ViewDeclaration):
         return f'{'pub ' if node.public else ''}view {name}'
+    if isinstance(node, InterfaceDeclaration):
+        return f'{'pub ' if node.public else ''}interface {name}'
     if isinstance(node, FunctionDeclaration):
         return _function_signature(node, name)
     if isinstance(node, VariableDeclaration):
@@ -1018,6 +1084,7 @@ def _function_signature(node: FunctionDeclaration, name: str) -> str:
         f'{'comptime ' if parameter.comptime else ''}'
         f'{'move ' if parameter.passing_mode == "move" else ""}'
         f'{_type_label(parameter.type)} {parameter.name}'
+        f'{_constraint_label(parameter)}'
         for parameter in parameters
     )
     raises = ''
@@ -1043,8 +1110,15 @@ def _parameter_labels(
         f'{'comptime ' if item.comptime else ''}'
         f'{'move ' if item.passing_mode == "move" else ""}'
         f'{_type_label(item.type)} {item.name}'
+        f'{_constraint_label(item)}'
         for item in parameters
     )
+
+
+def _constraint_label(parameter: VariableDeclaration) -> str:
+    if not parameter.constraints:
+        return ''
+    return ': ' + ' + '.join(_type_label(item) or item.name for item in parameter.constraints)
 
 
 def _type_label(type_ref: TypeReference | None) -> str | None:

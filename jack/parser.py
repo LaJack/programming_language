@@ -17,6 +17,9 @@ try:
         FunctionDeclaration,
         If,
         IfBranch,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
+        InterfaceUse,
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
@@ -57,6 +60,9 @@ except ImportError:
         FunctionDeclaration,
         If,
         IfBranch,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
+        InterfaceUse,
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
@@ -134,7 +140,7 @@ class ParseResult:
 
 
 class Lexer:
-    SYMBOLS = set('{}();,+.=<>![]&')
+    SYMBOLS = set('{}();,:+.=<>![]&')
     TWO_CHAR_SYMBOLS = {'==', '!=', '<=', '>=', '..'}
 
     def __init__(self, source: str, source_path: str | Path | None = None) -> None:
@@ -439,6 +445,8 @@ class Parser:
         'for',
         'if',
         'import',
+        'implements',
+        'interface',
         'module',
         'move',
         'in',
@@ -509,6 +517,18 @@ class Parser:
         is_comptime = self._match_keyword('comptime')
         is_extern = self._match_keyword('extern')
         extern_abi = self._extern_abi() if is_extern else None
+
+        if self._match_keyword('interface'):
+            if is_comptime or is_extern:
+                raise self._error(self._previous(), 'interface cannot be comptime or extern.')
+            declaration = self._interface_declaration()
+            declaration.public = is_public
+            return declaration
+
+        if self._looks_like_implementation():
+            if is_public or is_comptime or is_extern:
+                raise self._error(self._peek(), 'implementation declarations cannot have modifiers.')
+            return self._implementation_declaration()
 
         if self._check_keyword('module') or self._check_keyword('import'):
             raise self._error(self._peek(), 'Module and import declarations cannot be modified.')
@@ -703,6 +723,102 @@ class Parser:
         self._match(';')
         return TypeDeclaration(name, fields, parameters, methods)
 
+    def _interface_declaration(self) -> InterfaceDeclaration:
+        name = self._identifier_value('Expected interface name.')
+        self._consume('{', 'Expected { before interface methods.')
+        methods: list[FunctionDeclaration] = []
+        while not self._check('}'):
+            if self._check('EOF'):
+                raise self._error(self._peek(), 'Expected } after interface methods.')
+            methods.append(self._interface_method())
+        self._consume('}', 'Expected } after interface methods.')
+        self._match(';')
+        return InterfaceDeclaration(name, methods)
+
+    def _interface_method(self) -> FunctionDeclaration:
+        start = self._peek()
+        is_comptime = self._match_keyword('comptime')
+        if self._check_special_method_name() and self._check_next('('):
+            name = self._identifier_value('Expected interface method name.')
+            return_type = TypeReference('void')
+        else:
+            return_type = self._type_reference()
+            name = self._identifier_value('Expected interface method name.')
+        self._consume('(', f'Expected ( after {name}.')
+        parameters = self._function_parameters()
+        raises, raises_inferred = self._raises_clause()
+        self._consume(';', 'Expected ; after interface method signature.')
+        method = FunctionDeclaration(
+            name, parameters, [], return_type, comptime=is_comptime,
+            raises=raises, raises_inferred=raises_inferred,
+        )
+        return self._with_span(self._method_declaration('Self', method), start)
+
+    def _looks_like_implementation(self) -> bool:
+        if not self._check('IDENT'):
+            return False
+        index = self.current + 1
+        if index < len(self.tokens) and self.tokens[index].kind == '(':
+            depth = 0
+            while index < len(self.tokens):
+                kind = self.tokens[index].kind
+                if kind == '(':
+                    depth += 1
+                elif kind == ')':
+                    depth -= 1
+                    if depth == 0:
+                        index += 1
+                        break
+                index += 1
+        return (
+            index < len(self.tokens)
+            and self.tokens[index].kind == 'IDENT'
+            and self.tokens[index].value == 'implements'
+        )
+
+    def _implementation_declaration(self) -> ImplementationDeclaration:
+        type_name = self._type_identifier_value('Expected implementing type name.')
+        parameters: list[VariableDeclaration] = []
+        if self._match('('):
+            if not self._check(')'):
+                while True:
+                    parameters.append(self._parameter())
+                    if not self._match(','):
+                        break
+            self._consume(')', 'Expected ) after implementation parameters.')
+        if not self._match_keyword('implements'):
+            raise self._error(self._peek(), 'Expected implements after type.')
+        interface = self._type_reference()
+        self._consume('{', 'Expected { before implementation entries.')
+        methods: list[FunctionDeclaration] = []
+        uses: list[InterfaceUse] = []
+        while not self._check('}'):
+            if self._check('EOF'):
+                raise self._error(self._peek(), 'Expected } after implementation entries.')
+            if self._match_keyword('use'):
+                start = self._previous()
+                name = self._identifier_value('Expected method name after use.')
+                self._consume(';', 'Expected ; after use declaration.')
+                uses.append(self._with_span(InterfaceUse(name), start))
+                continue
+            method_start = self._peek()
+            is_comptime = self._match_keyword('comptime')
+            if self._check_special_method_name() and self._check_next('('):
+                name = self._identifier_value('Expected implementation method name.')
+                return_type = TypeReference('void')
+            else:
+                return_type = self._type_reference()
+                name = self._identifier_value('Expected implementation method name.')
+            self._consume('(', f'Expected ( after {name}.')
+            method = self._with_span(
+                self._finish_function_declaration(name, return_type, is_comptime),
+                method_start,
+            )
+            methods.append(self._method_declaration('Self', method))
+        self._consume('}', 'Expected } after implementation entries.')
+        self._match(';')
+        return ImplementationDeclaration(type_name, interface, parameters, methods, uses)
+
     def _method_declaration(self, type_name: str, method: FunctionDeclaration) -> FunctionDeclaration:
         if method.parameters and method.parameters[0].name == 'self':
             method.self_parameter = method.parameters[0]
@@ -820,10 +936,17 @@ class Parser:
 
         parameter_type = self._type_reference()
         parameter_name = self._identifier_value('Expected parameter name.')
+        constraints: list[TypeReference] = []
+        if self._match(':'):
+            if not is_comptime or parameter_type.name != 'type':
+                raise self._error(self._previous(), 'Only comptime type parameters may have constraints.')
+            constraints.append(self._type_reference())
+            while self._match('+'):
+                constraints.append(self._type_reference())
         return self._with_span(
             VariableDeclaration(
                 parameter_name, parameter_type, comptime=is_comptime,
-                passing_mode=passing_mode,
+                passing_mode=passing_mode, constraints=constraints,
             ),
             start_token,
         )
@@ -1472,8 +1595,8 @@ class Parser:
 class RecoveringParser(Parser):
     RECOVERY_KEYWORDS = {
         'catch', 'comptime', 'elif', 'else', 'extern', 'for', 'if', 'import',
-        'module', 'print', 'pub', 'raise', 'rethrow', 'return', 'struct', 'try',
-        'view', 'while',
+        'interface', 'module', 'print', 'pub', 'raise', 'rethrow', 'return',
+        'struct', 'try', 'use', 'view', 'while',
     }
 
     def __init__(
@@ -1509,13 +1632,13 @@ class RecoveringParser(Parser):
 
     def _recover_parameter_list(self, closing_message: str) -> list[VariableDeclaration]:
         parameters: list[VariableDeclaration] = []
-        while not self._check(')', 'EOF') and not self.limit_reached:
+        while not self._check(')', ';', '}', 'EOF') and not self.limit_reached:
             start = self.current
             try:
                 parameters.append(self._parameter())
             except ParseError as err:
                 self._record(err)
-                self._synchronize_list({',', ')'}, start)
+                self._synchronize_list({',', ')', ';', '}'}, start)
             if not self._match(','):
                 break
         if self._check(')'):

@@ -14,6 +14,8 @@ try:
         FunctionCall,
         FunctionDeclaration,
         If,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
         ImportBinding,
         ImportDeclaration,
         IndexExpression,
@@ -47,6 +49,8 @@ except ImportError:
         FunctionCall,
         FunctionDeclaration,
         If,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
         ImportBinding,
         ImportDeclaration,
         IndexExpression,
@@ -498,6 +502,24 @@ class ModuleResolver:
                 used_aliases.update(self._rewrite_function_names(method, context, method_owner=True))
             if top_level:
                 statement.name = self._top_level_internal_name(statement, context)
+        elif type(statement) is InterfaceDeclaration:
+            for method in statement.methods:
+                used_aliases.update(
+                    self._rewrite_function_names(method, context, method_owner=True)
+                )
+            if top_level:
+                statement.name = self._top_level_internal_name(statement, context)
+        elif type(statement) is ImplementationDeclaration:
+            statement.type_name = self._rewrite_type_base_name(
+                statement.type_name, context, used_aliases
+            )
+            self._rewrite_type_names(statement.interface, context, used_aliases)
+            for parameter in statement.parameters:
+                used_aliases.update(self._rewrite_parameter_names(parameter, context))
+            for method in statement.methods:
+                used_aliases.update(
+                    self._rewrite_function_names(method, context, method_owner=True)
+                )
         elif type(statement) is FunctionDeclaration:
             used_aliases.update(self._rewrite_function_names(statement, context))
             if top_level:
@@ -530,6 +552,8 @@ class ModuleResolver:
             scope.declare(statement.self_parameter.name)
         for parameter in statement.parameters:
             self._rewrite_type_names(parameter.type, context, used_aliases)
+            for constraint in parameter.constraints:
+                self._rewrite_type_names(constraint, context, used_aliases)
             scope.declare(parameter.name)
         used_aliases.update(self._rewrite_statement_list_names(statement.body, context, scope))
         statement.qualified_imports = self._alias_use_bindings(used_aliases)
@@ -540,7 +564,17 @@ class ModuleResolver:
     ) -> set[tuple[str, str]]:
         used_aliases: set[tuple[str, str]] = set()
         self._rewrite_type_names(parameter.type, context, used_aliases)
+        for constraint in parameter.constraints:
+            self._rewrite_type_names(constraint, context, used_aliases)
         return used_aliases
+
+    def _rewrite_type_base_name(
+        self,
+        name: str,
+        context: NameRewriteContext,
+        used_aliases: set[tuple[str, str]],
+    ) -> str:
+        return self._rewrite_symbol_name(name, context, None, used_aliases)
 
     def _rewrite_statement_list_names(
         self,
@@ -677,6 +711,7 @@ class ModuleResolver:
     def _is_top_level_symbol_declaration(self, statement: Statement) -> bool:
         return type(statement) in {
             TypeDeclaration,
+            InterfaceDeclaration,
             FunctionDeclaration,
             VariableDeclaration,
             ViewDeclaration,

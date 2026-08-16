@@ -60,6 +60,22 @@ class SemanticLspProjectTests(unittest.TestCase):
 
         self.assertEqual([], analysis.diagnostics)
 
+    def test_interfaces_constraints_and_implementations_are_indexed(self):
+        entry = self.write('main.jack', '''
+interface Sized { usize size(&in self); }
+struct Value { usize size(&in self) { return 1; } }
+Value implements Sized { use size; }
+void inspect(comptime type T: Sized, &in T value) { print(value.size()); }
+Value value;
+''')
+
+        analysis = self.analyze(entry)
+
+        self.assertEqual([], analysis.diagnostics)
+        symbols = {(symbol.kind, symbol.name) for symbol in analysis.model.symbols.values()}
+        self.assertIn(('interface', 'Sized'), symbols)
+        self.assertIn(('method', 'size'), symbols)
+
     def test_imported_semantic_error_keeps_imported_source_path(self):
         library = self.write(
             'bad.jack',

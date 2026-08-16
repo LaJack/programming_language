@@ -132,6 +132,7 @@ class VariableDeclaration(Statement):
     extern: bool = False
     abi: str | None = None
     passing_mode: str = 'copy'
+    constraints: List[TypeReference] = field(default_factory=list)
 
 
 @dataclass
@@ -142,6 +143,26 @@ class TypeDeclaration(Statement):
     methods: List['FunctionDeclaration'] = field(default_factory=list)
     extern: bool = False
     abi: str | None = None
+
+
+@dataclass
+class InterfaceDeclaration(Statement):
+    name: str
+    methods: List['FunctionDeclaration']
+
+
+@dataclass
+class InterfaceUse(AstNode):
+    name: str
+
+
+@dataclass
+class ImplementationDeclaration(Statement):
+    type_name: str
+    interface: TypeReference
+    parameters: List[VariableDeclaration] = field(default_factory=list)
+    methods: List['FunctionDeclaration'] = field(default_factory=list)
+    uses: List[InterfaceUse] = field(default_factory=list)
 
 
 @dataclass
@@ -168,6 +189,8 @@ class FunctionDeclaration(Statement):
     raises: List[TypeReference] = field(default_factory=list)
     raises_inferred: bool = False
     self_parameter: VariableDeclaration | None = None
+    interface_name: str | None = None
+    synthetic: bool = False
 
 
 @dataclass
@@ -219,6 +242,7 @@ class Assignment(Statement):
 class FunctionCall(Statement, Expression):
     function_name: str
     parameters: List[Expression]
+    interface_name: str | None = None
 
 
 @dataclass

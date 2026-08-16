@@ -12,6 +12,8 @@ from typing import BinaryIO, TextIO
 from .ast_nodes import (
     For,
     FunctionDeclaration,
+    ImplementationDeclaration,
+    InterfaceDeclaration,
     If,
     ModuleDeclaration,
     SourceSpan,
@@ -222,6 +224,23 @@ def _collect_statement_entries(
         for method in statement.methods:
             entries.append(_function_entry(method, tokens, method_kind=True, owner_name=statement.name))
             _collect_function_scope(method, tokens, entries, owner_name=statement.name)
+        return
+
+    if isinstance(statement, InterfaceDeclaration):
+        entries.append(_entry(
+            statement.name, 11, statement, tokens,
+            f'interface {statement.name}', 'interface',
+        ))
+        for method in statement.methods:
+            entries.append(_function_entry(method, tokens, method_kind=True, owner_name=statement.name))
+        return
+
+    if isinstance(statement, ImplementationDeclaration):
+        for method in statement.methods:
+            entries.append(_function_entry(
+                method, tokens, method_kind=True, owner_name=statement.type_name
+            ))
+            _collect_function_scope(method, tokens, entries, owner_name=statement.type_name)
         return
 
     if isinstance(statement, ViewDeclaration):
@@ -1459,13 +1478,14 @@ def _completion_kind(symbol: SemanticSymbol) -> int:
         'catch': 6,
         'type': 7,
         'view': 8,
+        'interface': 8,
         'module': 9,
     }.get(symbol.kind, 1)
 
 
 def _semantic_symbol_type(symbol: SemanticSymbol) -> str:
     return {
-        'type': 'struct', 'view': 'type', 'function': 'function',
+        'type': 'struct', 'view': 'type', 'interface': 'type', 'function': 'function',
         'method': 'method', 'field': 'property', 'parameter': 'parameter',
         'catch': 'variable', 'global': 'variable', 'variable': 'variable',
         'module': 'namespace', 'alias': 'namespace',

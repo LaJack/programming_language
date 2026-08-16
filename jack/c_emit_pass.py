@@ -1368,6 +1368,13 @@ class CEmitPass:
             )
         if statement.initializer is None:
             return []
+        if symbol.type_ref.array_size is not None:
+            target = self._mangle(symbol.name)
+            source = self._emit_hir_expression(statement.initializer, env)
+            return self._with_source_directive(
+                [f'__builtin_memmove({target}, {source}, sizeof({target}));'],
+                statement,
+            )
         return self._with_source_directive([
             f'{self._mangle(symbol.name)} = '
             f'{self._emit_hir_expression_as_type(statement.initializer, symbol.type_ref, env)};'
@@ -1729,15 +1736,46 @@ class CEmitPass:
     ) -> list[str]:
         lines: list[str] = []
         for name in reversed(names):
-            type_decl = self._type_declaration_for(env[name])
-            method = self._method_declaration_for(type_decl, 'deinit')
+            lines.extend(self._emit_deinit_value(self._mangle(name), env[name]))
+        return lines
+
+    def _emit_deinit_value(
+        self, expression: str, type_ref: TypeReference
+    ) -> list[str]:
+        if type_ref.borrow is not None or type_ref.is_slice:
+            return []
+        if type_ref.array_size is not None:
+            element_type = copy.deepcopy(type_ref)
+            element_type.array_size = None
+            size = int(self._emit_array_size(type_ref.array_size))
+            lines: list[str] = []
+            for index in reversed(range(size)):
+                lines.extend(
+                    self._emit_deinit_value(f'{expression}[{index}]', element_type)
+                )
+            return lines
+        type_decl = self.type_declarations.get(self._type_name(type_ref))
+        if type_decl is None or type_decl.extern:
+            return []
+        lines: list[str] = []
+        method = next(
+            (candidate for candidate in type_decl.methods if candidate.name == 'deinit'),
+            None,
+        )
+        if method is not None:
             if self._function_raises(method):
                 raise CEmitFeatureNotImplemented(
                     'C emission for raising destructors is not implemented yet.'
                 )
             lines.append(
                 f'{self._method_function_name(type_decl.name, method.name)}'
-                f'(&{self._mangle(name)});'
+                f'(&{expression});'
+            )
+        for field in reversed(type_decl.fields):
+            lines.extend(
+                self._emit_deinit_value(
+                    self._field_access(expression, field.name), field.type_ref
+                )
             )
         return lines
 
@@ -2064,6 +2102,8 @@ class CEmitPass:
                 f'{self._field_access(target, "data")}, '
                 f'{self._field_access(target, "len")} }}'
             )
+        if target_type.borrow is not None:
+            return target
         if self._is_array_type(target_type):
             return target
         return f'&{target}'

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import sys
 from dataclasses import dataclass
 
@@ -351,17 +353,10 @@ class LLVMLoweringPass:
                 if not isinstance(declaration, HIRGlobalVariable) or declaration.symbol.extern:
                     continue
                 type_declaration = self.types.get(declaration.symbol.type_ref.name)
-                if type_declaration is None:
-                    continue
-                deinit = next(
-                    (method for method in type_declaration.methods if method.name == 'deinit'),
-                    None,
+                self._emit_global_deinit_value(
+                    self._global_name(declaration.symbol.name),
+                    declaration.symbol.type_ref,
                 )
-                if deinit is not None:
-                    builder.emit(
-                        f'call void @{quoted(f"{type_declaration.name}.deinit")}'
-                        f'(ptr {self._global_name(declaration.symbol.name)})'
-                    )
         if not builder.terminated:
             builder.terminate('ret i32 0')
         function = LLVMFunction(
@@ -373,6 +368,43 @@ class LLVMLoweringPass:
         )
         self.builder = None
         return function
+
+    def _emit_global_deinit_value(
+        self, pointer: str, type_ref: TypeReference
+    ) -> None:
+        if type_ref.borrow is not None or type_ref.is_slice:
+            return
+        if type_ref.array_size is not None:
+            if type(type_ref.array_size) is not int:
+                raise LLVMLoweringError('Owned array cleanup requires a normalized extent.')
+            element_type = copy.deepcopy(type_ref)
+            element_type.array_size = None
+            for index in reversed(range(type_ref.array_size)):
+                item = self._b.temp('global.item.ptr')
+                self._b.emit(
+                    f'{item} = getelementptr inbounds {self._type(type_ref)}, '
+                    f'ptr {pointer}, i32 0, i64 {index}'
+                )
+                self._emit_global_deinit_value(item, element_type)
+            return
+        declaration = self.types.get(type_ref.name)
+        if declaration is None or declaration.extern:
+            return
+        deinit = next(
+            (method for method in declaration.methods if method.name == 'deinit'),
+            None,
+        )
+        if deinit is not None:
+            self._b.emit(
+                f'call void @{quoted(f"{declaration.name}.deinit")}(ptr {pointer})'
+            )
+        for index, field in reversed(list(enumerate(declaration.fields))):
+            field_pointer = self._b.temp('global.field.ptr')
+            self._b.emit(
+                f'{field_pointer} = getelementptr inbounds '
+                f'{self._named_type(declaration.name)}, ptr {pointer}, i32 0, i32 {index}'
+            )
+            self._emit_global_deinit_value(field_pointer, field.type_ref)
 
     def _statements(self, statements: list[HIRStatement], env: dict[str, tuple[str, TypeReference]]) -> None:
         for statement in statements:
@@ -606,6 +638,24 @@ class LLVMLoweringPass:
                 return LLVMValue(read_type, loaded, expression.read_type)
             return LLVMValue(type_name, value, type_ref)
         if isinstance(expression, HIRFieldAccessExpression):
+            if isinstance(expression.target, HIRCallExpression):
+                target = self._expression(expression.target, env)
+                owner = self.types.get(expression.owner_type_name)
+                if owner is None:
+                    raise LLVMLoweringError(
+                        f'Unknown field owner {expression.owner_type_name}.', expression.span
+                    )
+                index = next(
+                    i for i, field in enumerate(owner.fields)
+                    if field.name == expression.field_name
+                )
+                type_ref = owner.fields[index].type_ref
+                type_name = self._type(type_ref)
+                value = self._b.temp('field')
+                self._b.emit(
+                    f'{value} = extractvalue {target.type_name} {target.operand}, {index}'
+                )
+                return LLVMValue(type_name, value, type_ref)
             pointer, type_ref = self._lvalue(expression, env)
             type_name = self._type(type_ref)
             value = self._b.temp('field')
@@ -796,6 +846,8 @@ class LLVMLoweringPass:
             return self._slice(expression.expr, env, borrow_mode_can_write(expression.mode))
         if expression.type_ref.name in self.views:
             return self._view_borrow(expression, env)
+        if expression.expr.type_ref.borrow is not None:
+            return self._borrow_argument(expression.expr, env)
         if self._is_slice(expression.expr.type_ref):
             return self._expression(expression.expr, env)
         pointer, _ = self._lvalue(expression.expr, env)

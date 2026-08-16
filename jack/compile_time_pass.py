@@ -26,6 +26,8 @@ try:
         FunctionDeclaration,
         If,
         IfBranch,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
@@ -74,6 +76,8 @@ except ImportError:
         FunctionDeclaration,
         If,
         IfBranch,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
@@ -305,14 +309,19 @@ class CompileTimePass:
         self.executor = CompileTimeExecutor(self)
         self.functions: dict[str, FunctionDeclaration] = {}
         self.types: dict[str, TypeDeclaration] = {}
+        self.interfaces: dict[str, InterfaceDeclaration] = {}
+        self.implementations: list[ImplementationDeclaration] = []
         self.variant_names: dict[tuple[str, tuple[tuple[str, object, str], ...]], str] = {}
         self.type_variant_names: dict[tuple[str, tuple[tuple[str, object, str], ...]], str] = {}
         self.synthetic_counter = 0
         self.generated_variants: list[FunctionDeclaration] = []
         self.generated_types: list[TypeDeclaration] = []
+        self.active_interface_dispatch: dict[str, set[str]] = {}
 
     def apply(self, ast: list[Statement]) -> list[Statement]:
         self._register_declarations(ast)
+        self._validate_interface_contracts()
+        self._validate_generic_copy_contracts(ast)
         lowered = self._apply_statements(ast, CompileTimeScope())
         lowered_types = [node for node in lowered if type(node) is TypeDeclaration]
         lowered_rest = [node for node in lowered if type(node) is not TypeDeclaration]
@@ -326,11 +335,241 @@ class CompileTimePass:
         return runtime_ast
 
     def _register_declarations(self, ast: Iterable[Statement]) -> None:
-        for node in ast:
+        nodes = list(ast)
+        for node in nodes:
             if type(node) is FunctionDeclaration:
                 self.functions[node.name] = node
             elif type(node) is TypeDeclaration:
                 self.types[node.name] = node
+            elif type(node) is InterfaceDeclaration:
+                self.interfaces[node.name] = node
+            elif type(node) is ImplementationDeclaration:
+                self.implementations.append(node)
+        for implementation in self.implementations:
+            declaration = self.types.get(implementation.type_name)
+            if declaration is None or declaration.parameters or implementation.parameters:
+                continue
+            for method in implementation.methods:
+                concrete = copy.deepcopy(method)
+                concrete.interface_name = implementation.interface.name
+                concrete.source_name = method.source_name or method.name
+                concrete.name = f'{implementation.interface.name}${method.name}'
+                self._mark_implementation_calls(
+                    concrete, implementation.interface.name
+                )
+                self._replace_self_in_function(concrete, declaration.name)
+                declaration.methods.append(concrete)
+
+    def _replace_self_in_function(
+        self, declaration: FunctionDeclaration, self_name: str
+    ) -> None:
+        refs = [declaration.return_type, *declaration.raises]
+        if declaration.self_parameter is not None:
+            refs.append(declaration.self_parameter.type)
+        refs.extend(parameter.type for parameter in declaration.parameters)
+        for type_ref in refs:
+            self._replace_self_type(type_ref, self_name)
+
+    def _replace_self_type(self, type_ref: TypeReference, self_name: str) -> None:
+        if type_ref.name in {'Self', 'self'}:
+            type_ref.name = self_name
+        for argument in type_ref.arguments:
+            if type(argument) is TypeReference:
+                self._replace_self_type(argument, self_name)
+
+    def _mark_implementation_calls(
+        self, declaration: FunctionDeclaration, interface_name: str
+    ) -> None:
+        interface = self.interfaces.get(interface_name)
+        method_names = (
+            {method.name for method in interface.methods}
+            if interface is not None else {'init'} if interface_name == 'Copyable' else set()
+        )
+        seen: set[int] = set()
+
+        def visit(value: object) -> None:
+            if value is None or isinstance(value, (str, int, float, bool, SourceSpan)):
+                return
+            identity = id(value)
+            if identity in seen:
+                return
+            seen.add(identity)
+            if type(value) is FunctionCall and '.' in value.function_name:
+                if value.function_name.rsplit('.', 1)[1] in method_names:
+                    value.interface_name = interface_name
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    visit(item)
+            elif hasattr(value, '__dict__'):
+                for item in vars(value).values():
+                    visit(item)
+
+        visit(declaration.body)
+
+    def _validate_generic_copy_contracts(self, ast: Iterable[Statement]) -> None:
+        for node in ast:
+            functions: list[
+                tuple[FunctionDeclaration, dict[str, VariableDeclaration]]
+            ] = []
+            if type(node) is FunctionDeclaration:
+                functions.append((node, {}))
+            elif type(node) is TypeDeclaration:
+                inherited = {
+                    parameter.name: parameter
+                    for parameter in node.parameters
+                    if parameter.comptime and parameter.type.name == 'type'
+                }
+                functions.extend((method, inherited) for method in node.methods)
+            elif type(node) is ImplementationDeclaration:
+                inherited = {
+                    parameter.name: parameter
+                    for parameter in node.parameters
+                    if parameter.comptime and parameter.type.name == 'type'
+                }
+                functions.extend((method, inherited) for method in node.methods)
+            for declaration, inherited in functions:
+                type_parameters = {
+                    **inherited,
+                    **{
+                    parameter.name: parameter
+                    for parameter in declaration.parameters
+                    if parameter.comptime and parameter.type.name == 'type'
+                    },
+                }
+                for parameter in declaration.parameters:
+                    generic = type_parameters.get(parameter.type.name)
+                    if (
+                        generic is not None
+                        and not parameter.comptime
+                        and parameter.type.borrow is None
+                        and parameter.passing_mode == 'copy'
+                        and not self._parameter_has_constraint(generic, 'Copyable')
+                    ):
+                        raise CompileTimeError(
+                            f'Generic parameter "{parameter.name}" copies type '
+                            f'"{generic.name}"; declare "{generic.name}: Copyable".',
+                            parameter.span,
+                        )
+
+    def _parameter_has_constraint(
+        self, parameter: VariableDeclaration, interface_name: str
+    ) -> bool:
+        return any(
+            constraint.name == interface_name
+            or constraint.name.rsplit('$', 1)[-1] == interface_name
+            for constraint in parameter.constraints
+        )
+
+    def _validate_interface_contracts(self) -> None:
+        seen: set[tuple[str, str]] = set()
+        for implementation in self.implementations:
+            type_decl = self.types.get(implementation.type_name)
+            interface = self.interfaces.get(implementation.interface.name)
+            if type_decl is None:
+                raise CompileTimeError(
+                    f'Unknown implementation type "{implementation.type_name}".',
+                    implementation.span,
+                )
+            if interface is None and implementation.interface.name != 'Copyable':
+                raise CompileTimeError(
+                    f'Unknown interface "{implementation.interface.name}".',
+                    implementation.span,
+                )
+            key = (implementation.type_name, implementation.interface.name)
+            if key in seen:
+                raise CompileTimeError(
+                    f'Duplicate implementation of "{implementation.interface.name}" '
+                    f'for "{implementation.type_name}".',
+                    implementation.span,
+                )
+            seen.add(key)
+            interface_module = interface.module_name if interface is not None else None
+            if implementation.module_name not in {type_decl.module_name, interface_module}:
+                raise CompileTimeError(
+                    'An implementation must be declared in the module owning its type or interface.',
+                    implementation.span,
+                )
+            requirements = (
+                {method.name: method for method in interface.methods}
+                if interface is not None else {'init': self._copyable_requirement()}
+            )
+            entries: dict[str, FunctionDeclaration | None] = {}
+            for use in implementation.uses:
+                if use.name in entries:
+                    raise CompileTimeError(f'Duplicate implementation entry "{use.name}".', use.span)
+                entries[use.name] = None
+            for method in implementation.methods:
+                if method.name in entries:
+                    raise CompileTimeError(f'Duplicate implementation entry "{method.name}".', method.span)
+                entries[method.name] = method
+            unknown = sorted(set(entries) - set(requirements))
+            missing = sorted(set(requirements) - set(entries))
+            if unknown:
+                raise CompileTimeError(
+                    f'Interface "{implementation.interface.name}" has no method "{unknown[0]}".',
+                    implementation.span,
+                )
+            if missing:
+                raise CompileTimeError(
+                    f'Implementation of "{implementation.interface.name}" is missing method "{missing[0]}".',
+                    implementation.span,
+                )
+            inherent = {method.name: method for method in type_decl.methods}
+            for name, supplied in entries.items():
+                candidate = supplied or inherent.get(name)
+                if candidate is None:
+                    raise CompileTimeError(
+                        f'No visible inherent method "{name}" exists for use.', implementation.span
+                    )
+                if self._interface_signature_key(requirements[name]) != self._interface_signature_key(candidate):
+                    raise CompileTimeError(
+                        f'Method "{name}" does not match interface '
+                        f'"{implementation.interface.name}".', candidate.span,
+                    )
+
+    def _copyable_requirement(self) -> FunctionDeclaration:
+        return FunctionDeclaration(
+            'init', [VariableDeclaration('other', TypeReference('Self', borrow='in'))],
+            [], TypeReference('void'),
+            self_parameter=VariableDeclaration('self', TypeReference('Self', borrow='out')),
+        )
+
+    def _interface_signature_key(self, method: FunctionDeclaration) -> tuple[object, ...]:
+        parameters = [method.self_parameter, *method.parameters]
+        return (
+            self._constraint_type_key(method.return_type),
+            tuple(
+                (
+                    parameter.comptime,
+                    parameter.passing_mode,
+                    self._constraint_type_key(parameter.type),
+                )
+                for parameter in parameters if parameter is not None
+            ),
+            tuple(self._constraint_type_key(error) for error in method.raises),
+            method.raises_inferred,
+        )
+
+    def _constraint_type_key(self, type_ref: TypeReference) -> str:
+        name = 'Self' if type_ref.name in {'self', 'Self'} else type_ref.name
+        if type_ref.arguments:
+            name += '(' + ','.join(
+                self._constraint_type_key(argument)
+                if type(argument) is TypeReference else repr(argument)
+                for argument in type_ref.arguments
+            ) + ')'
+        if type_ref.array_size is not None:
+            size = (
+                type_ref.array_size.value
+                if type(type_ref.array_size) is LiteralExpression
+                else type_ref.array_size
+            )
+            name += f'[{size}]'
+        elif type_ref.is_slice:
+            name += '[]'
+        if type_ref.borrow is not None:
+            name = f'&{type_ref.borrow} {name}'
+        return name
 
     def _apply_statements(
         self, ast: Iterable[Statement], scope: CompileTimeScope
@@ -370,6 +609,10 @@ class CompileTimePass:
     def _apply_statement(self, node: Statement, scope: CompileTimeScope) -> list[Statement]:
         if type(node) in {ModuleDeclaration, ImportDeclaration}:
             return []
+        if type(node) is InterfaceDeclaration:
+            return [copy.deepcopy(node)]
+        if type(node) is ImplementationDeclaration:
+            return [] if node.parameters else [copy.deepcopy(node)]
         if type(node) is ViewDeclaration:
             return [copy.deepcopy(node)]
         if type(node) is VariableDeclaration:
@@ -953,7 +1196,11 @@ class CompileTimePass:
             self._reject_runtime_comptime_struct_literals(arguments, call.function_name)
             for argument in arguments:
                 self._reject_runtime_formatted_string_expression(argument, f'call to "{call.function_name}"')
-            return argument_preludes, FunctionCall(call.function_name, arguments)
+            return argument_preludes, FunctionCall(
+                call.function_name,
+                arguments,
+                interface_name=self._interface_for_call(call.function_name),
+            )
 
         expected = len(declaration.parameters)
         actual = len(arguments)
@@ -970,6 +1217,7 @@ class CompileTimePass:
         for parameter, argument in zip(declaration.parameters, arguments):
             if parameter.comptime:
                 value = self._eval_comptime_argument(argument, parameter.type, body_scope)
+                self._validate_constraints(parameter, value, body_scope)
                 comptime_key.append((parameter.name, self._key_value(value.value), value.type))
                 body_scope.declare(parameter.name, value)
             else:
@@ -993,7 +1241,12 @@ class CompileTimePass:
             variant_name = self._variant_name(call.function_name, key[1])
             self.variant_names[key] = variant_name
             return_type = self._apply_type_reference(declaration.return_type, body_scope)
-            body = self._apply_statements(declaration.body, body_scope)
+            previous_dispatch = self.active_interface_dispatch
+            self.active_interface_dispatch = self._generic_interface_dispatch(declaration)
+            try:
+                body = self._apply_statements(declaration.body, body_scope)
+            finally:
+                self.active_interface_dispatch = previous_dispatch
             self._validate_returns(call.function_name, return_type, body)
             variant = FunctionDeclaration(
                 variant_name,
@@ -1013,6 +1266,41 @@ class CompileTimePass:
             self.functions[variant_name] = variant
 
         return argument_preludes, FunctionCall(variant_name, runtime_arguments)
+
+    def _generic_interface_dispatch(
+        self, declaration: FunctionDeclaration
+    ) -> dict[str, set[str]]:
+        constraints = {
+            parameter.name: {constraint.name for constraint in parameter.constraints}
+            for parameter in declaration.parameters
+            if parameter.comptime and parameter.type.name == 'type'
+        }
+        return {
+            parameter.name: set(constraints[parameter.type.name])
+            for parameter in declaration.parameters
+            if not parameter.comptime and parameter.type.name in constraints
+        }
+
+    def _interface_for_call(self, function_name: str) -> str | None:
+        if '.' not in function_name:
+            return None
+        receiver_name, method_name = function_name.rsplit('.', 1)
+        interfaces = self.active_interface_dispatch.get(receiver_name.split('.', 1)[0], set())
+        matches = []
+        for interface_name in sorted(interfaces):
+            declaration = self.interfaces.get(interface_name)
+            if declaration is not None and any(
+                method.name == method_name for method in declaration.methods
+            ):
+                matches.append(interface_name)
+            elif interface_name == 'Copyable' and method_name == 'init':
+                matches.append(interface_name)
+        if len(matches) > 1:
+            raise CompileTimeError(
+                f'Ambiguous constrained method "{method_name}" from interfaces '
+                + ', '.join(f'"{name}"' for name in matches) + '.'
+            )
+        return matches[0] if matches else None
 
     def _apply_comptime_receiver_method_call(
         self, call: FunctionCall, arguments: list[Expression], scope: CompileTimeScope
@@ -1164,6 +1452,7 @@ class CompileTimePass:
             if not parameter.comptime:
                 raise CompileTimeFeatureNotImplemented('Runtime type parameters are not implemented yet.')
             value = self._eval_comptime_argument(argument, parameter.type, field_scope)
+            self._validate_constraints(parameter, value, field_scope)
             comptime_key.append((parameter.name, self._key_value(value.value), value.type))
             field_scope.declare(parameter.name, value)
 
@@ -1183,6 +1472,24 @@ class CompileTimePass:
                 )
                 for method in declaration.methods
             ]
+            for implementation in self.implementations:
+                if implementation.type_name != declaration.name:
+                    continue
+                for method in implementation.methods:
+                    concrete = copy.deepcopy(method)
+                    concrete.interface_name = implementation.interface.name
+                    concrete.source_name = method.source_name or method.name
+                    concrete.name = f'{implementation.interface.name}${method.name}'
+                    self._mark_implementation_calls(
+                        concrete, implementation.interface.name
+                    )
+                    self._replace_self_in_function(concrete, variant_name)
+                    methods.append(self._runtime_method_declaration(
+                        concrete,
+                        field_scope,
+                        owner_type=TypeReference(variant_name),
+                        owner_source_name=declaration.name,
+                    ))
             generated_type = TypeDeclaration(
                 variant_name,
                 fields,
@@ -1198,6 +1505,58 @@ class CompileTimePass:
             self.types[variant_name] = generated_type
 
         return TypeReference(variant_name, span=type_ref.span)
+
+    def _validate_constraints(
+        self,
+        parameter: VariableDeclaration,
+        value: LiteralExpression,
+        scope: CompileTimeScope,
+    ) -> None:
+        if not parameter.constraints:
+            return
+        if value.type != 'type' or type(value.value) is not TypeReference:
+            raise CompileTimeError(
+                f'Constraints on "{parameter.name}" require a type argument.'
+            )
+        concrete = self._apply_type_reference(value.value, scope)
+        for constraint in parameter.constraints:
+            constraint_ref = self._apply_type_reference(constraint, scope)
+            if not self._type_satisfies_constraint(concrete, constraint_ref.name):
+                raise CompileTimeError(
+                    f'Type "{self._type_name(concrete)}" does not implement '
+                    f'"{constraint_ref.name}" required by "{parameter.name}".'
+                )
+
+    def _type_satisfies_constraint(self, type_ref: TypeReference, interface: str) -> bool:
+        name = self._type_name(type_ref)
+        declaration = self.types.get(name)
+        source_name = (
+            (declaration.source_name or self._generic_source_name(name))
+            if declaration is not None else name
+        )
+        if any(
+            implementation.interface.name == interface
+            and implementation.type_name in {name, source_name}
+            for implementation in self.implementations
+        ):
+            return True
+        if interface != 'Copyable':
+            return False
+        if type_ref.borrow == 'in':
+            return True
+        if type_ref.borrow in {'out', 'inout'} or type_ref.is_slice:
+            return False
+        if is_builtin_type(name) or name in {'str', 'c_char', 'c_void', 'type'}:
+            return True
+        if declaration is None or declaration.extern:
+            return False
+        if any(method.name == 'deinit' for method in declaration.methods):
+            return False
+        return all(self._type_satisfies_constraint(field.type, 'Copyable')
+                   for field in declaration.fields)
+
+    def _generic_source_name(self, concrete_name: str) -> str:
+        return concrete_name.split('$comptime$', 1)[0]
 
     def _apply_array_size(
         self, expression: Expression | None, scope: CompileTimeScope
@@ -2388,7 +2747,14 @@ class CompileTimePass:
             if type_decl is None:
                 return
             method = next(
-                (method for method in type_decl.methods if method.name == method_name),
+                (
+                    method for method in type_decl.methods
+                    if method.name == method_name
+                    or (
+                        call.interface_name == method.interface_name
+                        and method.source_name == method_name
+                    )
+                ),
                 None,
             )
             if method is not None:
@@ -2501,6 +2867,13 @@ class CompileTimePass:
             self_parameter=self._runtime_method_self_parameter(
                 declaration.self_parameter, scope, owner_type, owner_source_name
             ),
+            public=declaration.public,
+            module_name=declaration.module_name,
+            source_name=declaration.source_name,
+            imports=list(declaration.imports),
+            qualified_imports=list(declaration.qualified_imports),
+            interface_name=declaration.interface_name,
+            synthetic=declaration.synthetic,
             span=declaration.span,
         )
 

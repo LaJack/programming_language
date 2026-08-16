@@ -29,6 +29,8 @@ try:
         FunctionCall,
         FunctionDeclaration,
         If,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
         ImportBinding,
         IndexExpression,
         LiteralExpression,
@@ -81,6 +83,8 @@ except ImportError:
         FunctionCall,
         FunctionDeclaration,
         If,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
         ImportBinding,
         IndexExpression,
         LiteralExpression,
@@ -193,6 +197,8 @@ class SemanticPass:
         self.types: dict[str, TypeDeclaration] = {}
         self.functions: dict[str, FunctionDeclaration] = {}
         self.views: dict[str, ViewDeclaration] = {}
+        self.interfaces: dict[str, InterfaceDeclaration] = {}
+        self.implementations: dict[tuple[str, str], ImplementationDeclaration] = {}
         self.global_scope = SemanticScope()
         self.current_module_name: str | None = None
         self.current_imports: list[ImportBinding] = []
@@ -210,6 +216,8 @@ class SemanticPass:
     def validate(self, ast: list[Statement]) -> None:
         runtime_ast = [node for node in ast if type(node) not in {ModuleDeclaration, ImportDeclaration}]
         self._register_top_level_names(runtime_ast)
+        self._validate_interface_declarations(runtime_ast)
+        self._validate_implementation_declarations(runtime_ast)
         self._validate_type_declarations(runtime_ast)
         self._validate_view_declarations(runtime_ast)
         self._validate_top_level_statements(runtime_ast)
@@ -249,6 +257,18 @@ class SemanticPass:
                         TypeReference(node.name),
                         module_name=node.module_name,
                         public=node.public,
+                        source_name=node.source_name or node.name,
+                    ),
+                )
+            elif type(node) is InterfaceDeclaration:
+                if node.name in self.interfaces or self.global_scope.get(node.name) is not None:
+                    raise SemanticError(f'Interface "{node.name}" is already declared.', node.span)
+                self.interfaces[node.name] = node
+                self.global_scope.declare(
+                    node.name,
+                    SymbolInfo(
+                        'interface', TypeReference(node.name),
+                        module_name=node.module_name, public=node.public,
                         source_name=node.source_name or node.name,
                     ),
                 )
@@ -330,6 +350,163 @@ class SemanticPass:
                 self.current_imports = previous_imports
                 self.current_qualified_imports = previous_qualified_imports
 
+    def _validate_interface_declarations(self, ast: list[Statement]) -> None:
+        for declaration in ast:
+            if type(declaration) is not InterfaceDeclaration:
+                continue
+            seen: set[str] = set()
+            for method in declaration.methods:
+                if method.name in seen:
+                    raise SemanticError(
+                        f'Interface "{declaration.name}" has duplicate method "{method.name}".',
+                        method.span,
+                    )
+                seen.add(method.name)
+                if method.body:
+                    raise SemanticError('Interface methods cannot have bodies.', method.span)
+                if method.self_parameter is None:
+                    raise SemanticError(
+                        f'Interface method "{declaration.name}.{method.name}" must declare self.',
+                        method.span,
+                    )
+                self_parameter = method.self_parameter
+                if (
+                    self_parameter.type.name not in {'Self', 'self'}
+                    or self_parameter.type.borrow is None
+                ):
+                    raise SemanticError(
+                        f'Interface method "{declaration.name}.{method.name}" self '
+                        'parameter must explicitly borrow Self.',
+                        self_parameter.span,
+                    )
+                for parameter in method.parameters:
+                    self._validate_interface_type_reference(parameter.type)
+                self._validate_interface_type_reference(method.return_type, allow_void=True)
+                for error in method.raises:
+                    self._validate_interface_type_reference(error)
+
+    def _validate_interface_type_reference(
+        self, type_ref: TypeReference, allow_void: bool = False
+    ) -> None:
+        if type_ref.name not in {'Self', 'self'}:
+            self._validate_type_reference(type_ref, allow_void=allow_void)
+        for argument in type_ref.arguments:
+            if type(argument) is TypeReference:
+                self._validate_interface_type_reference(argument)
+
+    def _validate_implementation_declarations(self, ast: list[Statement]) -> None:
+        for implementation in ast:
+            if type(implementation) is not ImplementationDeclaration:
+                continue
+            if implementation.parameters:
+                raise SemanticError(
+                    f'Generic implementation for "{implementation.type_name}" reached semantic validation.',
+                    implementation.span,
+                )
+            type_decl = self.types.get(implementation.type_name)
+            interface = self.interfaces.get(implementation.interface.name)
+            if type_decl is None:
+                raise SemanticError(
+                    f'Unknown implementation type "{implementation.type_name}".', implementation.span
+                )
+            if interface is None and implementation.interface.name != 'Copyable':
+                raise SemanticError(
+                    f'Unknown interface "{implementation.interface.name}".', implementation.span
+                )
+            interface_module = interface.module_name if interface is not None else None
+            if implementation.module_name not in {type_decl.module_name, interface_module}:
+                raise SemanticError(
+                    'An implementation must be declared in the module owning its type or interface.',
+                    implementation.span,
+                )
+            key = (implementation.type_name, implementation.interface.name)
+            if key in self.implementations:
+                raise SemanticError(
+                    f'Duplicate implementation of "{implementation.interface.name}" for "{implementation.type_name}".',
+                    implementation.span,
+                )
+            self.implementations[key] = implementation
+            requirements = self._interface_requirements(interface, implementation.interface.name)
+            entries: dict[str, FunctionDeclaration | None] = {}
+            for use in implementation.uses:
+                if use.name in entries:
+                    raise SemanticError(f'Duplicate implementation entry "{use.name}".', use.span)
+                entries[use.name] = None
+            for method in implementation.methods:
+                if method.name in entries:
+                    raise SemanticError(f'Duplicate implementation entry "{method.name}".', method.span)
+                entries[method.name] = method
+            unknown = sorted(set(entries) - set(requirements))
+            missing = sorted(set(requirements) - set(entries))
+            if unknown:
+                raise SemanticError(
+                    f'Interface "{implementation.interface.name}" has no method "{unknown[0]}".',
+                    implementation.span,
+                )
+            if missing:
+                raise SemanticError(
+                    f'Implementation of "{implementation.interface.name}" is missing method "{missing[0]}".',
+                    implementation.span,
+                )
+            inherent = {method.name: method for method in type_decl.methods}
+            for name, supplied in entries.items():
+                candidate = inherent.get(name) if supplied is None else supplied
+                if candidate is None:
+                    raise SemanticError(f'No visible inherent method "{name}" exists for use.', implementation.span)
+                if not self._interface_signature_matches(requirements[name], candidate, type_decl.name):
+                    raise SemanticError(
+                        f'Method "{name}" does not match interface "{implementation.interface.name}".',
+                        candidate.span,
+                    )
+
+    def _interface_requirements(
+        self, interface: InterfaceDeclaration | None, name: str
+    ) -> dict[str, FunctionDeclaration]:
+        if interface is not None:
+            return {method.name: method for method in interface.methods}
+        if name == 'Copyable':
+            return {'init': FunctionDeclaration(
+                'init', [VariableDeclaration('other', TypeReference('Self', borrow='in'))],
+                [], TypeReference('void'),
+                self_parameter=VariableDeclaration('self', TypeReference('Self', borrow='out')),
+            )}
+        return {}
+
+    def _interface_signature_matches(
+        self, required: FunctionDeclaration, actual: FunctionDeclaration, self_name: str
+    ) -> bool:
+        required_parameters = [required.self_parameter, *required.parameters]
+        actual_parameters = [actual.self_parameter, *actual.parameters]
+        if any(parameter is None for parameter in required_parameters + actual_parameters):
+            return False
+        if len(required_parameters) != len(actual_parameters):
+            return False
+        if required.comptime != actual.comptime or required.raises_inferred != actual.raises_inferred:
+            return False
+        if not self._interface_type_matches(required.return_type, actual.return_type, self_name):
+            return False
+        if len(required.raises) != len(actual.raises):
+            return False
+        if any(not self._interface_type_matches(left, right, self_name)
+               for left, right in zip(required.raises, actual.raises)):
+            return False
+        for left, right in zip(required_parameters, actual_parameters):
+            assert left is not None and right is not None
+            if (left.comptime, left.passing_mode) != (right.comptime, right.passing_mode):
+                return False
+            if not self._interface_type_matches(left.type, right.type, self_name):
+                return False
+        return True
+
+    def _interface_type_matches(
+        self, required: TypeReference, actual: TypeReference, self_name: str
+    ) -> bool:
+        left = copy.deepcopy(required)
+        right = copy.deepcopy(actual)
+        self._substitute_self_type(left, self_name)
+        self._substitute_self_type(right, self_name)
+        return self._type_name(left) == self._type_name(right)
+
     def _validate_view_field_type(self, view_name: str, field: ViewField) -> None:
         type_ref = field.type
         if type_ref.arguments:
@@ -357,7 +534,10 @@ class SemanticPass:
 
     def _validate_top_level_statements(self, ast: list[Statement]) -> None:
         for node in ast:
-            if type(node) in {TypeDeclaration, FunctionDeclaration, ViewDeclaration}:
+            if type(node) in {
+                TypeDeclaration, FunctionDeclaration, ViewDeclaration,
+                InterfaceDeclaration, ImplementationDeclaration,
+            }:
                 continue
             previous_module_name = self.current_module_name
             previous_imports = self.current_imports
@@ -381,6 +561,29 @@ class SemanticPass:
             elif type(node) is TypeDeclaration:
                 for method in node.methods:
                     self._ensure_method_body_validated(node, method)
+            elif type(node) is ImplementationDeclaration:
+                type_decl = self.types.get(node.type_name)
+                if type_decl is not None:
+                    for method in node.methods:
+                        self._substitute_interface_self(method, type_decl.name)
+                        self._ensure_method_body_validated(type_decl, method)
+
+    def _substitute_interface_self(
+        self, declaration: FunctionDeclaration, self_name: str
+    ) -> None:
+        references = [declaration.return_type, *declaration.raises]
+        if declaration.self_parameter is not None:
+            references.append(declaration.self_parameter.type)
+        references.extend(parameter.type for parameter in declaration.parameters)
+        for type_ref in references:
+            self._substitute_self_type(type_ref, self_name)
+
+    def _substitute_self_type(self, type_ref: TypeReference, self_name: str) -> None:
+        if type_ref.name in {'Self', 'self'}:
+            type_ref.name = self_name
+        for argument in type_ref.arguments:
+            if type(argument) is TypeReference:
+                self._substitute_self_type(argument, self_name)
 
     def _ensure_function_body_validated(
         self, declaration: FunctionDeclaration, parent_scope: SemanticScope
@@ -1283,7 +1486,7 @@ class SemanticPass:
         receiver_name, method_name = call.function_name.rsplit('.', 1)
         receiver_type = self._resolve_name_type(receiver_name, scope)
         type_decl = self._type_declaration_for(receiver_type)
-        method = next((method for method in type_decl.methods if method.name == method_name), None)
+        method = self._visible_method_for_call(type_decl, method_name, call.interface_name)
         if method is None:
             raise SemanticError(f'Type "{type_decl.name}" has no method "{method_name}".')
         self_parameter = self._method_self_parameter(type_decl, method)
@@ -1301,6 +1504,38 @@ class SemanticPass:
         )
         self._validate_call_raises(f'{type_decl.name}.{method_name}', method.raises)
         return method.return_type
+
+    def _visible_method_for_call(
+        self,
+        type_decl: TypeDeclaration,
+        method_name: str,
+        interface_name: str | None,
+    ) -> FunctionDeclaration | None:
+        candidates = [
+            method for method in type_decl.methods
+            if method.name == method_name
+            or (
+                interface_name == method.interface_name
+                and method.source_name == method_name
+            )
+        ]
+        if '$' in method_name:
+            return candidates[0] if candidates else None
+        if interface_name is None:
+            return next(
+                (method for method in candidates if method.interface_name is None),
+                None,
+            )
+        return next(
+            (
+                method for method in candidates
+                if method.interface_name == interface_name
+            ),
+            next(
+                (method for method in candidates if method.interface_name is None),
+                None,
+            ),
+        )
 
     def _validate_call_arguments(
         self,
@@ -1551,7 +1786,9 @@ class SemanticPass:
             receiver_name, method_name = call.function_name.rsplit('.', 1)
             receiver_type = self._resolve_name_type(receiver_name, scope)
             type_decl = self._type_declaration_for(receiver_type)
-            method = next((method for method in type_decl.methods if method.name == method_name), None)
+            method = self._visible_method_for_call(
+                type_decl, method_name, call.interface_name
+            )
             if method is None:
                 raise SemanticError(f'Type "{type_decl.name}" has no method "{method_name}".')
             return method, method.parameters, receiver_name, type_decl
@@ -1974,6 +2211,8 @@ class SemanticPass:
             return True
         declaration = self.types.get(name)
         if declaration is None:
+            return True
+        if (name, 'Copyable') in self.implementations:
             return True
         if declaration.extern or any(method.name == 'deinit' for method in declaration.methods):
             return False

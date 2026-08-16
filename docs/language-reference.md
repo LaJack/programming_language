@@ -214,11 +214,13 @@ consume(owned_file);
 update(other_file);
 ```
 
-Plain parameters are rejected when their specialized type is not structurally
-copyable. Primitives and `&in` borrows are copyable; structs and arrays are
-copyable only when all stored values are copyable. A struct with `deinit`, an
-`&out` or `&inout` borrow, a slice, or an opaque extern value is not copyable.
-Specialization may reject a copy contract, but never changes it into a move.
+Plain parameters are rejected when their type does not implement `Copyable`.
+The compiler synthesizes `Copyable` for primitives, `&in` borrows, and
+structs or arrays whose stored values are copyable. It is not synthesized for
+slices, mutable borrows, opaque extern values, or structs with `deinit`.
+Resource structs can provide an explicit deep-copy implementation. Generic
+copy contracts must state `T: Copyable`; specialization never changes a copy
+contract into a move.
 
 Use `move` when transferring a whole local or owned parameter outside a call:
 
@@ -329,6 +331,50 @@ i32 add_offset(comptime i32 offset, i32 value) {
 
 i32 y = add_offset(3, 10);
 ```
+
+## Interfaces And Constraints
+
+Interfaces are compile-time contracts with an implicit implementing type named
+`Self`. They do not create runtime interface values or use dynamic dispatch:
+
+```jack
+pub interface Serializable {
+    usize size(&in self);
+    void write(&in self, &out u8[] destination);
+}
+```
+
+Implementations live outside struct declarations. A block may define an
+interface-scoped method or forward an exactly matching inherent method with
+`use`:
+
+```jack
+Message implements Serializable {
+    use size;
+
+    void write(&in self, &out u8[] destination) {
+        // implementation
+    }
+}
+```
+
+An implementation must be declared by the module owning either the type or the
+interface. Every requirement must appear exactly once, and signatures must
+match after substituting `Self`, including ownership modes and `raises`.
+
+Type parameters list all required interfaces inline:
+
+```jack
+void save(comptime type T: Copyable + Serializable, &in T value) {
+    value.write(destination);
+}
+```
+
+`Copyable` is compiler-known and has the contract
+`init(&out self, &in Self other)`. An explicit implementation overrides the
+synthesized structural copy and is used by initialization, assignment, struct
+field copying, and plain parameter passing. Moves and returns remain ownership
+transfers and do not call `Copyable.init`.
 
 Current generic support has no constraints or interfaces. Generic code is
 validated after specialization.
@@ -505,7 +551,8 @@ Built-in functions and forms include:
 The current Python compiler is a bootstrap implementation. Important
 limitations include:
 
-- no generic constraints, interfaces, or traits yet;
+- no interface inheritance, associated types, default methods, interface
+  objects, or dynamic dispatch;
 - no heap allocator model beyond experiments in `std.collections.vector`;
 - no user-facing lifetime syntax;
 - partial moves and non-lexical borrow lifetimes are not supported;

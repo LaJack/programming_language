@@ -730,7 +730,7 @@ class CompileTimePassTests(unittest.TestCase):
 
     def test_generated_generic_type_is_ordered_after_runtime_field_dependency(self):
         ast = parse('''
-            struct ExampleDriver(comptime type Accessor) {
+            struct ExampleDriver(comptime type Accessor: Copyable) {
                 Accessor device;
 
                 init(&inout self, Accessor device) {
@@ -782,7 +782,7 @@ class CompileTimePassTests(unittest.TestCase):
                 i32 code;
             }
 
-            struct ExampleDriver(comptime type Accessor) {
+            struct ExampleDriver(comptime type Accessor: Copyable) {
                 Accessor device;
 
                 init(&inout self, Accessor device) {
@@ -819,7 +819,7 @@ class CompileTimePassTests(unittest.TestCase):
 
     def test_generic_type_must_be_instantiated_with_comptime_arguments(self):
         ast = parse('''
-            struct Box(comptime type T) {
+            struct Box(comptime type T: Copyable) {
                 T value;
             }
 
@@ -974,7 +974,7 @@ class CompileTimePassTests(unittest.TestCase):
 
     def test_constructor_syntax_works_with_generic_type_arguments(self):
         ast = parse('''
-            struct Box(comptime type T) {
+            struct Box(comptime type T: Copyable) {
                 T value;
 
                 init(&inout self, T value) {

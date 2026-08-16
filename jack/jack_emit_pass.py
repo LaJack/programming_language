@@ -12,6 +12,8 @@ try:
         FunctionCall,
         FunctionDeclaration,
         If,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
@@ -45,6 +47,8 @@ except ImportError:
         FunctionCall,
         FunctionDeclaration,
         If,
+        ImplementationDeclaration,
+        InterfaceDeclaration,
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
@@ -91,6 +95,10 @@ class JackEmitPass:
             return self._line(level, self._import_declaration(statement))
         if type(statement) is TypeDeclaration:
             return self._type_declaration(statement, level)
+        if type(statement) is InterfaceDeclaration:
+            return self._interface_declaration(statement, level)
+        if type(statement) is ImplementationDeclaration:
+            return self._implementation_declaration(statement, level)
         if type(statement) is ViewDeclaration:
             return self._view_declaration(statement, level)
         if type(statement) is FunctionDeclaration:
@@ -154,6 +162,52 @@ class JackEmitPass:
         lines.append(self._line(level, '}'))
         return '\n'.join(lines)
 
+    def _interface_declaration(self, declaration: InterfaceDeclaration, level: int) -> str:
+        prefix = self._declaration_prefix(declaration, allow_extern=False)
+        lines = [self._line(level, f'{prefix}interface {declaration.name} {{')]
+        for method in declaration.methods:
+            lines.append(self._function_signature(method, level + 1, method=True) + ';')
+        lines.append(self._line(level, '}'))
+        return '\n'.join(lines)
+
+    def _implementation_declaration(
+        self, declaration: ImplementationDeclaration, level: int
+    ) -> str:
+        parameters = ''
+        if declaration.parameters:
+            parameters = '(' + ', '.join(
+                self._parameter(parameter) for parameter in declaration.parameters
+            ) + ')'
+        lines = [self._line(
+            level,
+            f'{declaration.type_name}{parameters} implements '
+            f'{self._type_reference(declaration.interface)} {{',
+        )]
+        for use in declaration.uses:
+            lines.append(self._line(level + 1, f'use {use.name};'))
+        for method in declaration.methods:
+            if len(lines) > 1:
+                lines.append('')
+            lines.append(self._function_declaration(method, level + 1, method=True))
+        lines.append(self._line(level, '}'))
+        return '\n'.join(lines)
+
+    def _function_signature(
+        self, declaration: FunctionDeclaration, level: int, method: bool
+    ) -> str:
+        parameters = ', '.join(
+            self._parameter(parameter)
+            for parameter in self._function_parameters(declaration, method)
+        )
+        if declaration.name in {'init', 'deinit'} and self._type_reference(declaration.return_type) == 'void':
+            signature = f'{declaration.name}({parameters}){self._raises_clause(declaration)}'
+        else:
+            signature = (
+                f'{self._type_reference(declaration.return_type)} {declaration.name}'
+                f'({parameters}){self._raises_clause(declaration)}'
+            )
+        return self._line(level, signature)
+
     def _view_declaration(self, declaration: ViewDeclaration, level: int) -> str:
         prefix = self._declaration_prefix(declaration, allow_extern=False)
         lines = [self._line(level, f'{prefix}view {declaration.name} {{')]
@@ -216,7 +270,12 @@ class JackEmitPass:
             and declaration.type.borrow is not None
         ):
             return f'{prefix}&{declaration.type.borrow} self'
-        return f'{prefix}{self._type_reference(declaration.type)} {declaration.name}'
+        result = f'{prefix}{self._type_reference(declaration.type)} {declaration.name}'
+        if declaration.constraints:
+            result += ': ' + ' + '.join(
+                self._type_reference(constraint) for constraint in declaration.constraints
+            )
+        return result
 
     def _function_parameters(
         self, declaration: FunctionDeclaration, method: bool

@@ -873,7 +873,7 @@ class Interpreter:
         for parameter, argument in zip(declaration.parameters, hir_call.arguments):
             value = self._hir_call_argument_value(parameter, argument, scope)
             function_scope.declare(parameter.name, value)
-            if parameter.passing_mode == 'move' and self._value_needs_drop(value):
+            if parameter.type_ref.borrow is None and self._value_needs_drop(value):
                 function_scope.mark_for_deinit(parameter.name)
 
         try:
@@ -911,7 +911,7 @@ class Interpreter:
         for parameter, argument in zip(declaration.parameters, hir_call.arguments):
             value = self._hir_call_argument_value(parameter, argument, scope)
             method_scope.declare(parameter.name, value)
-            if parameter.passing_mode == 'move' and self._value_needs_drop(value):
+            if parameter.type_ref.borrow is None and self._value_needs_drop(value):
                 method_scope.mark_for_deinit(parameter.name)
 
         try:

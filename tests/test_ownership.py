@@ -51,7 +51,7 @@ class OwnershipTests(unittest.TestCase):
         ''')
 
     def test_noncopyable_plain_parameter_is_rejected_after_specialization(self):
-        with self.assertRaisesRegex(SemanticError, 'copyable|non-copyable'):
+        with self.assertRaisesRegex((SemanticError, CompileTimeError), 'Copyable|copyable|non-copyable'):
             validate_source('''
                 struct Resource {
                     deinit(&inout self) { }

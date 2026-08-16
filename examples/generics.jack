@@ -1,4 +1,4 @@
-struct ExampleDriver(comptime type Accessor)
+struct ExampleDriver(comptime type Accessor: Copyable)
 {
     Accessor device;
 

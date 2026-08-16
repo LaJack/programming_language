@@ -13,6 +13,66 @@ class ConformanceCase:
 
 CONFORMANCE_CASES = (
     ConformanceCase(
+        name='interfaces_and_custom_copyable',
+        source='''
+            interface Tagged {
+                i32 tag(&in self);
+            }
+
+            struct Resource {
+                i32 value;
+
+                init(&inout self, i32 value) { self.value = value; }
+                deinit(&inout self) { print(f"drop {self.value}"); }
+            }
+
+            Resource implements Tagged {
+                i32 tag(&in self) { return self.value; }
+            }
+
+            Resource implements Copyable {
+                init(&out self, &in Self other) {
+                    self.value = other.value + 100;
+                    print(f"copy {other.value}");
+                }
+            }
+
+            void inspect(comptime type T: Tagged, &in T value) { print(value.tag()); }
+            void duplicate(Resource value) { print(value.value); }
+
+            Resource first(7);
+            Resource second = first;
+            inspect(Resource, second);
+            duplicate(second);
+        ''',
+        expected_stdout=(
+            'copy 7\nvalue.tag() = 107\ncopy 107\nvalue.value = 207\n'
+            'drop 207\ndrop 107\ndrop 7\n'
+        ),
+    ),
+    ConformanceCase(
+        name='custom_copyable_arrays',
+        source='''
+            struct Resource {
+                i32 value;
+                deinit(&inout self) { print(f"drop {self.value}"); }
+            }
+
+            Resource implements Copyable {
+                init(&out self, &in Self other) {
+                    self.value = other.value + 10;
+                    print(f"copy {other.value}");
+                }
+            }
+
+            Resource[2] first;
+            Resource[2] second = first;
+        ''',
+        expected_stdout=(
+            'copy 0\ncopy 0\ndrop 10\ndrop 10\ndrop 0\ndrop 0\n'
+        ),
+    ),
+    ConformanceCase(
         name='primitives_control_comptime_and_raw_bytes',
         source='''
             i32 add(comptime i32 offset, i32 value) {
@@ -44,7 +104,7 @@ CONFORMANCE_CASES = (
     ConformanceCase(
         name='generic_type_specialization',
         source='''
-            struct Box(comptime type T) {
+            struct Box(comptime type T: Copyable) {
                 T value;
 
                 init(&inout self, T value) {

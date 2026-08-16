@@ -395,7 +395,7 @@ class HIRStaticCleanupLoweringPass:
             self.drop_flags = {}
             move_parameters = [
                 parameter for parameter in declaration.parameters
-                if parameter.passing_mode == 'move' and self._has_deinit(parameter.type_ref)
+                if parameter.type_ref.borrow is None and self._has_deinit(parameter.type_ref)
             ]
             flag_declarations = [
                 self._hir_create_drop_flag(parameter.name, True, parameter.span)
@@ -437,7 +437,7 @@ class HIRStaticCleanupLoweringPass:
                 self.drop_flags = {}
                 move_parameters = [
                     parameter for parameter in method.parameters
-                    if parameter.passing_mode == 'move' and self._has_deinit(parameter.type_ref)
+                    if parameter.type_ref.borrow is None and self._has_deinit(parameter.type_ref)
                 ]
                 flag_declarations = [
                     self._hir_create_drop_flag(parameter.name, True, parameter.span)

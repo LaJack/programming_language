@@ -186,14 +186,22 @@ def compile_to_hir(
 
 
 class HIRLoweringPass(SemanticPass):
+    def __init__(self) -> None:
+        super().__init__()
+        self.copy_helper_names: dict[str, str] = {}
+        self.copy_helper_results: dict[str, str] = {}
+
     def lower(self, ast: list[Statement]) -> HIRProgram:
         self.validate(ast)
+        helpers = self._install_copy_helpers(ast)
         declarations: list[HIRDeclaration] = []
         body: list[HIRStatement] = []
         top_level: list[HIRStatement] = []
         entry_module = self._entry_module(ast)
         module_dependencies = self._module_dependencies(ast, entry_module)
-        for statement in ast:
+        for statement in [*ast, *helpers]:
+            if type(statement).__name__ in {'InterfaceDeclaration', 'ImplementationDeclaration'}:
+                continue
             if self._is_top_level_declaration(statement):
                 declaration = self._declaration(statement)
                 declaration = self._record_statement(statement, declaration)
@@ -214,6 +222,161 @@ class HIRLoweringPass(SemanticPass):
             entry_module=entry_module,
             module_dependencies=module_dependencies,
         )
+
+    def _install_copy_helpers(
+        self, ast: list[Statement]
+    ) -> list[Statement]:
+        helpers: list[Statement] = []
+        for type_decl in self.types.values():
+            method = next(
+                (
+                    candidate for candidate in type_decl.methods
+                    if candidate.interface_name == 'Copyable'
+                    and candidate.name == 'Copyable$init'
+                ),
+                None,
+            )
+            if method is None:
+                continue
+            helper_name = f'$jack$copy${type_decl.name}'
+            self.copy_helper_names[type_decl.name] = helper_name
+            source_type = TypeReference(type_decl.name, borrow='in')
+            helper = FunctionDeclaration(
+                helper_name,
+                [VariableDeclaration('source', source_type)],
+                [
+                    VariableDeclaration('destination', TypeReference(type_decl.name)),
+                    FunctionCall(
+                        'destination.Copyable$init',
+                        [VariableExpression('source')],
+                    ),
+                    Return(VariableExpression('destination')),
+                ],
+                TypeReference(type_decl.name),
+                raises=self._copy_types(method.raises),
+                module_name=type_decl.module_name,
+                source_name=f'Copyable.init<{type_decl.source_name or type_decl.name}>',
+                synthetic=True,
+            )
+            self._register_copy_helper(helper)
+            helpers.append(helper)
+        for type_ref in self._array_copy_types(ast):
+            key = self._type_name(type_ref)
+            helper_name = '$jack$copy$array$' + ''.join(
+                character if character.isalnum() else '$' for character in key
+            )
+            self.copy_helper_names[key] = helper_name
+            wrapper_name = '$jack$copy$array$result$' + ''.join(
+                character if character.isalnum() else '$' for character in key
+            )
+            self.copy_helper_results[key] = wrapper_name
+            wrapper = TypeDeclaration(
+                wrapper_name,
+                [VariableDeclaration('value', self._copy_type(type_ref))],
+            )
+            self.types[wrapper_name] = wrapper
+            self.global_scope.declare(
+                wrapper_name,
+                SymbolInfo('type', TypeReference(wrapper_name)),
+            )
+            helpers.append(wrapper)
+            source_type = self._copy_type(type_ref)
+            source_type.borrow = 'in'
+            index = VariableExpression('index')
+            helper = FunctionDeclaration(
+                helper_name,
+                [VariableDeclaration('source', source_type)],
+                [
+                    VariableDeclaration('destination', TypeReference(wrapper_name)),
+                    For(
+                        VariableDeclaration(
+                            'index', TypeReference('usize'),
+                            LiteralExpression(0, 'usize'),
+                        ),
+                        CompositeExpression(
+                            VariableExpression('index'),
+                            LiteralExpression(
+                                self._copy_array_size(type_ref), 'usize'
+                            ),
+                            '<',
+                        ),
+                        Assignment(
+                            'index',
+                            CompositeExpression(
+                                VariableExpression('index'),
+                                LiteralExpression(1, 'usize'),
+                                '+',
+                            ),
+                        ),
+                        [Assignment(
+                            IndexExpression(VariableExpression('destination.value'), index),
+                            IndexExpression(
+                                VariableExpression('source'),
+                                VariableExpression('index'),
+                            ),
+                        )],
+                    ),
+                    Return(VariableExpression('destination')),
+                ],
+                TypeReference(wrapper_name),
+                synthetic=True,
+            )
+            self._register_copy_helper(helper)
+            helpers.append(helper)
+        return helpers
+
+    def _copy_array_size(self, type_ref: TypeReference) -> int:
+        size = type_ref.array_size
+        if type(size) is LiteralExpression:
+            return int(size.value)
+        if type(size) is int:
+            return size
+        raise HIRLoweringError(
+            f'Custom-copy array "{self._type_name(type_ref)}" needs a literal size.',
+            type_ref.span,
+        )
+
+    def _register_copy_helper(self, helper: FunctionDeclaration) -> None:
+        self.functions[helper.name] = helper
+        self.global_scope.declare(
+            helper.name,
+            SymbolInfo(
+                'function', helper.return_type,
+                module_name=helper.module_name,
+                source_name=helper.source_name or helper.name,
+            ),
+        )
+
+    def _array_copy_types(self, ast: list[Statement]) -> list[TypeReference]:
+        found: dict[str, TypeReference] = {}
+        seen: set[int] = set()
+
+        def visit(value: object) -> None:
+            if value is None or isinstance(value, (str, int, float, bool, SourceSpan)):
+                return
+            identity = id(value)
+            if identity in seen:
+                return
+            seen.add(identity)
+            if type(value) is TypeReference:
+                if value.array_size is not None:
+                    element = self._element_type(value)
+                    if self._type_name(element) in self.copy_helper_names:
+                        found.setdefault(self._type_name(value), self._copy_type(value))
+                for argument in value.arguments:
+                    visit(argument)
+                visit(value.array_size)
+                return
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    visit(item)
+                return
+            if hasattr(value, '__dict__'):
+                for item in vars(value).values():
+                    visit(item)
+
+        visit(ast)
+        return [found[key] for key in sorted(found)]
 
     def _is_top_level_declaration(self, statement: Statement) -> bool:
         return type(statement) in {
@@ -321,6 +484,8 @@ class HIRLoweringPass(SemanticPass):
             source_name=declaration.source_name,
             extern=declaration.extern,
             abi=declaration.abi,
+            interface_name=declaration.interface_name,
+            synthetic=declaration.synthetic,
             span=declaration.span,
         )
 
@@ -365,6 +530,8 @@ class HIRLoweringPass(SemanticPass):
             source_name=method.source_name,
             extern=method.extern,
             abi=method.abi,
+            interface_name=method.interface_name,
+            synthetic=method.synthetic,
             span=method.span,
         )
         self._record_statement(method, declaration)
@@ -477,7 +644,11 @@ class HIRLoweringPass(SemanticPass):
         initializer = (
             None
             if declaration.expr is None
-            else self._expression(declaration.expr, scope)
+            else self._maybe_custom_copy(
+                self._expression(declaration.expr, scope),
+                declaration.type,
+                declaration.expr,
+            )
         )
         symbol = self._symbol(declaration)
         if not top_level:
@@ -516,7 +687,11 @@ class HIRLoweringPass(SemanticPass):
         target = self._assignment_target(assignment.name, scope, assignment.span)
         return HIRAssignment(
             target=target,
-            expr=self._expression(assignment.expr, scope),
+            expr=self._maybe_custom_copy(
+                self._expression(assignment.expr, scope),
+                target.type_ref,
+                assignment.expr,
+            ),
             target_type=self._copy_type(target.type_ref),
             span=assignment.span,
         )
@@ -647,14 +822,7 @@ class HIRLoweringPass(SemanticPass):
             return self._record_expression(
                 expression,
                 HIRStructLiteralExpression(
-                    fields=[
-                        HIRStructLiteralField(
-                            name=field.name,
-                            expr=self._expression(field.expr, scope),
-                            span=field.span,
-                        )
-                        for field in expression.fields
-                    ],
+                    fields=self._struct_literal_fields(expression, scope),
                     type_ref=type_ref,
                     read_type=self._read_type(type_ref),
                     span=expression.span,
@@ -731,6 +899,24 @@ class HIRLoweringPass(SemanticPass):
             f'Expression "{type(expression).__name__}" cannot be lowered to HIR.',
             getattr(expression, 'span', None),
         )
+
+    def _struct_literal_fields(
+        self, expression: StructLiteralExpression, scope: SemanticScope
+    ) -> list[HIRStructLiteralField]:
+        declaration = self._type_declaration_for(expression.type_ref)
+        field_types = {field.name: field.type for field in declaration.fields}
+        return [
+            HIRStructLiteralField(
+                name=field.name,
+                expr=self._maybe_custom_copy(
+                    self._expression(field.expr, scope),
+                    field_types[field.name],
+                    field.expr,
+                ),
+                span=field.span,
+            )
+            for field in expression.fields
+        ]
 
     def _name_expression(
         self,
@@ -824,6 +1010,10 @@ class HIRLoweringPass(SemanticPass):
                         read_type=self._copy_type(lowered.read_type or lowered.type_ref),
                         span=argument.span,
                     )
+                elif parameter.type_ref.borrow is None:
+                    lowered = self._maybe_custom_copy(
+                        lowered, parameter.type_ref, argument
+                    )
             arguments.append(lowered)
         expression = HIRCallExpression(
             target=target,
@@ -837,6 +1027,58 @@ class HIRLoweringPass(SemanticPass):
         if record_source:
             return self._record_expression(call, expression)
         return expression
+
+    def _maybe_custom_copy(
+        self,
+        expression: HIRExpression,
+        target_type: TypeReference,
+        source: Expression,
+    ) -> HIRExpression:
+        if type(source) is MoveExpression or target_type.borrow is not None:
+            return expression
+        normalized_target = self._copy_type(target_type)
+        type_name = self._type_name(normalized_target)
+        helper_name = self.copy_helper_names.get(type_name)
+        if helper_name is None:
+            return expression
+        helper = self.functions.get(helper_name)
+        if helper is None:
+            return expression
+        borrow_type = normalized_target
+        borrow_type.borrow = 'in'
+        borrowed = HIRBorrowExpression(
+            mode='in',
+            expr=expression,
+            type_ref=self._copy_type(borrow_type),
+            read_type=self._read_type(borrow_type),
+            span=source.span,
+        )
+        call = HIRCallExpression(
+            target=HIRCallTarget(
+                kind='function',
+                name=helper_name,
+                return_type=self._copy_type(helper.return_type),
+                parameters=[self._symbol(parameter) for parameter in helper.parameters],
+                raises=self._copy_types(helper.raises),
+                owner_type_name=None,
+            ),
+            arguments=[borrowed],
+            type_ref=self._copy_type(helper.return_type),
+            read_type=self._read_type(helper.return_type),
+            span=source.span,
+        )
+        wrapper_name = self.copy_helper_results.get(type_name)
+        if wrapper_name is None:
+            return call
+        return HIRFieldAccessExpression(
+            target=call,
+            field_name='value',
+            owner_type_name=wrapper_name,
+            from_view=False,
+            type_ref=self._copy_type(target_type),
+            read_type=self._read_type(target_type),
+            span=source.span,
+        )
 
     def _call_target(
         self, call: FunctionCall, scope: SemanticScope
@@ -895,7 +1137,9 @@ class HIRLoweringPass(SemanticPass):
         receiver_name, method_name = call.function_name.rsplit('.', 1)
         receiver = self._name_expression(receiver_name, scope, call.span)
         type_decl = self._type_declaration_for(receiver.type_ref)
-        method = next((method for method in type_decl.methods if method.name == method_name), None)
+        method = self._visible_method_for_call(
+            type_decl, method_name, call.interface_name
+        )
         if method is None:
             raise HIRLoweringError(
                 f'Type "{type_decl.name}" has no method "{method_name}" while lowering HIR.',
@@ -913,7 +1157,7 @@ class HIRLoweringPass(SemanticPass):
         return (
             HIRCallTarget(
                 kind='method',
-                name=f'{type_decl.name}.{method_name}',
+                name=f'{type_decl.name}.{method.name}',
                 return_type=self._copy_type(method.return_type),
                 parameters=[self._symbol(parameter) for parameter in method.parameters],
                 self_parameter=self._symbol(self_parameter),

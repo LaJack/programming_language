@@ -65,6 +65,11 @@ class BorrowExpression(Expression):
 
 
 @dataclass
+class MoveExpression(Expression):
+    expr: Expression
+
+
+@dataclass
 class IndexExpression(Expression):
     target: Expression
     index: Expression
@@ -126,6 +131,7 @@ class VariableDeclaration(Statement):
     constructor_args: List[Expression] = field(default_factory=list)
     extern: bool = False
     abi: str | None = None
+    passing_mode: str = 'copy'
 
 
 @dataclass

@@ -33,6 +33,7 @@ try:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         Print,
         Raise,
@@ -84,6 +85,7 @@ except ImportError:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         Print,
         Raise,
@@ -122,6 +124,8 @@ class SymbolInfo:
     borrow_accesses: tuple['BorrowAccess', ...] = ()
     view_borrow_accesses: tuple['ViewBorrowAccess', ...] = ()
     can_return_borrow: bool = False
+    passing_mode: str = 'copy'
+    owned_local: bool = False
 
 
 @dataclass(frozen=True)
@@ -200,6 +204,7 @@ class SemanticPass:
         self.current_rethrow_errors: list[str] = []
         self.current_borrow_return_accesses: list[BorrowAccess] | None = None
         self.borrow_return_summaries: dict[int, tuple[BorrowAccess, ...]] = {}
+        self.ownership_states: dict[int, str] = {}
         self.function_body_states: dict[int, str] = {}
 
     def validate(self, ast: list[Statement]) -> None:
@@ -490,6 +495,19 @@ class SemanticPass:
                 raise SemanticError(f'Function "{context}" has duplicate parameter "{parameter.name}".')
             seen_parameters.add(parameter.name)
             self._validate_parameter(parameter, context)
+            if declaration.abi == 'c' and parameter.passing_mode == 'move':
+                raise SemanticError(
+                    f'Extern C function "{context}" cannot declare move parameter "{parameter.name}".'
+                )
+            if (
+                parameter.passing_mode == 'copy'
+                and not self._is_borrow_type(parameter.type)
+                and not self._is_copyable_type(parameter.type)
+            ):
+                raise SemanticError(
+                    f'Parameter "{parameter.name}" of function "{context}" requires a copyable type, '
+                    f'but "{self._type_name(parameter.type)}" is not copyable.'
+                )
 
         if declaration.name in {'init', 'deinit'}:
             if not self._is_void_type(declaration.return_type):
@@ -538,6 +556,18 @@ class SemanticPass:
         return copy.deepcopy(self._method_self_parameter(type_decl, method).type)
 
     def _validate_parameter(self, parameter: VariableDeclaration, function_name: str) -> None:
+        if parameter.passing_mode not in {'copy', 'move'}:
+            raise SemanticError(
+                f'Parameter "{parameter.name}" has invalid passing mode "{parameter.passing_mode}".'
+            )
+        if parameter.comptime and parameter.passing_mode == 'move':
+            raise SemanticError(f'Comptime parameter "{parameter.name}" cannot use move.')
+        if parameter.passing_mode == 'move' and self._is_borrow_type(parameter.type):
+            raise SemanticError(
+                f'Parameter "{parameter.name}" cannot combine move with a borrow type.'
+            )
+        if parameter.abi == 'c' and parameter.passing_mode == 'move':
+            raise SemanticError(f'Extern C parameter "{parameter.name}" cannot use move.')
         self._validate_variable_type(parameter.name, parameter.type, allow_void=False)
         if parameter.type.array_size is not None and type(parameter.type.array_size) is not LiteralExpression:
             raise SemanticError(f'Parameter "{parameter.name}" array size must be literal for now.')
@@ -591,15 +621,15 @@ class SemanticPass:
     def _validate_function_body(self, declaration: FunctionDeclaration, parent_scope: SemanticScope) -> None:
         scope = SemanticScope(parent_scope)
         for parameter in declaration.parameters:
-            scope.declare(
-                parameter.name,
-                SymbolInfo(
-                    'variable',
-                    parameter.type,
-                    module_name=declaration.module_name,
-                    can_return_borrow=self._is_borrow_type(parameter.type),
-                ),
+            info = SymbolInfo(
+                'variable', parameter.type,
+                module_name=declaration.module_name,
+                can_return_borrow=self._is_borrow_type(parameter.type),
+                passing_mode=parameter.passing_mode,
+                owned_local=not self._is_borrow_type(parameter.type),
             )
+            scope.declare(parameter.name, info)
+            self.ownership_states[id(info)] = 'initialized'
 
         previous_module_name = self.current_module_name
         previous_imports = self.current_imports
@@ -651,15 +681,15 @@ class SemanticPass:
             ),
         )
         for parameter in method.parameters:
-            scope.declare(
-                parameter.name,
-                SymbolInfo(
-                    'variable',
-                    parameter.type,
-                    module_name=type_decl.module_name,
-                    can_return_borrow=self._is_borrow_type(parameter.type),
-                ),
+            info = SymbolInfo(
+                'variable', parameter.type,
+                module_name=type_decl.module_name,
+                can_return_borrow=self._is_borrow_type(parameter.type),
+                passing_mode=parameter.passing_mode,
+                owned_local=not self._is_borrow_type(parameter.type),
             )
+            scope.declare(parameter.name, info)
+            self.ownership_states[id(info)] = 'initialized'
 
         previous_module_name = self.current_module_name
         previous_imports = self.current_imports
@@ -732,8 +762,14 @@ class SemanticPass:
             elif type(statement) is If:
                 self._validate_if(statement, scope, allow_return)
             elif type(statement) is While:
+                initial = dict(self.ownership_states)
                 self._validate_condition(statement.condition, scope, 'while condition')
                 self._validate_statements(statement.body, SemanticScope(scope), allow_return)
+                body_outcome = dict(self.ownership_states)
+                self._validate_loop_back_edge(initial, body_outcome)
+                self.ownership_states = self._join_ownership_states(
+                    initial, [initial, body_outcome]
+                )
             elif type(statement) is For:
                 self._validate_for(statement, scope, allow_return)
             elif type(statement) is Try:
@@ -805,19 +841,18 @@ class SemanticPass:
                     ignore_owners=self._borrow_source_owners(declaration.expr, scope),
                 )
 
-        scope.declare(
-            declaration.name,
-            SymbolInfo(
-                'variable',
-                declaration.type,
-                module_name=declaration.module_name or self.current_module_name,
-                public=declaration.public,
-                source_name=declaration.source_name or declaration.name,
-                borrow_accesses=borrow_accesses,
-                view_borrow_accesses=view_borrow_accesses,
-                can_return_borrow=scope is self.global_scope,
-            ),
+        info = SymbolInfo(
+            'variable', declaration.type,
+            module_name=declaration.module_name or self.current_module_name,
+            public=declaration.public,
+            source_name=declaration.source_name or declaration.name,
+            borrow_accesses=borrow_accesses,
+            view_borrow_accesses=view_borrow_accesses,
+            can_return_borrow=scope is self.global_scope,
+            owned_local=scope is not self.global_scope and not self._is_borrow_type(declaration.type),
         )
+        scope.declare(declaration.name, info)
+        self.ownership_states[id(info)] = 'initialized'
         for access in borrow_accesses:
             scope.add_borrow(declaration.name, access)
         if declaration.constructor_args:
@@ -837,6 +872,20 @@ class SemanticPass:
             )
         expr_type = self._expression_type_for_target(assignment.expr, target_type, scope)
         self._expect_assignable(target_type, expr_type, assignment.expr, 'assignment')
+        if isinstance(assignment.name, str) and '.' not in assignment.name:
+            info = scope.get(assignment.name)
+            if info is not None and info.owned_local:
+                self.ownership_states[id(info)] = 'initialized'
+
+    def _require_initialized(self, name: str, scope: SemanticScope) -> None:
+        root = name.split('.')[0]
+        info = scope.get(root)
+        if info is None or not info.owned_local:
+            return
+        state = self.ownership_states.get(id(info), 'initialized')
+        if state != 'initialized':
+            description = 'possibly moved' if state == 'conditional' else state
+            raise SemanticError(f'Cannot use "{root}" because it is {description}.')
 
     def _validate_raise(self, statement: Raise, scope: SemanticScope) -> None:
         error_type = self._expression_value_type(statement.expr, scope)
@@ -872,6 +921,7 @@ class SemanticPass:
 
     def _validate_print(self, statement: Print, scope: SemanticScope) -> None:
         if statement.expr is None:
+            self._require_initialized(statement.name, scope)
             value_type = self._resolve_name_type(statement.name, scope)
             if self._expression_reads_place(value_type):
                 self._validate_read_access(statement.name, scope, f'print of "{statement.name}"')
@@ -895,50 +945,112 @@ class SemanticPass:
             return
         if self._is_void_type(self.current_return_type):
             raise SemanticError(f'Void function "{self.current_function_name}" cannot return a value.')
-        expr_type = self._expression_type_for_target(statement.expr, self.current_return_type, scope)
-        self._expect_assignable(self.current_return_type, expr_type, statement.expr, 'return value')
         if self._is_borrow_type(self.current_return_type):
+            expr_type = self._expression_type_for_target(
+                statement.expr, self.current_return_type, scope
+            )
+            self._expect_assignable(
+                self.current_return_type, expr_type, statement.expr, 'return value'
+            )
             self._validate_borrow_return(statement.expr, self.current_return_type, scope)
+            return
+
+        expression = statement.expr
+        if type(statement.expr) is VariableExpression and '.' not in statement.expr.name:
+            info = scope.get(statement.expr.name)
+            if info is not None and info.owned_local:
+                expression = MoveExpression(statement.expr)
+                expression.span = statement.expr.span
+        expr_type = self._expression_type_for_target(
+            expression, self.current_return_type, scope
+        )
+        self._expect_assignable(
+            self.current_return_type, expr_type, expression, 'return value'
+        )
 
     def _validate_if(self, statement: If, scope: SemanticScope, allow_return: bool) -> None:
+        initial = dict(self.ownership_states)
+        outcomes: list[dict[int, str]] = []
         for branch in statement.branches:
+            self.ownership_states = dict(initial)
             self._validate_condition(branch.condition, scope, 'if condition')
             self._validate_statements(branch.body, SemanticScope(scope), allow_return)
+            outcomes.append(dict(self.ownership_states))
         if statement.else_body is not None:
+            self.ownership_states = dict(initial)
             self._validate_statements(statement.else_body, SemanticScope(scope), allow_return)
+            outcomes.append(dict(self.ownership_states))
+        else:
+            outcomes.append(initial)
+        self.ownership_states = self._join_ownership_states(initial, outcomes)
+
+    def _join_ownership_states(
+        self, initial: dict[int, str], outcomes: list[dict[int, str]]
+    ) -> dict[int, str]:
+        joined = dict(initial)
+        for symbol_id in initial:
+            states = {outcome.get(symbol_id, initial[symbol_id]) for outcome in outcomes}
+            joined[symbol_id] = next(iter(states)) if len(states) == 1 else 'conditional'
+        return joined
+
+    def _validate_loop_back_edge(
+        self, initial: dict[int, str], outcome: dict[int, str]
+    ) -> None:
+        for symbol_id, initial_state in initial.items():
+            if initial_state == 'initialized' and outcome.get(symbol_id) != 'initialized':
+                raise SemanticError(
+                    'A loop-carried value moved in the loop body must be reinitialized '
+                    'on every continuing path.'
+                )
 
     def _validate_for(self, statement: For, scope: SemanticScope, allow_return: bool) -> None:
         loop_scope = SemanticScope(scope)
         if statement.initializer is not None:
             self._validate_statement(statement.initializer, loop_scope, allow_return=False)
+        initial = dict(self.ownership_states)
         if statement.condition is not None:
             self._validate_condition(statement.condition, loop_scope, 'for condition')
+        self._validate_statements(statement.body, SemanticScope(loop_scope), allow_return)
         if statement.update is not None:
             self._validate_statement(statement.update, loop_scope, allow_return=False)
-        self._validate_statements(statement.body, SemanticScope(loop_scope), allow_return)
+        body_outcome = dict(self.ownership_states)
+        self._validate_loop_back_edge(initial, body_outcome)
+        self.ownership_states = self._join_ownership_states(
+            initial, [initial, body_outcome]
+        )
 
     def _validate_try(self, statement: Try, scope: SemanticScope, allow_return: bool) -> None:
         catch_error_names = [self._validate_catch_clause(catch) for catch in statement.catches]
+        initial = dict(self.ownership_states)
+        outcomes: list[dict[int, str]] = []
 
         previous_caught_errors = set(self.current_caught_errors)
         try:
+            self.ownership_states = dict(initial)
             self.current_caught_errors = previous_caught_errors | set(catch_error_names)
             self._validate_statements(statement.body, SemanticScope(scope), allow_return)
+            outcomes.append(dict(self.ownership_states))
         finally:
             self.current_caught_errors = previous_caught_errors
 
         for catch, error_name in zip(statement.catches, catch_error_names):
+            self.ownership_states = dict(initial)
             catch_scope = SemanticScope(scope)
             if catch.name is not None:
-                catch_scope.declare(
-                    catch.name,
-                    SymbolInfo('variable', catch.error_type, module_name=self.current_module_name),
+                info = SymbolInfo(
+                    'variable', catch.error_type,
+                    module_name=self.current_module_name,
+                    owned_local=True,
                 )
+                catch_scope.declare(catch.name, info)
+                self.ownership_states[id(info)] = 'initialized'
             self.current_rethrow_errors.append(error_name)
             try:
                 self._validate_statements(catch.body, catch_scope, allow_return)
+                outcomes.append(dict(self.ownership_states))
             finally:
                 self.current_rethrow_errors.pop()
+        self.ownership_states = self._join_ownership_states(initial, outcomes)
 
     def _validate_catch_clause(self, catch: CatchClause) -> str:
         return self._validate_error_type_reference(catch.error_type)
@@ -981,10 +1093,30 @@ class SemanticPass:
         if type(expression) is LiteralExpression:
             return TypeReference(expression.type)
         if type(expression) is VariableExpression:
+            if check_reads:
+                self._require_initialized(expression.name, scope)
             value_type = self._resolve_name_type(expression.name, scope)
             if check_reads and self._expression_reads_place(value_type):
                 self._validate_read_access(expression, scope, f'read of "{expression.name}"')
             return value_type
+        if type(expression) is MoveExpression:
+            if type(expression.expr) is not VariableExpression or '.' in expression.expr.name:
+                raise SemanticError('move requires a whole local variable or owned parameter.')
+            info = scope.get(expression.expr.name)
+            if info is None or not info.owned_local or self._is_borrow_type(info.type_ref):
+                raise SemanticError(
+                    f'Cannot move "{expression.expr.name}"; only owned locals and parameters can be moved.'
+                )
+            self._require_initialized(expression.expr.name, scope)
+            if any(
+                borrow.access.path.root == expression.expr.name
+                for borrow in scope.live_borrows()
+            ):
+                raise SemanticError(
+                    f'Cannot move "{expression.expr.name}" while it is borrowed.'
+                )
+            self.ownership_states[id(info)] = 'moved'
+            return info.type_ref
         if type(expression) is FunctionCall:
             return self._function_call_type(expression, scope)
         if type(expression) is TypeExpression:
@@ -1155,10 +1287,8 @@ class SemanticPass:
         if method is None:
             raise SemanticError(f'Type "{type_decl.name}" has no method "{method_name}".')
         self_parameter = self._method_self_parameter(type_decl, method)
-        self_argument = BorrowExpression(
-            self_parameter.type.borrow or 'inout',
-            VariableExpression(receiver_name),
-        )
+        self_argument = VariableExpression(receiver_name)
+        self_argument.span = call.span
         self_borrows = self._validate_call_argument(
             f'{type_decl.name}.{method_name}', self_parameter, self_argument, scope
         )
@@ -1199,44 +1329,54 @@ class SemanticPass:
         argument: Expression,
         scope: SemanticScope,
     ) -> tuple[BorrowAccess, ...]:
+        if type(argument) in {BorrowExpression, MoveExpression}:
+            raise SemanticError(
+                f'Call arguments do not accept explicit borrow or move markers; '
+                f'parameter "{parameter.name}" determines its passing behavior.'
+            )
         if self._is_borrow_type(parameter.type):
-            actual_type = self._expression_type(argument, scope)
-            if type(argument) is not BorrowExpression and not self._is_borrow_type(actual_type):
-                raise SemanticError(
-                    f'Parameter "{parameter.name}" of function "{function_name}" has type "{self._type_name(parameter.type)}" and requires an explicit borrow argument.'
-                )
+            synthetic = BorrowExpression(parameter.type.borrow or 'in', argument)
+            synthetic.span = argument.span
+            actual_type = self._expression_type(synthetic, scope)
             if not self._borrow_compatible(parameter.type, actual_type):
                 raise SemanticError(
                     f'Cannot pass value of type "{self._type_name(actual_type)}" to parameter "{parameter.name}" of type "{self._type_name(parameter.type)}".'
                 )
-            if type(argument) is BorrowExpression:
-                borrow_accesses = self._borrow_accesses_for_expression(
-                    argument.expr, argument.mode, scope, expected_type=parameter.type
-                )
-                self._check_borrow_conflicts(
-                    borrow_accesses,
-                    scope,
-                    f'parameter "{parameter.name}" of function "{function_name}"',
-                    ignore_owners=self._borrow_source_owners(argument, scope),
-                )
-                return borrow_accesses
-            borrow_accesses = self._borrow_accesses_for_existing_borrow(
-                argument, parameter.type.borrow or 'in', scope
+            borrow_accesses = self._borrow_accesses_for_expression(
+                argument, parameter.type.borrow or 'in', scope,
+                expected_type=parameter.type,
             )
+            mode = parameter.type.borrow or 'in'
+            if borrow_mode_can_read(mode):
+                for access in borrow_accesses:
+                    self._require_initialized(access.path.root, scope)
             self._check_borrow_conflicts(
                 borrow_accesses,
                 scope,
                 f'parameter "{parameter.name}" of function "{function_name}"',
                 ignore_owners=self._place_source_owners(argument, scope),
             )
+            if mode == 'out' and type(argument) is VariableExpression and '.' not in argument.name:
+                info = scope.get(argument.name)
+                if info is not None and info.owned_local:
+                    self.ownership_states[id(info)] = 'initialized'
             return borrow_accesses
 
-        if type(argument) is BorrowExpression:
+        expression = argument
+        if parameter.passing_mode == 'move' and type(argument) is VariableExpression:
+            expression = MoveExpression(argument)
+            expression.span = argument.span
+        elif parameter.passing_mode == 'move' and self._raw_place_paths(argument):
             raise SemanticError(
-                f'Borrow argument passed to non-borrow parameter "{parameter.name}" of function "{function_name}".'
+                f'Parameter "{parameter.name}" requires ownership of a whole local, '
+                'owned parameter, or temporary value.'
             )
-        actual_type = self._expression_type_for_target(argument, parameter.type, scope)
-        self._expect_assignable(parameter.type, actual_type, argument, f'parameter "{parameter.name}"')
+        actual_type = self._expression_type_for_target(expression, parameter.type, scope)
+        self._expect_assignable(parameter.type, actual_type, expression, f'parameter "{parameter.name}"')
+        if parameter.passing_mode == 'copy' and not self._is_copyable_type(parameter.type):
+            raise SemanticError(
+                f'Parameter "{parameter.name}" of function "{function_name}" requires a copyable type.'
+            )
         return ()
 
     def _validate_borrow_return(
@@ -1768,11 +1908,20 @@ class SemanticPass:
         context: str,
     ) -> None:
         if (
-            self._is_array_type(target_type)
-            and self._is_array_type(source_type)
-            and source_expression is not None
+            source_expression is not None
+            and type(source_expression) is not MoveExpression
+            and self._raw_place_paths(source_expression)
+            and not self._is_borrow_type(target_type)
+            and not self._is_copyable_type(target_type)
         ):
-            raise SemanticError('Array values cannot be copied; use an explicit borrow or slice.')
+            label = (
+                source_expression.name
+                if type(source_expression) is VariableExpression
+                else 'place expression'
+            )
+            raise SemanticError(
+                f'Cannot copy non-copyable value "{label}"; use move on a whole local.'
+            )
         if self._is_assignable(target_type, source_type, source_expression):
             return
         raise SemanticError(
@@ -1790,7 +1939,12 @@ class SemanticPass:
         if self._is_borrow_type(target_type):
             return self._borrow_compatible(target_type, source_type)
         if self._is_array_type(target_type):
-            return False
+            return (
+                self._is_array_type(source_type)
+                and target_type.array_size == source_type.array_size
+                and self._same_element_type(target_type, source_type)
+                and self._is_copyable_type(target_type)
+            )
         if self._is_slice_type(target_type):
             return self._is_slice_type(source_type) and self._same_element_type(target_type, source_type)
 
@@ -1806,6 +1960,28 @@ class SemanticPass:
                     return False
             return True
         return target_name == source_name
+
+    def _is_copyable_type(
+        self, type_ref: TypeReference, seen: set[str] | None = None
+    ) -> bool:
+        if type_ref.borrow == 'in':
+            return True
+        if type_ref.borrow in {'out', 'inout'} or type_ref.is_slice:
+            return False
+        element = self._element_type(type_ref)
+        name = self._type_name(element)
+        if is_builtin_type(name) or name in {'str', 'c_char', 'c_void', 'type'}:
+            return True
+        declaration = self.types.get(name)
+        if declaration is None:
+            return True
+        if declaration.extern or any(method.name == 'deinit' for method in declaration.methods):
+            return False
+        seen = set(seen or ())
+        if name in seen:
+            return True
+        seen.add(name)
+        return all(self._is_copyable_type(field.type, seen) for field in declaration.fields)
 
     def _borrow_compatible(self, expected: TypeReference, actual: TypeReference) -> bool:
         if not self._is_borrow_type(actual):

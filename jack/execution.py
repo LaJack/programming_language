@@ -16,6 +16,7 @@ try:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         Print,
         Raise,
@@ -45,6 +46,7 @@ except ImportError:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         Print,
         Raise,
@@ -191,6 +193,8 @@ class ExecutionEngine(Generic[Value, Scope]):
             return self._eval_formatted_string(expression, scope)
         if type(expression) is BorrowExpression:
             return self._eval_borrow(expression, scope)
+        if type(expression) is MoveExpression:
+            return self._eval_expression(expression.expr, scope)
         if type(expression) is IndexExpression:
             return self._eval_index(expression, scope)
         if type(expression) is SliceExpression:

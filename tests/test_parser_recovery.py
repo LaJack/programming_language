@@ -73,8 +73,8 @@ class RecoveringParserTests(unittest.TestCase):
 
     def test_valid_slice_is_not_diagnosed_during_speculative_type_parse(self):
         result = parse_recovering(
-            'u8[4] source; fill(&out source[..]); '
-            'copy(&in source[1..], &out source[..3]);'
+            'u8[4] source; fill(source[..]); '
+            'copy(source[1..], source[..3]);'
         )
 
         self.assertEqual([], result.diagnostics)

@@ -29,6 +29,7 @@ try:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         Print,
         Raise,
@@ -76,6 +77,7 @@ except ImportError:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         Print,
         Raise,
@@ -664,6 +666,11 @@ class CompileTimePass:
     def _apply_function_declaration(
         self, declaration: FunctionDeclaration, scope: CompileTimeScope
     ) -> list[Statement]:
+        if any(
+            parameter.comptime and parameter.passing_mode == 'move'
+            for parameter in declaration.parameters
+        ):
+            raise CompileTimeError('Comptime parameters cannot use move.')
         if declaration.extern:
             if any(parameter.comptime for parameter in declaration.parameters):
                 raise CompileTimeError('Extern function parameters cannot be marked comptime.')
@@ -848,6 +855,9 @@ class CompileTimePass:
         if type(expression) is BorrowExpression:
             prelude, expr = self._apply_expression(expression.expr, scope)
             return prelude, BorrowExpression(expression.mode, expr)
+        if type(expression) is MoveExpression:
+            prelude, expr = self._apply_expression(expression.expr, scope)
+            return prelude, MoveExpression(expr)
         if type(expression) is IndexExpression:
             if self._expression_has_comptime_root(expression.target, scope):
                 return [], self._eval_comptime_expression(expression, scope)
@@ -1206,6 +1216,13 @@ class CompileTimePass:
         if self._is_type_type(expected_type):
             return LiteralExpression(self._eval_comptime_type_argument(argument, scope), 'type')
         expression = self._argument_as_expression(argument)
+        if expected_type.borrow is not None:
+            if type(expression) is BorrowExpression:
+                raise CompileTimeError(
+                    'Call arguments do not accept explicit borrow markers; '
+                    'the parameter determines its passing behavior.'
+                )
+            expression = BorrowExpression(expected_type.borrow, expression)
         value = self._eval_comptime_expression(expression, scope)
         runtime_type = self._apply_type_reference(expected_type, scope)
         return LiteralExpression(
@@ -1370,6 +1387,16 @@ class CompileTimePass:
     def _comptime_extern_argument(self, value: LiteralExpression) -> object:
         if type(value.value) is ComptimeOpaqueValue:
             return value.value.value
+        if type(value.value) is ComptimeBorrowValue:
+            target: object = value.value
+            seen: set[int] = set()
+            while type(target) is ComptimeBorrowValue and target.cell is not None:
+                if id(target) in seen:
+                    break
+                seen.add(id(target))
+                target = target.cell.value
+            if type(target) is ComptimeOpaqueValue:
+                return target.value
         return value.value
 
     def _eval_comptime_builtin_conversion(
@@ -1632,10 +1659,14 @@ class CompileTimePass:
             raise CompileTimeError(
                 f'Cannot convert opaque comptime value of type "{self._type_name(value.type_ref)}" to type "{self._type_name(type_ref)}".'
             )
+        if self._is_borrow_type(type_ref):
+            if type(value) is ComptimeBorrowValue:
+                return self._cast_comptime_borrow(value, type_ref)
+            if self._is_opaque_comptime_type(type_ref):
+                return ComptimeOpaqueValue(copy.deepcopy(type_ref), value)
+            return self._cast_comptime_borrow(value, type_ref)
         if self._is_opaque_comptime_type(type_ref):
             return ComptimeOpaqueValue(copy.deepcopy(type_ref), value)
-        if self._is_borrow_type(type_ref):
-            return self._cast_comptime_borrow(value, type_ref)
         if self._is_array_type(type_ref):
             return self._cast_comptime_array(value, type_ref, source_type=source_type)
         if self._is_slice_type(type_ref):
@@ -2035,6 +2066,8 @@ class CompileTimePass:
             return self._expression_has_comptime_root(expression.target, scope)
         if type(expression) is BorrowExpression:
             return self._expression_has_comptime_root(expression.expr, scope)
+        if type(expression) is MoveExpression:
+            return self._expression_has_comptime_root(expression.expr, scope)
         if type(expression) is CompositeExpression:
             return (
                 self._expression_has_comptime_root(expression.left, scope)
@@ -2287,6 +2320,8 @@ class CompileTimePass:
             borrowed = copy.deepcopy(inner_type)
             borrowed.borrow = expression.mode
             return borrowed
+        if type(expression) is MoveExpression:
+            return self._infer_expression_type(expression.expr, env, functions, types)
         if type(expression) is CompositeExpression:
             if expression.operator in {'==', '!=', '<', '>', '<=', '>='}:
                 return TypeReference('bool')
@@ -2318,6 +2353,8 @@ class CompileTimePass:
             for field in expression.fields:
                 self._infer_raises_from_expression(field.expr, env, functions, types, errors)
         elif type(expression) is BorrowExpression:
+            self._infer_raises_from_expression(expression.expr, env, functions, types, errors)
+        elif type(expression) is MoveExpression:
             self._infer_raises_from_expression(expression.expr, env, functions, types, errors)
         elif type(expression) is IndexExpression:
             self._infer_raises_from_expression(expression.target, env, functions, types, errors)
@@ -2411,6 +2448,7 @@ class CompileTimePass:
             declaration.expr,
             constructor_args=copy.deepcopy(declaration.constructor_args),
             public=declaration.public,
+            passing_mode=declaration.passing_mode,
         )
 
     def _runtime_type_declaration(self, declaration: TypeDeclaration, scope: CompileTimeScope) -> TypeDeclaration:
@@ -2576,6 +2614,8 @@ class CompileTimePass:
             return f'{self._expression_label(expression.target)}[{start}..{end}]'
         if type(expression) is BorrowExpression:
             return f'&{expression.mode} {self._expression_label(expression.expr)}'
+        if type(expression) is MoveExpression:
+            return f'move {self._expression_label(expression.expr)}'
         if type(expression) is StructLiteralExpression:
             fields = ', '.join(
                 f'{field.name} = {self._expression_label(field.expr)}'

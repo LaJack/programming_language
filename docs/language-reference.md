@@ -159,8 +159,8 @@ Slices use an empty size:
 &inout u8[] window = &inout buffer[4..8];
 ```
 
-Array and slice values are not implicitly copied. Parameters that accept arrays
-must use an explicit borrow or slice type:
+Fixed arrays are copied when their element type is copyable. Slices are borrows,
+so parameters that accept shared array storage use a borrow slice type:
 
 ```jack
 void fill(&out u8[] dst) {
@@ -184,10 +184,11 @@ void copy(&in u8[] src, &out u8[] dst) {
 }
 ```
 
-Borrow expressions use the same modes:
+Calls use uniform value syntax. The parameter type determines which temporary
+borrow is created:
 
 ```jack
-copy(&in source[..], &out destination[..]);
+copy(source[..], destination[..]);
 ```
 
 The borrow checker rejects overlapping live accesses when at least one access
@@ -196,6 +197,44 @@ may write. Disjoint struct fields may be borrowed independently.
 Borrowed values can be returned only when their origin is allowed to escape,
 such as a borrowed parameter, `self`, a global, or a borrow returned by another
 checked function.
+
+## Ownership And Moves
+
+Every parameter has a fixed ownership contract. A plain value parameter copies,
+a `move` parameter consumes, and a borrow parameter aliases for the duration of
+the call:
+
+```jack
+void inspect(File file) { }
+void consume(move File file) { }
+void update(&inout File file) { }
+
+inspect(copyable_file);
+consume(owned_file);
+update(other_file);
+```
+
+Plain parameters are rejected when their specialized type is not structurally
+copyable. Primitives and `&in` borrows are copyable; structs and arrays are
+copyable only when all stored values are copyable. A struct with `deinit`, an
+`&out` or `&inout` borrow, a slice, or an opaque extern value is not copyable.
+Specialization may reject a copy contract, but never changes it into a move.
+
+Use `move` when transferring a whole local or owned parameter outside a call:
+
+```jack
+File second = move first;
+```
+
+The source cannot be read, borrowed, destroyed, or moved again until assignment
+reinitializes it. Moving globals, fields, indexes, dereferences, and borrowed
+values is not supported. Returning an owned local transfers it automatically;
+no `move` marker is written on `return`.
+
+Named borrows live until their lexical scope exits. Implicit call borrows live
+only for the complete call. Owned values are destroyed exactly once in reverse
+declaration order, including during error propagation. Aggregate fields are
+destroyed in reverse field order after the aggregate's own `deinit` method.
 
 ## Views
 
@@ -319,7 +358,7 @@ comptime memory resources cannot be materialized as runtime values.
 
 ```jack
 comptime u8[4] buffer;
-comptime fill(&out buffer[..]);
+comptime fill(buffer[..]);
 
 u8 first = buffer[0];
 ```
@@ -469,6 +508,6 @@ limitations include:
 - no generic constraints, interfaces, or traits yet;
 - no heap allocator model beyond experiments in `std.collections.vector`;
 - no user-facing lifetime syntax;
-- no full ownership or move system;
+- partial moves and non-lexical borrow lifetimes are not supported;
 - C emission is useful but not yet a stable ABI contract;
 - the language reference follows the implementation and may change quickly.

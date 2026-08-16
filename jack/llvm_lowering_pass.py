@@ -22,6 +22,7 @@ from .hir_nodes import (
     HIRIf,
     HIRIndexExpression,
     HIRLiteralExpression,
+    HIRMoveExpression,
     HIRPrint,
     HIRProgram,
     HIRRaise,
@@ -618,6 +619,8 @@ class LLVMLoweringPass:
             return LLVMValue(type_name, value, type_ref)
         if isinstance(expression, HIRBorrowExpression):
             return self._borrow(expression, env)
+        if isinstance(expression, HIRMoveExpression):
+            return self._expression(expression.expr, env)
         if isinstance(expression, HIRSliceExpression):
             return self._slice(expression, env, mutable=True)
         if isinstance(expression, HIRCompositeExpression):
@@ -957,7 +960,7 @@ class LLVMLoweringPass:
 
     def _len(self, call, env) -> LLVMValue:
         argument = call.arguments[0]
-        inner = argument.expr if isinstance(argument, HIRBorrowExpression) else argument
+        inner = argument.expr if isinstance(argument, (HIRBorrowExpression, HIRMoveExpression)) else argument
         if isinstance(inner, HIRSliceExpression):
             value = self._slice(inner, env, True)
             length = self._b.temp('len')

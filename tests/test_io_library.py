@@ -31,7 +31,7 @@ def io_program(path: Path) -> str:
         File file(path);
 
         u8[4] buffer;
-        usize bytes_read = file.read(&inout buffer[..]);
+        usize bytes_read = file.read(buffer[..]);
         i32 close_status = file.close();
 
         print(bytes_read);
@@ -51,7 +51,7 @@ def comptime_io_program(path: Path) -> str:
         comptime File file(path);
 
         comptime u8[4] buffer;
-        comptime usize bytes_read = file.read(&inout buffer[..]);
+        comptime usize bytes_read = file.read(buffer[..]);
         comptime i32 close_status = file.close();
 
         print(bytes_read);

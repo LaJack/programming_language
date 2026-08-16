@@ -37,6 +37,7 @@ class HIRVariableSymbol(HIRNode):
     extern: bool = False
     abi: str | None = None
     synthetic: bool = False
+    passing_mode: str = 'copy'
 
     @property
     def type(self) -> TypeReference:
@@ -158,6 +159,11 @@ class HIRFieldAccessExpression(HIRExpression):
 @dataclass(frozen=True, kw_only=True)
 class HIRBorrowExpression(HIRExpression):
     mode: str
+    expr: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRMoveExpression(HIRExpression):
     expr: HIRExpression
 
 

@@ -1440,7 +1440,7 @@ class CompileTimePassTests(unittest.TestCase):
             }
 
             comptime u8[4] buffer;
-            comptime fill(&inout buffer[..]);
+            comptime fill(buffer[..]);
 
             u8 first = buffer[0];
         ''')
@@ -1480,7 +1480,7 @@ class CompileTimePassTests(unittest.TestCase):
             }
 
             comptime u8[2] buffer;
-            comptime overwrite(&in buffer[..]);
+            comptime overwrite(buffer[..]);
         ''')
 
         with self.assertRaisesRegex(CompileTimeError, 'read-only comptime borrow'):
@@ -1494,7 +1494,7 @@ class CompileTimePassTests(unittest.TestCase):
             comptime data[0] = 10;
             comptime data[1] = 20;
             comptime data[2] = 0;
-            comptime i32 value = second_byte(&in data[0]);
+            comptime i32 value = second_byte(data[0]);
 
             i32 runtime_value = value;
         ''')

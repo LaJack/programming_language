@@ -86,9 +86,9 @@ CONFORMANCE_CASES = (
             }
 
             Packet packet(40);
-            bump(&inout packet);
+            bump(packet);
             u8[4] values;
-            fill(&out values[1..3]);
+            fill(values[1..3]);
             print(packet.value);
             print(values[1]);
             print(values[2]);
@@ -139,6 +139,43 @@ CONFORMANCE_CASES = (
         ),
     ),
     ConformanceCase(
+        name='ownership_moves_reinitialization_and_cleanup',
+        source='''
+            struct Resource {
+                i32 id;
+                init(&inout self, i32 id) { self.id = id; }
+                deinit(&inout self) { print(self.id); }
+            }
+
+            Resource make(i32 id) {
+                Resource resource(id);
+                return resource;
+            }
+
+            void consume(move Resource resource) {
+                print(resource.id);
+            }
+
+            void run() {
+                u8[2] values;
+                values[0] = 7;
+                u8[2] copied = values;
+                values[0] = 9;
+                print(copied[0]);
+
+                Resource resource(1);
+                consume(resource);
+                resource = make(2);
+                resource = make(3);
+            }
+            run();
+        ''',
+        expected_stdout=(
+            'copied[0] = 7\nresource.id = 1\nself.id = 1\n'
+            'self.id = 2\nself.id = 3\n'
+        ),
+    ),
+    ConformanceCase(
         name='imported_module',
         source='''
             module app.main;
@@ -170,7 +207,7 @@ CONFORMANCE_CASES = (
             message[0] = 111;
             message[1] = 107;
             message[2] = 10;
-            usize written = fwrite(&in message[0], 1, len(message), stdout);
+            usize written = fwrite(message[0], 1, len(message), stdout);
             print(written);
         ''',
         expected_stdout='ok\nwritten = 3\n',

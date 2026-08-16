@@ -17,7 +17,7 @@ class ArrayAndSliceTests(unittest.TestCase):
             }
 
             u8[4] buffer;
-            fill(&inout buffer[..]);
+            fill(buffer[..]);
         ''')
 
         function = ast[0]
@@ -31,8 +31,7 @@ class ArrayAndSliceTests(unittest.TestCase):
 
         call = ast[2]
         self.assertEqual(FunctionCall, type(call))
-        self.assertEqual(BorrowExpression, type(call.parameters[0]))
-        self.assertEqual(SliceExpression, type(call.parameters[0].expr))
+        self.assertEqual(SliceExpression, type(call.parameters[0]))
 
     def test_parser_reads_in_out_and_inout_borrow_modes(self):
         ast = parse('''
@@ -56,7 +55,7 @@ class ArrayAndSliceTests(unittest.TestCase):
             }
 
             u8[2] buffer;
-            fill(&out buffer[..]);
+            fill(buffer[..]);
             print(buffer[0]);
         '''
 
@@ -83,7 +82,7 @@ class ArrayAndSliceTests(unittest.TestCase):
             }
 
             u8[4] buffer;
-            fill(&inout buffer[..]);
+            fill(buffer[..]);
             print(buffer[0]);
         '''
 
@@ -100,7 +99,7 @@ class ArrayAndSliceTests(unittest.TestCase):
             }
 
             u8[4] buffer;
-            set_first(&inout buffer);
+            set_first(buffer);
             print(buffer[0]);
         '''
 
@@ -110,7 +109,7 @@ class ArrayAndSliceTests(unittest.TestCase):
 
         self.assertEqual('buffer[0] = 7\n', output.getvalue())
 
-    def test_interpreter_requires_explicit_borrow_for_borrow_parameters(self):
+    def test_interpreter_infers_borrow_for_borrow_parameters(self):
         source = '''
             void fill(&inout u8[] dst) {
                 dst[0] = 42;
@@ -120,8 +119,10 @@ class ArrayAndSliceTests(unittest.TestCase):
             fill(buffer[..]);
         '''
 
-        with self.assertRaisesRegex(SemanticError, 'requires an explicit borrow'):
+        output = io.StringIO()
+        with redirect_stdout(output):
             Interpreter().eval_source_ast(parse(source))
+        self.assertEqual('', output.getvalue())
 
     def test_interpreter_rejects_assignment_through_in_slice(self):
         source = '''
@@ -130,7 +131,7 @@ class ArrayAndSliceTests(unittest.TestCase):
             }
 
             u8[4] buffer;
-            nope(&in buffer[..]);
+            nope(buffer[..]);
         '''
 
         with self.assertRaisesRegex(SemanticError, 'read-only borrow or slice'):
@@ -143,7 +144,7 @@ class ArrayAndSliceTests(unittest.TestCase):
             }
 
             u8[4] buffer;
-            fill(&inout buffer[..]);
+            fill(buffer[..]);
             print(buffer[0]);
         '''
 
@@ -163,7 +164,7 @@ class ArrayAndSliceTests(unittest.TestCase):
             }
 
             u8[4] buffer;
-            set_first(&inout buffer);
+            set_first(buffer);
         '''
 
         c_source = emit_c(parse(source))
@@ -184,7 +185,7 @@ class ArrayAndSliceTests(unittest.TestCase):
 
             u8 a = 8;
             u8 b = 9;
-            u8 c = pick(&in a, &in b);
+            u8 c = pick(a, b);
             print(c);
         '''
 
@@ -209,7 +210,7 @@ class ArrayAndSliceTests(unittest.TestCase):
 
             u8 a = 8;
             u8 b = 9;
-            u8 c = pick(&in a, &in b);
+            u8 c = pick(a, b);
         '''
 
         c_source = emit_c(parse(source))
@@ -236,7 +237,7 @@ class ArrayAndSliceTests(unittest.TestCase):
             }
 
             u8[4] buffer;
-            show_first(&in buffer[..]);
+            show_first(buffer[..]);
         '''
 
         c_source = emit_c(parse(source))
@@ -310,7 +311,7 @@ class ArrayAndSliceTests(unittest.TestCase):
 
             u8[4] buffer;
             &inout u8[] window = &inout buffer[..];
-            show(&in window);
+            show(window);
         '''
 
         c_source = emit_c(parse(source))

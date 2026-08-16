@@ -155,7 +155,7 @@ class HIRLoweringPassTests(unittest.TestCase):
             }
 
             u8[4] bytes;
-            fill(&inout bytes[..]);
+            fill(bytes[..]);
         ''')
 
         function = next(node for node in hir.declarations if type(node) is HIRFunctionDeclaration)

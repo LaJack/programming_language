@@ -91,12 +91,12 @@ class ErrorEffectsTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            ['HIRVariableDeclaration', 'HIRExpressionStatement', 'HIRReturn'],
+            ['HIRVariableDeclaration', 'HIRVariableDeclaration', 'HIRIf', 'HIRReturn'],
             [type(statement).__name__ for statement in function.body],
         )
-        cleanup = function.body[1]
-        self.assertIsInstance(cleanup, HIRExpressionStatement)
-        self.assertEqual('Tracer.deinit', cleanup.expr.target.name)
+        cleanup = function.body[2]
+        self.assertIsInstance(cleanup, HIRIf)
+        self.assertEqual('Tracer.deinit', cleanup.branches[0].body[0].expr.target.name)
 
     def test_hir_cleanup_lowering_wraps_raising_calls(self):
         program = lower_to_hir(compile_and_validate(
@@ -120,11 +120,14 @@ class ErrorEffectsTests(unittest.TestCase):
             if isinstance(declaration, HIRFunctionDeclaration)
             and declaration.name == 'caller'
         )
-        wrapped = caller.body[1]
+        wrapped = caller.body[2]
 
         self.assertIsInstance(wrapped, HIRTry)
         self.assertEqual('fail', wrapped.body[0].expr.target.name)
-        self.assertEqual('Tracer.deinit', wrapped.catches[0].body[0].expr.target.name)
+        self.assertEqual(
+            'Tracer.deinit',
+            wrapped.catches[0].body[0].branches[0].body[0].expr.target.name,
+        )
         self.assertIsInstance(wrapped.catches[0].body[1], HIRRethrow)
 
     def test_hir_cleanup_lowering_copies_raise_payload(self):
@@ -152,11 +155,13 @@ class ErrorEffectsTests(unittest.TestCase):
             and declaration.name == 'caller'
         )
 
-        self.assertIsInstance(caller.body[3], HIRVariableDeclaration)
-        self.assertEqual('jack_cleanup_error_value_1', caller.body[3].symbol.name)
-        self.assertIsInstance(caller.body[4], HIRAssignment)
-        self.assertEqual('Tracer.deinit', caller.body[5].expr.target.name)
-        self.assertIsInstance(caller.body[6], HIRRaise)
+        self.assertIsInstance(caller.body[4], HIRVariableDeclaration)
+        self.assertEqual('jack_cleanup_error_value_1', caller.body[4].symbol.name)
+        self.assertIsInstance(caller.body[5], HIRAssignment)
+        self.assertEqual(
+            'Tracer.deinit', caller.body[6].branches[0].body[0].expr.target.name
+        )
+        self.assertIsInstance(caller.body[7], HIRRaise)
 
     def test_parser_reads_struct_error_raises_and_raise_statements(self):
         ast = parse(access_error_source() + '''
@@ -325,7 +330,7 @@ class ErrorEffectsTests(unittest.TestCase):
             if isinstance(declaration, HIRFunctionDeclaration)
             and declaration.name == 'caller'
         )
-        call = caller.body[1].body[0].expr
+        call = caller.body[2].body[0].expr
 
         self.assertTrue(lowered)
         self.assertIsInstance(call, HIRCallExpression)
@@ -370,10 +375,13 @@ class ErrorEffectsTests(unittest.TestCase):
         )
 
         self.assertIn('HIRCallExpression', lowering.hir_expression_types)
-        self.assertIsInstance(caller.body[2], HIRTry)
-        self.assertIsInstance(caller.body[2].body[0], HIRAssignment)
-        self.assertEqual('Tracer.deinit', caller.body[2].catches[0].body[0].expr.target.name)
-        self.assertIsInstance(caller.body[2].catches[0].body[1], HIRRethrow)
+        self.assertIsInstance(caller.body[3], HIRTry)
+        self.assertIsInstance(caller.body[3].body[0], HIRAssignment)
+        self.assertEqual(
+            'Tracer.deinit',
+            caller.body[3].catches[0].body[0].branches[0].body[0].expr.target.name,
+        )
+        self.assertIsInstance(caller.body[3].catches[0].body[1], HIRRethrow)
 
     def test_cleanup_lowering_uses_hir_statement_error_walk(self):
         class SpyLowering(HIRStaticCleanupLoweringPass):
@@ -488,14 +496,21 @@ class ErrorEffectsTests(unittest.TestCase):
             if isinstance(declaration, HIRFunctionDeclaration)
             and declaration.name == 'caller'
         )
-        wrapped = caller.body[2]
+        wrapped = caller.body[3]
 
         self.assertIsInstance(wrapped, HIRTry)
         self.assertEqual('Resource.init', wrapped.body[0].expr.target.name)
-        self.assertEqual('Tracer.deinit', wrapped.catches[0].body[0].expr.target.name)
+        self.assertEqual(
+            'Tracer.deinit',
+            wrapped.catches[0].body[0].branches[0].body[0].expr.target.name,
+        )
         self.assertNotIn(
             'Resource.deinit',
-            [statement.expr.target.name for statement in wrapped.catches[0].body[:-1]],
+            [
+                statement.branches[0].body[0].expr.target.name
+                for statement in wrapped.catches[0].body[:-1]
+                if isinstance(statement, HIRIf)
+            ],
         )
 
     def test_c_emit_wraps_raising_constructor_arguments(self):

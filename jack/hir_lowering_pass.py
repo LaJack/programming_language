@@ -24,6 +24,7 @@ try:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         Print,
         Raise,
         Rethrow,
@@ -61,6 +62,7 @@ try:
         HIRIndexExpression,
         HIRLiteralExpression,
         HIRModuleDeclaration,
+        HIRMoveExpression,
         HIRPrint,
         HIRProgram,
         HIRRaise,
@@ -99,6 +101,7 @@ except ImportError:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         Print,
         Raise,
         Rethrow,
@@ -136,6 +139,7 @@ except ImportError:
         HIRIndexExpression,
         HIRLiteralExpression,
         HIRModuleDeclaration,
+        HIRMoveExpression,
         HIRPrint,
         HIRProgram,
         HIRRaise,
@@ -415,8 +419,21 @@ class HIRLoweringPass(SemanticPass):
                 span=statement.span,
             )
         if type(statement) is Return:
+            expr = None if statement.expr is None else self._expression(statement.expr, scope)
+            if (
+                expr is not None
+                and type(statement.expr) is VariableExpression
+                and '.' not in statement.expr.name
+                and expr.type_ref.borrow is None
+            ):
+                expr = HIRMoveExpression(
+                    expr=expr,
+                    type_ref=self._copy_type(expr.type_ref),
+                    read_type=self._copy_type(expr.read_type or expr.type_ref),
+                    span=statement.expr.span,
+                )
             return HIRReturn(
-                expr=None if statement.expr is None else self._expression(statement.expr, scope),
+                expr=expr,
                 span=statement.span,
             )
         if type(statement) is Raise:
@@ -699,6 +716,17 @@ class HIRLoweringPass(SemanticPass):
                     span=expression.span,
                 ),
             )
+        if type(expression) is MoveExpression:
+            inner = self._expression(expression.expr, scope)
+            return self._record_expression(
+                expression,
+                HIRMoveExpression(
+                    expr=inner,
+                    type_ref=self._copy_type(inner.type_ref),
+                    read_type=self._copy_type(inner.read_type or inner.type_ref),
+                    span=expression.span,
+                ),
+            )
         raise HIRLoweringError(
             f'Expression "{type(expression).__name__}" cannot be lowered to HIR.',
             getattr(expression, 'span', None),
@@ -767,7 +795,36 @@ class HIRLoweringPass(SemanticPass):
         self, call: FunctionCall, scope: SemanticScope, *, record_source: bool = True
     ) -> HIRCallExpression:
         target, receiver, implicit_self = self._call_target(call, scope)
-        arguments = [self._expression(argument, scope) for argument in call.parameters]
+        arguments = []
+        for index, argument in enumerate(call.parameters):
+            lowered = self._expression(argument, scope)
+            if index < len(target.parameters):
+                parameter = target.parameters[index]
+                if (
+                    parameter.type_ref.borrow is not None
+                    and (
+                        lowered.type_ref.borrow is None
+                        or (
+                            lowered.type_ref.is_slice
+                            and lowered.type_ref.borrow != parameter.type_ref.borrow
+                        )
+                    )
+                ):
+                    lowered = HIRBorrowExpression(
+                        mode=parameter.type_ref.borrow,
+                        expr=lowered,
+                        type_ref=self._copy_type(parameter.type_ref),
+                        read_type=self._read_type(parameter.type_ref),
+                        span=argument.span,
+                    )
+                elif parameter.passing_mode == 'move':
+                    lowered = HIRMoveExpression(
+                        expr=lowered,
+                        type_ref=self._copy_type(lowered.type_ref),
+                        read_type=self._copy_type(lowered.read_type or lowered.type_ref),
+                        span=argument.span,
+                    )
+            arguments.append(lowered)
         expression = HIRCallExpression(
             target=target,
             arguments=arguments,
@@ -908,6 +965,7 @@ class HIRLoweringPass(SemanticPass):
             source_name=declaration.source_name,
             extern=declaration.extern,
             abi=declaration.abi,
+            passing_mode=declaration.passing_mode,
             span=declaration.span,
         )
 

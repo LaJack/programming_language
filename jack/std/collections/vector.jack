@@ -28,9 +28,9 @@ pub struct Vector(comptime type T, comptime type Allocator) {
         self.capacity = capacity;
     }
 
-    bool push(&inout self, T value) {
+    bool push(&inout self, move T value) {
         if (self.length < self.capacity) {
-            self.items[self.length] = value;
+            self.items[self.length] = move value;
             self.length = self.length + usize(1);
             return true;
         }

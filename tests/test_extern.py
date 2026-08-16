@@ -124,7 +124,7 @@ class ExternTests(unittest.TestCase):
             extern "c" usize fwrite(&in c_void data, usize size, usize count, &inout FILE stream);
 
             u8[4] buffer;
-            usize written = fwrite(&in buffer[0], 1, len(buffer), stdout);
+            usize written = fwrite(buffer[0], 1, len(buffer), stdout);
             print(written);
         ''')
 
@@ -148,7 +148,7 @@ class ExternTests(unittest.TestCase):
             extern "c" usize fwrite(&in c_void data, usize size, usize count, &inout FILE stream);
 
             u8[4] buffer;
-            usize written = fwrite(&in buffer[0], 1, len(buffer), stdout);
+            usize written = fwrite(buffer[0], 1, len(buffer), stdout);
         ''')
 
         stdout = object()

@@ -70,19 +70,19 @@ void mutate_disjoint_views(&inout PacketHeaderView header, &inout PacketFlagsVie
 u8 left = 8;
 u8 right = 9;
 
-u8 biggest_value = max_value(&in left, &in right);
+u8 biggest_value = max_value(left, right);
 print(biggest_value);
 
-&in u8 biggest_ref = max_ref(&in left, &in right);
+&in u8 biggest_ref = max_ref(left, right);
 print(biggest_ref);
 
 u8[4] source;
 u8[4] destination;
 
-fill(&out source[..]);
-copy_first_two(&in source[..], &out destination[..]);
-bump_first(&inout destination[..]);
-set_third(&inout destination);
+fill(source[..]);
+copy_first_two(source[..], destination[..]);
+bump_first(destination[..]);
+set_third(destination);
 
 print(destination[0]);
 print(destination[1]);
@@ -93,10 +93,10 @@ Packet packet;
 packet.header = 41;
 packet.flags = 3;
 
-refresh_checksum(&inout packet);
+refresh_checksum(packet);
 print(packet.checksum);
 
-mutate_disjoint_views(&inout packet, &inout packet);
+mutate_disjoint_views(packet, packet);
 print(packet.header);
 print(packet.flags);
 

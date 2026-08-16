@@ -105,7 +105,7 @@ The first Jack IO module is `std.io`, shipped with the Python package under `jac
 import std.io;
 
 File file("examples/io.txt");
-usize bytes_read = file.read(&inout buffer[..]);
+usize bytes_read = file.read(buffer[..]);
 file.close();
 ```
 
@@ -182,7 +182,7 @@ void fill(&inout u8[] dst) {
 }
 
 comptime u8[4] buffer;
-comptime fill(&inout buffer[..]);
+comptime fill(buffer[..]);
 
 u8 first = buffer[0];
 i32 count = len(buffer);
@@ -195,7 +195,7 @@ import std.io;
 
 comptime File file("examples/io.txt");
 comptime u8[8] buffer;
-comptime usize count = file.read(&inout buffer[..]);
+comptime usize count = file.read(buffer[..]);
 
 usize runtime_count = count; // ok: plain data crosses phases
 // File runtime_file = file; // rejected: contains a comptime host handle

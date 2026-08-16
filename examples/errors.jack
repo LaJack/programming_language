@@ -6,10 +6,10 @@ struct ExampleDriver(comptime type Accessor)
 {
     Accessor device;
 
-    init(&inout self, Accessor device)
+    init(&inout self, move Accessor device)
     {
         print(f"Example driver init.");
-        self.device = device;
+        self.device = move device;
     }
 
     deinit(&inout self)

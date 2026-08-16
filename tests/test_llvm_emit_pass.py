@@ -111,7 +111,7 @@ class LLVMEmitPassTests(unittest.TestCase):
             }
 
             i32[3] values;
-            fill(&out values[..]);
+            fill(values[..]);
             i32 total = values[0] + values[1] + values[2];
             print(total);
         ''')
@@ -191,10 +191,10 @@ class LLVMEmitPassTests(unittest.TestCase):
 
             u8 left = 8;
             u8 right = 9;
-            u8 biggest = max_value(&in left, &in right);
+            u8 biggest = max_value(left, right);
             Packet packet;
             packet.header = 41;
-            update(&inout packet);
+            update(packet);
             print(biggest);
             print(packet.checksum);
         ''')

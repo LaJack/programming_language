@@ -37,6 +37,7 @@ try:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMoveExpression,
         HIRPrint,
         HIRProgram,
         HIRRaise,
@@ -88,6 +89,7 @@ except ImportError:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMoveExpression,
         HIRPrint,
         HIRProgram,
         HIRRaise,
@@ -258,6 +260,9 @@ class JackArrayElementBorrow:
         return self.mode
 
 
+_MOVED_VALUE = object()
+
+
 class SymbolTable:
     BUILTINS = {
         'str': str,
@@ -272,6 +277,8 @@ class SymbolTable:
     def get(self, name: str) -> object:
         parts = self._split_name(name)
         obj = self._resolve_root(parts[0])
+        if obj is _MOVED_VALUE:
+            raise EvaluationError(f'Cannot use moved value "{parts[0]}".')
 
         for field in parts[1:]:
             try:
@@ -312,6 +319,23 @@ class SymbolTable:
         if name not in self.symbols:
             raise NameResolutionError(f'Cannot deinit undeclared name "{name}".')
         self.deinit_names.append(name)
+
+    def is_marked_for_deinit(self, name: str) -> bool:
+        target_scope = self._scope_containing(name)
+        return target_scope is not None and name in target_scope.deinit_names
+
+    def take(self, name: str) -> object:
+        parts = self._split_name(name)
+        if len(parts) != 1:
+            raise NameResolutionError('Only whole variables can be moved.')
+        target_scope = self._scope_containing(name)
+        if target_scope is None:
+            raise NameResolutionError(f'Cannot move undeclared name "{name}".')
+        value = target_scope.symbols[name]
+        while name in target_scope.deinit_names:
+            target_scope.deinit_names.remove(name)
+        target_scope.symbols[name] = _MOVED_VALUE
+        return value
 
     def assign(self, name: str, value: object) -> None:
         parts = self._split_name(name)
@@ -375,6 +399,7 @@ class Interpreter:
         self.hir_program: HIRProgram | None = None
         self.hir_functions_by_name: dict[str, HIRFunctionDeclaration] = {}
         self.hir_methods_by_owner_and_name: dict[tuple[str, str], HIRFunctionDeclaration] = {}
+        self.hir_types_by_name: dict[str, HIRTypeDeclaration] = {}
 
     def _prepare_hir(self, program: HIRProgram) -> None:
         self.hir_program = program
@@ -388,6 +413,11 @@ class Interpreter:
             for type_declaration in self.hir_program.declarations
             if isinstance(type_declaration, HIRTypeDeclaration)
             for method in type_declaration.methods
+        }
+        self.hir_types_by_name = {
+            declaration.name: declaration
+            for declaration in self.hir_program.declarations
+            if isinstance(declaration, HIRTypeDeclaration)
         }
 
     def _hir_method_declaration_for_target(self, target: object) -> HIRFunctionDeclaration:
@@ -555,14 +585,26 @@ class Interpreter:
                 declaration.initializer, symbol.type_ref, scope
             )
         scope.declare(symbol.name, value)
-        if self._has_method(value, 'deinit'):
+        if self._value_needs_drop(value):
             scope.mark_for_deinit(symbol.name)
         if declaration.constructor_call is not None:
             self._eval_hir_function_call(declaration.constructor_call, scope)
 
     def _execute_hir_assignment(self, assignment: HIRAssignment, scope: SymbolTable) -> None:
         value = self._eval_hir_expression_as_type(assignment.expr, assignment.target_type, scope)
+        if isinstance(assignment.target, HIRVariableExpression):
+            name = assignment.target.name
+            if scope.is_marked_for_deinit(name):
+                self._execute_deinit_name(scope, name)
         self._assign_hir_expression_target(assignment.target, value, scope)
+        if (
+            isinstance(assignment.target, HIRVariableExpression)
+            and self._value_needs_drop(value)
+            and not scope.is_marked_for_deinit(assignment.target.name)
+        ):
+            target_scope = scope._scope_containing(assignment.target.name)
+            assert target_scope is not None
+            target_scope.mark_for_deinit(assignment.target.name)
 
     def _execute_hir_print(self, prt: HIRPrint, scope: SymbolTable) -> None:
         value = self._read_value(self._eval_hir_expression(prt.expr, scope))
@@ -683,6 +725,10 @@ class Interpreter:
             return self._slice_from_hir_expression(expression, scope, mutable=False)
         if isinstance(expression, HIRBorrowExpression):
             return self._eval_hir_borrow(expression, scope)
+        if isinstance(expression, HIRMoveExpression):
+            if not isinstance(expression.expr, HIRVariableExpression):
+                return self._eval_hir_expression(expression.expr, scope)
+            return scope.take(expression.expr.name)
         raise EvaluationError(f'Unknown HIR expression type "{type(expression).__name__}".')
 
     def _eval_hir_expression_as_type(
@@ -690,6 +736,11 @@ class Interpreter:
     ) -> object:
         if isinstance(type_ref, TypeReference) and self._is_borrow_type(type_ref):
             return self._eval_hir_borrow_argument(expression, type_ref, scope)
+        if isinstance(expression, HIRMoveExpression):
+            value = self._eval_hir_expression(expression, scope)
+            if self._type_name(expression.type_ref) == self._type_name(type_ref):
+                return value
+            return self._coerce_value(value, type_ref, scope)
         type_name = self._type_name(type_ref)
         if isinstance(expression, HIRLiteralExpression) and is_builtin_type(type_name):
             return self._coerce_value(
@@ -820,9 +871,10 @@ class Interpreter:
 
         function_scope = SymbolTable(scope)
         for parameter, argument in zip(declaration.parameters, hir_call.arguments):
-            function_scope.declare(
-                parameter.name, self._hir_call_argument_value(parameter, argument, scope)
-            )
+            value = self._hir_call_argument_value(parameter, argument, scope)
+            function_scope.declare(parameter.name, value)
+            if parameter.passing_mode == 'move' and self._value_needs_drop(value):
+                function_scope.mark_for_deinit(parameter.name)
 
         try:
             returned = self._execute_hir_statements(
@@ -857,9 +909,10 @@ class Interpreter:
             ),
         )
         for parameter, argument in zip(declaration.parameters, hir_call.arguments):
-            method_scope.declare(
-                parameter.name, self._hir_call_argument_value(parameter, argument, scope)
-            )
+            value = self._hir_call_argument_value(parameter, argument, scope)
+            method_scope.declare(parameter.name, value)
+            if parameter.passing_mode == 'move' and self._value_needs_drop(value):
+                method_scope.mark_for_deinit(parameter.name)
 
         try:
             returned = self._execute_hir_statements(
@@ -889,6 +942,8 @@ class Interpreter:
         parameter_type = self._parameter_type(parameter)
         if self._is_borrow_type(parameter_type):
             return self._eval_hir_borrow_argument(argument, parameter_type, scope)
+        if isinstance(argument, HIRMoveExpression):
+            return self._eval_hir_expression_as_type(argument, parameter_type, scope)
         return copy.deepcopy(self._eval_hir_expression_as_type(argument, parameter_type, scope))
 
     def _parameter_type(self, parameter: object) -> TypeReference:
@@ -1172,10 +1227,18 @@ class Interpreter:
     def _execute_deinit_scope(self, scope: SymbolTable) -> None:
         while scope.deinit_names:
             name = scope.deinit_names.pop()
-            value = scope.get(name)
-            hir_deinit = self._hir_method_for_value(value, 'deinit')
-            if hir_deinit is None:
-                continue
+            self._execute_deinit_value(scope.get(name), scope)
+
+    def _execute_deinit_name(self, scope: SymbolTable, name: str) -> None:
+        target_scope = scope._scope_containing(name)
+        if target_scope is None:
+            raise NameResolutionError(f'Cannot deinit undeclared name "{name}".')
+        target_scope.deinit_names.remove(name)
+        self._execute_deinit_value(target_scope.get(name), target_scope)
+
+    def _execute_deinit_value(self, value: object, scope: SymbolTable) -> None:
+        hir_deinit = self._hir_method_for_value(value, 'deinit')
+        if hir_deinit is not None:
             target = HIRCallTarget(
                 kind='method',
                 name=f'{value.__class__.__name__}.deinit',
@@ -1192,6 +1255,37 @@ class Interpreter:
                 read_type=copy.deepcopy(hir_deinit.return_type),
             )
             self._eval_hir_declared_method_call(value, hir_deinit, call, scope)
+
+        declaration = self.hir_types_by_name.get(value.__class__.__name__)
+        if declaration is None:
+            if isinstance(value, JackArray):
+                for item in reversed(value.values):
+                    if self._value_needs_drop(item):
+                        self._execute_deinit_value(item, scope)
+            return
+        for field in reversed(declaration.fields):
+            if field.type_ref.borrow is not None or field.type_ref.is_slice:
+                continue
+            field_value = getattr(value, field.name)
+            if self._value_needs_drop(field_value):
+                self._execute_deinit_value(field_value, scope)
+
+    def _value_needs_drop(self, value: object) -> bool:
+        if isinstance(value, (JackBorrow, JackArrayElementBorrow, JackSlice)):
+            return False
+        if isinstance(value, JackArray):
+            return any(self._value_needs_drop(item) for item in value.values)
+        declaration = self.hir_types_by_name.get(value.__class__.__name__)
+        if declaration is None:
+            return False
+        if any(method.name == 'deinit' for method in declaration.methods):
+            return True
+        return any(
+            field.type_ref.borrow is None
+            and not field.type_ref.is_slice
+            and self._value_needs_drop(getattr(value, field.name))
+            for field in declaration.fields
+        )
 
     def _hir_method_for_value(
         self, value: object, name: str

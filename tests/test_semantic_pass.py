@@ -69,16 +69,15 @@ class SemanticPassTests(unittest.TestCase):
                 }
             ''')
 
-    def test_rejects_plain_argument_for_borrow_parameter(self):
-        with self.assertRaisesRegex(SemanticError, 'requires an explicit borrow'):
-            validate_source('''
-                void fill(&inout u8[] dst) {
-                    dst[0] = 42;
-                }
+    def test_infers_borrow_from_parameter(self):
+        validate_source('''
+            void fill(&inout u8[] dst) {
+                dst[0] = 42;
+            }
 
-                u8[4] buffer;
-                fill(buffer[..]);
-            ''')
+            u8[4] buffer;
+            fill(buffer[..]);
+        ''')
 
     def test_rejects_assignment_through_in_slice(self):
         with self.assertRaisesRegex(SemanticError, 'read-only borrow or slice'):
@@ -125,12 +124,11 @@ class SemanticPassTests(unittest.TestCase):
                 u8[] window = buffer[..];
             ''')
 
-    def test_rejects_array_copy_initialization(self):
-        with self.assertRaisesRegex(SemanticError, 'Array values cannot be copied'):
-            validate_source('''
-                u8[2] source;
-                u8[2] copy = source;
-            ''')
+    def test_allows_structurally_copyable_array_initialization(self):
+        validate_source('''
+            u8[2] source;
+            u8[2] copy = source;
+        ''')
 
 
 if __name__ == '__main__':

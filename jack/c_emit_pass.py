@@ -41,6 +41,7 @@ try:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMoveExpression,
         HIRPrint,
         HIRProgram,
         HIRRaise,
@@ -96,6 +97,7 @@ except ImportError:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMoveExpression,
         HIRPrint,
         HIRProgram,
         HIRRaise,
@@ -1449,6 +1451,17 @@ class CEmitPass:
         self, statement: HIRVariableDeclaration, env: dict[str, TypeReference]
     ) -> list[str]:
         symbol = statement.symbol
+        if symbol.type_ref.array_size is not None and statement.initializer is not None:
+            env[symbol.name] = symbol.type_ref
+            target = self._mangle(symbol.name)
+            source = self._emit_hir_expression(statement.initializer, env)
+            lines = [
+                f'{self._emit_declaration(symbol.type_ref, target, env)} = {{0}};',
+                f'__builtin_memmove({target}, {source}, sizeof({target}));',
+            ]
+            if statement.constructor_call is not None:
+                lines.append(f'{self._emit_hir_call(statement.constructor_call, env)};')
+            return lines
         initializer = (
             self._emit_hir_expression_as_type(statement.initializer, symbol.type_ref, env)
             if statement.initializer is not None
@@ -1469,6 +1482,10 @@ class CEmitPass:
     def _emit_hir_assignment(
         self, statement: HIRAssignment, env: dict[str, TypeReference]
     ) -> list[str]:
+        if statement.target_type.array_size is not None:
+            target = self._emit_hir_expression(statement.target, env)
+            source = self._emit_hir_expression(statement.expr, env)
+            return [f'__builtin_memmove({target}, {source}, sizeof({target}));']
         return [
             f'{self._emit_hir_expression(statement.target, env)} = '
             f'{self._emit_hir_expression_as_type(statement.expr, statement.target_type, env)};'
@@ -1817,6 +1834,8 @@ class CEmitPass:
             return self._emit_hir_slice_literal(expression, env, mutable=False)
         if isinstance(expression, HIRBorrowExpression):
             return self._emit_hir_borrow_expression(expression, env)
+        if isinstance(expression, HIRMoveExpression):
+            return self._emit_hir_expression(expression.expr, env)
         raise CEmitError(f'Unknown HIR expression type "{type(expression).__name__}".')
 
     def _emit_hir_field_access(
@@ -1953,7 +1972,7 @@ class CEmitPass:
             actual_type = argument.type_ref
             if not self._is_borrow_type(actual_type):
                 raise CEmitError(
-                    f'Parameter of type "{self._type_name(expected_type)}" requires an explicit borrow argument.'
+                    f'Parameter of type "{self._type_name(expected_type)}" requires a borrow-compatible HIR argument.'
                 )
             if not borrow_mode_compatible(expected_type.borrow, actual_type.borrow):
                 raise CEmitError(
@@ -1962,6 +1981,8 @@ class CEmitPass:
             return self._emit_hir_expression_as_type(argument, expected_type, env)
         if isinstance(argument, HIRBorrowExpression):
             raise CEmitError('Borrow argument passed to a non-borrow parameter.')
+        if isinstance(argument, HIRMoveExpression):
+            argument = argument.expr
         return self._emit_hir_expression_as_type(argument, expected_type, env)
 
     def _emit_hir_receiver_argument(

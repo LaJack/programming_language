@@ -4,7 +4,7 @@ comptime str path = "examples/io.txt";
 comptime File file(path);
 
 comptime u8[8] buffer;
-comptime usize bytes_read = file.read(&inout buffer[..]);
+comptime usize bytes_read = file.read(buffer[..]);
 comptime i32 close_status = file.close();
 
 print(bytes_read);

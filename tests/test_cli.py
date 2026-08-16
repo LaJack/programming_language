@@ -261,7 +261,7 @@ class CliTests(unittest.TestCase):
                 message[1] = 105;
                 message[2] = 10;
 
-                usize written = fwrite(&in message[0], 1, len(message), stdout);
+                usize written = fwrite(message[0], 1, len(message), stdout);
                 print(written);
             ''')
 

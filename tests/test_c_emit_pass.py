@@ -343,7 +343,8 @@ class CEmitPassTests(unittest.TestCase):
 
         self.assertIn('Tracer tracer = {0};', c_source)
         self.assertIn('Tracer_init(&tracer, 3);', c_source)
-        self.assertIn('Tracer_deinit(&tracer);\n    return;', c_source)
+        self.assertIn('if (jack_drop_tracer_1)', c_source)
+        self.assertIn('Tracer_deinit(&tracer);', c_source)
 
     def test_emits_type_methods_as_c_functions(self):
         source = '''

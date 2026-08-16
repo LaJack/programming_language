@@ -15,6 +15,7 @@ try:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         Print,
         Raise,
@@ -47,6 +48,7 @@ except ImportError:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         Print,
         Raise,
@@ -206,6 +208,8 @@ class JackEmitPass:
 
     def _parameter(self, declaration: VariableDeclaration) -> str:
         prefix = 'comptime ' if declaration.comptime else ''
+        if declaration.passing_mode == 'move':
+            prefix += 'move '
         if (
             declaration.name == 'self'
             and declaration.type.name == 'self'
@@ -345,6 +349,8 @@ class JackEmitPass:
             source = self._struct_literal(expression)
         elif type(expression) is BorrowExpression:
             source = f'&{expression.mode} {self._expression(expression.expr, precedence)}'
+        elif type(expression) is MoveExpression:
+            source = f'move {self._expression(expression.expr, precedence)}'
         elif type(expression) is IndexExpression:
             source = f'{self._expression(expression.target, precedence)}[{self._expression(expression.index)}]'
         elif type(expression) is SliceExpression:
@@ -425,7 +431,7 @@ class JackEmitPass:
             if expression.operator == '+':
                 return 2
             return 1
-        if type(expression) in {BorrowExpression}:
+        if type(expression) in {BorrowExpression, MoveExpression}:
             return 3
         if type(expression) in {FunctionCall, IndexExpression, SliceExpression}:
             return 4

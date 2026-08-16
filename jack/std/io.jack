@@ -13,7 +13,7 @@ pub struct File {
     }
 
     usize read(&inout self, &inout u8[] dst) {
-        return fread(&inout dst[0], 1, usize(len(dst)), self.handle);
+        return fread(dst[0], 1, usize(len(dst)), self.handle);
     }
 
     i32 close(&inout self) {

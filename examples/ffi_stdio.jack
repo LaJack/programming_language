@@ -10,5 +10,5 @@ message[3] = 108;
 message[4] = 111;
 message[5] = 10;
 
-usize written = fwrite(&in message[0], 1, len(message), stdout);
+usize written = fwrite(message[0], 1, len(message), stdout);
 print(written);

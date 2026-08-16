@@ -152,7 +152,7 @@ class ViewDeclarationTests(unittest.TestCase):
 
             Packet packet;
             packet.header = 41;
-            update(&inout packet);
+            update(packet);
         '''))
 
         self.assertEqual(42, interpreter.global_scope.get('packet.checksum'))
@@ -175,7 +175,7 @@ class ViewDeclarationTests(unittest.TestCase):
             }
 
             Packet packet;
-            update(&inout packet);
+            update(packet);
         '''))
 
         self.assertIn('typedef struct PacketView {', c_source)

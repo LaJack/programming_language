@@ -23,6 +23,7 @@ from .ast_nodes import (
     IndexExpression,
     LiteralExpression,
     ModuleDeclaration,
+    MoveExpression,
     Print,
     Raise,
     Return,
@@ -56,7 +57,7 @@ SKIPPED_DIRECTORIES = {
 }
 JACK_KEYWORDS = {
     'as', 'catch', 'comptime', 'else', 'extern', 'false', 'for', 'if',
-    'import', 'in', 'inout', 'module', 'out', 'print', 'pub', 'raise',
+    'import', 'in', 'inout', 'module', 'move', 'out', 'print', 'pub', 'raise',
     'raises', 'rethrow', 'return', 'struct', 'true', 'try', 'view', 'while',
 }
 BUILTIN_TYPES = {'void', 'str', 'c_char', 'c_void', 'type', *BUILTIN_TYPE_SPECS}
@@ -701,6 +702,8 @@ class _GraphIndexBuilder:
             if value is not None:
                 value.borrow = node.mode
             return value
+        if isinstance(node, MoveExpression):
+            return self._expression(node.expr, env)
         if isinstance(node, IndexExpression):
             value = self._expression(node.target, env)
             self._expression(node.index, env)
@@ -1012,7 +1015,9 @@ def _declaration_signature(node: Statement, name: str) -> str:
 def _function_signature(node: FunctionDeclaration, name: str) -> str:
     parameters = [*([node.self_parameter] if node.self_parameter is not None else []), *node.parameters]
     values = ', '.join(
-        f'{'comptime ' if parameter.comptime else ''}{_type_label(parameter.type)} {parameter.name}'
+        f'{'comptime ' if parameter.comptime else ''}'
+        f'{'move ' if parameter.passing_mode == "move" else ""}'
+        f'{_type_label(parameter.type)} {parameter.name}'
         for parameter in parameters
     )
     raises = ''
@@ -1035,7 +1040,9 @@ def _parameter_labels(
     else:
         return ()
     return tuple(
-        f'{'comptime ' if item.comptime else ''}{_type_label(item.type)} {item.name}'
+        f'{'comptime ' if item.comptime else ''}'
+        f'{'move ' if item.passing_mode == "move" else ""}'
+        f'{_type_label(item.type)} {item.name}'
         for item in parameters
     )
 

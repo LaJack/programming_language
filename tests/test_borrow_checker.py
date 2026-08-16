@@ -51,7 +51,7 @@ class BorrowCheckerTests(unittest.TestCase):
             ''')
 
     def test_rejects_return_while_out_borrow_is_live(self):
-        with self.assertRaisesRegex(SemanticError, 'overlaps live &out borrow'):
+        with self.assertRaisesRegex(SemanticError, 'while it is borrowed'):
             validate_source('''
                 i32 read() {
                     i32 value = 1;
@@ -146,7 +146,7 @@ class BorrowCheckerTests(unittest.TestCase):
                 }
 
                 i32 value = 1;
-                use(&in value, &out value);
+                use(value, value);
             ''')
 
     def test_allows_non_conflicting_temporary_call_borrows(self):
@@ -155,7 +155,7 @@ class BorrowCheckerTests(unittest.TestCase):
             }
 
             i32 value = 1;
-            use(&in value, &in value);
+            use(value, value);
         ''')
 
         self.assertTrue(ast)
@@ -329,7 +329,7 @@ class BorrowCheckerTests(unittest.TestCase):
                 }
 
                 i32 value = 1;
-                &in i32 ref = identity(&in value);
+                &in i32 ref = identity(value);
                 value = 2;
             ''')
 
@@ -347,7 +347,7 @@ class BorrowCheckerTests(unittest.TestCase):
 
                 i32 left = 1;
                 i32 right = 2;
-                &in i32 ref = pick(true, &in left, &in right);
+                &in i32 ref = pick(true, left, right);
                 right = 3;
             ''')
 

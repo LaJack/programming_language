@@ -20,6 +20,7 @@ try:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         InvalidExpression,
         InvalidStatement,
@@ -59,6 +60,7 @@ except ImportError:
         IndexExpression,
         LiteralExpression,
         ModuleDeclaration,
+        MoveExpression,
         ImportDeclaration,
         InvalidExpression,
         InvalidStatement,
@@ -438,6 +440,7 @@ class Parser:
         'if',
         'import',
         'module',
+        'move',
         'in',
         'inout',
         'out',
@@ -793,6 +796,7 @@ class Parser:
     def _parameter(self) -> VariableDeclaration:
         start_token = self._peek()
         is_comptime = self._match_keyword('comptime')
+        passing_mode = 'move' if self._match_keyword('move') else 'copy'
         shorthand_start = self.current
         if self._match('&'):
             borrow_token = self._previous()
@@ -805,7 +809,10 @@ class Parser:
                     self_token,
                 )
                 return self._with_span(
-                    VariableDeclaration('self', parameter_type, comptime=is_comptime),
+                    VariableDeclaration(
+                        'self', parameter_type, comptime=is_comptime,
+                        passing_mode=passing_mode,
+                    ),
                     start_token,
                     self_token,
                 )
@@ -814,7 +821,10 @@ class Parser:
         parameter_type = self._type_reference()
         parameter_name = self._identifier_value('Expected parameter name.')
         return self._with_span(
-            VariableDeclaration(parameter_name, parameter_type, comptime=is_comptime),
+            VariableDeclaration(
+                parameter_name, parameter_type, comptime=is_comptime,
+                passing_mode=passing_mode,
+            ),
             start_token,
         )
 
@@ -1060,6 +1070,8 @@ class Parser:
         return expr
 
     def _borrow(self) -> Expression:
+        if self._match_keyword('move'):
+            return MoveExpression(self._postfix())
         if self._match('&'):
             mode = self._borrow_mode('')
             return BorrowExpression(mode, self._postfix())

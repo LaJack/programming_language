@@ -249,7 +249,12 @@ class ModuleResolver:
             import_bindings: list[ImportBinding] = []
             for declaration in imports:
                 effective_name = self._effective_module_name(declaration.module_name)
-                flattened.extend(self._load_module(declaration.module_name))
+                try:
+                    flattened.extend(self._load_module(declaration.module_name))
+                except ModuleLoadError as err:
+                    if err.span is not None:
+                        raise
+                    raise ModuleLoadError(str(err), declaration.span) from err
                 import_bindings.append(
                     ImportBinding(effective_name, declaration.alias, declaration.symbols)
                 )

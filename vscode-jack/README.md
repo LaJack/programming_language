@@ -8,6 +8,8 @@ This extension provides editor basics for the experimental Jack language:
 - document symbols for Outline and Breadcrumbs
 - semantic hover and cross-file go-to-definition
 - lexical and member completion, references, and project-wide rename
+- semantic highlighting and signature help for calls, methods, and constructors
+- recoverable semantic diagnostics with safe typo and import quick fixes
 - Linux x86-64 source debugging through CodeLLDB
 - comments, brackets, indentation, and string pairing rules
 

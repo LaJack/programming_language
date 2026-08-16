@@ -24,7 +24,7 @@ from .ast_nodes import (
     While,
 )
 from .builtin_types import is_builtin_type
-from .parser import Lexer, ParseError, Token, parse
+from .parser import Lexer, ParseError, Token, parse, parse_recovering
 from .lsp_analysis import (
     BUILTIN_TYPES,
     JACK_KEYWORDS,
@@ -62,28 +62,31 @@ class SymbolEntry:
 
 BUILTIN_HOVER_TYPES = {'void', 'str', 'c_char', 'c_void', 'type'}
 MEMBER_SYMBOL_KINDS = {6, 8}
+SEMANTIC_TOKEN_TYPES = [
+    'namespace', 'type', 'struct', 'typeParameter', 'function', 'method',
+    'property', 'parameter', 'variable', 'keyword', 'string', 'number',
+    'operator', 'comment',
+]
+SEMANTIC_TOKEN_MODIFIERS = [
+    'declaration', 'definition', 'readonly', 'modification', 'comptime',
+    'extern', 'public', 'defaultLibrary',
+]
 
 
 def diagnostics_for_source(source: str) -> list[JsonValue]:
-    try:
-        parse(source)
-    except ParseError as err:
-        return [
-            {
-                'range': range_from_span(err.span) if err.span is not None else range_from_error(str(err), source),
-                'severity': 1,
-                'source': 'jack',
-                'message': str(err),
-            }
-        ]
-    return []
+    return [
+        {
+            'range': range_from_span(item.span) if item.span is not None else _zero_range(),
+            'severity': 1,
+            'source': 'jack',
+            'message': item.message,
+        }
+        for item in parse_recovering(source).diagnostics
+    ]
 
 
 def document_symbols_for_source(source: str) -> list[JsonValue]:
-    try:
-        statements = parse(source)
-    except ParseError:
-        return []
+    statements = parse_recovering(source).statements
     return [symbol for statement in statements for symbol in _statement_symbols(statement)]
 
 
@@ -149,8 +152,12 @@ def symbol_entry_at_token(source: str, token: Token) -> SymbolEntry | None:
     return matching[0]
 
 
-def symbol_entries_for_source(source: str) -> list[SymbolEntry]:
-    statements = parse(source)
+def symbol_entries_for_source(
+    source: str, *, recovering: bool = False
+) -> list[SymbolEntry]:
+    statements = (
+        parse_recovering(source).statements if recovering else parse(source)
+    )
     tokens = Lexer(source).tokenize()
     entries: list[SymbolEntry] = []
     for statement in statements:
@@ -652,6 +659,12 @@ class LanguageServer:
                 self._respond(request_id, self._prepare_rename(params))
             elif method == 'textDocument/rename' and request_id is not None:
                 self._respond(request_id, self._rename(params))
+            elif method == 'textDocument/semanticTokens/full' and request_id is not None:
+                self._respond(request_id, self._semantic_tokens(params))
+            elif method == 'textDocument/signatureHelp' and request_id is not None:
+                self._respond(request_id, self._signature_help(params))
+            elif method == 'textDocument/codeAction' and request_id is not None:
+                self._respond(request_id, self._code_actions(params))
             elif method == 'workspace/didChangeWatchedFiles':
                 self._did_change_watched_files(params)
             elif request_id is not None:
@@ -681,6 +694,18 @@ class LanguageServer:
                 },
                 'referencesProvider': True,
                 'renameProvider': {'prepareProvider': True},
+                'semanticTokensProvider': {
+                    'legend': {
+                        'tokenTypes': SEMANTIC_TOKEN_TYPES,
+                        'tokenModifiers': SEMANTIC_TOKEN_MODIFIERS,
+                    },
+                    'full': True,
+                },
+                'signatureHelpProvider': {
+                    'triggerCharacters': ['(', ','],
+                    'retriggerCharacters': [','],
+                },
+                'codeActionProvider': True,
             },
             'serverInfo': {
                 'name': 'jack-lsp',
@@ -842,6 +867,10 @@ class LanguageServer:
             if model is not None:
                 for symbol in model.visible_symbols(path, offset):
                     candidates.append((symbol.name, _completion_kind(symbol), symbol.signature))
+            if parse_recovering(document.text).diagnostics:
+                for entry in symbol_entries_for_source(document.text, recovering=True):
+                    if entry.selection_span.start_offset <= offset:
+                        candidates.append((entry.name, entry.kind, entry.detail or entry.hover))
             candidates.extend((name, 7, f'builtin type {name}') for name in sorted(BUILTIN_TYPES))
             candidates.extend((name, 14, name) for name in sorted(JACK_KEYWORDS))
         seen = set()
@@ -883,6 +912,179 @@ class LanguageServer:
             if item.symbol_id == symbol.id
             and (include_declaration or not item.declaration)
         ]
+
+    def _semantic_tokens(self, params: JsonValue) -> JsonValue:
+        document = self._document_from_position_request(params)
+        if document is None:
+            return {'data': []}
+        path = path_from_uri(document.uri)
+        try:
+            tokens = Lexer(document.text, source_path=path).tokenize()
+        except ParseError:
+            return {'data': []}
+        semantic: dict[int, tuple[str, set[str]]] = {}
+        model = self.semantic_model
+        if model is not None and path is not None and not parse_recovering(document.text).diagnostics:
+            for occurrence in model.occurrences:
+                if occurrence.path != path:
+                    continue
+                symbol = model.symbols.get(occurrence.symbol_id)
+                if symbol is None:
+                    continue
+                modifiers = set()
+                if occurrence.declaration:
+                    modifiers.update({'declaration', 'definition'})
+                if symbol.public:
+                    modifiers.add('public')
+                if symbol.extern:
+                    modifiers.add('extern')
+                if 'comptime ' in symbol.signature:
+                    modifiers.add('comptime')
+                if symbol.type_label and symbol.type_label.startswith('&in '):
+                    modifiers.add('readonly')
+                semantic[occurrence.span.start_offset] = (
+                    _semantic_symbol_type(symbol), modifiers
+                )
+        result: list[tuple[int, int, int, int, int]] = []
+        for token in tokens:
+            if token.kind == 'EOF':
+                continue
+            classified = semantic.get(token.offset) or _lexical_semantic_token(token)
+            if classified is None:
+                continue
+            token_type, modifiers = classified
+            result.append((
+                token.line - 1, token.column - 1,
+                max(token.end_offset - token.offset, 1),
+                SEMANTIC_TOKEN_TYPES.index(token_type),
+                sum(1 << SEMANTIC_TOKEN_MODIFIERS.index(value) for value in modifiers),
+            ))
+        for line, column, length in _comment_tokens(document.text):
+            result.append((line, column, length, SEMANTIC_TOKEN_TYPES.index('comment'), 0))
+        result.sort()
+        encoded = []
+        previous_line = previous_column = 0
+        for line, column, length, token_type, modifiers in result:
+            delta_line = line - previous_line
+            delta_column = column - previous_column if delta_line == 0 else column
+            encoded.extend([delta_line, delta_column, length, token_type, modifiers])
+            previous_line, previous_column = line, column
+        return {'data': encoded}
+
+    def _signature_help(self, params: JsonValue) -> JsonValue | None:
+        document = self._document_from_position_request(params)
+        position = params.get('position')
+        if document is None or not isinstance(position, dict):
+            return None
+        line, character = position.get('line'), position.get('character')
+        if not isinstance(line, int) or not isinstance(character, int):
+            return None
+        offset = offset_at_position(document.text, line, character)
+        try:
+            tokens = [token for token in Lexer(document.text).tokenize() if token.offset < offset]
+        except ParseError:
+            return None
+        depth = brackets = braces = 0
+        opening = None
+        active = 0
+        for token in reversed(tokens):
+            if token.kind == ')':
+                depth += 1
+            elif token.kind == ']':
+                brackets += 1
+            elif token.kind == '}':
+                braces += 1
+            elif token.kind == '(':
+                if depth == 0 and brackets == braces == 0:
+                    opening = token
+                    break
+                depth -= 1
+            elif token.kind == '[' and brackets:
+                brackets -= 1
+            elif token.kind == '{' and braces:
+                braces -= 1
+            elif token.kind == ',' and depth == brackets == braces == 0:
+                active += 1
+        if opening is None:
+            return None
+        before = [token for token in tokens if token.end_offset <= opening.offset]
+        name_token = next((token for token in reversed(before) if token.kind == 'IDENT'), None)
+        if name_token is None:
+            return None
+        symbol = None
+        path = path_from_uri(document.uri)
+        if self.semantic_model is not None and path is not None:
+            occurrence = self.semantic_model.occurrence_at(path, name_token.offset)
+            if occurrence is not None:
+                symbol = self.semantic_model.symbols.get(occurrence.symbol_id)
+            if symbol is None:
+                symbol = next((
+                    value for value in self.semantic_model.symbols.values()
+                    if value.name == name_token.value
+                    and value.kind in {'function', 'method', 'type'}
+                ), None)
+        if symbol is None and str(name_token.value) in BUILTIN_TYPES:
+            label = f'{name_token.value}(value)'
+            parameters = ['value']
+        elif symbol is not None:
+            label = symbol.signature
+            parameters = list(symbol.parameter_labels)
+        else:
+            return None
+        return {
+            'signatures': [{
+                'label': label,
+                'parameters': [{'label': value} for value in parameters],
+                'activeParameter': min(active, max(len(parameters) - 1, 0)),
+            }],
+            'activeSignature': 0,
+            'activeParameter': min(active, max(len(parameters) - 1, 0)),
+        }
+
+    def _code_actions(self, params: JsonValue) -> list[JsonValue]:
+        document = self._document_from_position_request(params)
+        context = params.get('context')
+        if document is None or not isinstance(context, dict) or self.semantic_model is None:
+            return []
+        path = path_from_uri(document.uri)
+        if path is None:
+            return []
+        model_version = self.semantic_model.versions.get(path)
+        if model_version is not None and document.version != model_version:
+            return []
+        actions = []
+        for diagnostic in context.get('diagnostics', []):
+            if not isinstance(diagnostic, dict):
+                continue
+            match = re.search(r'Unknown (?:name|function|type) "([A-Za-z_][A-Za-z0-9_]*)"', str(diagnostic.get('message', '')))
+            if match is None:
+                continue
+            unknown = match.group(1)
+            candidates = {
+                symbol.name for symbol in self.semantic_model.visible_symbols(path, 10**18)
+                if symbol.name != unknown and _edit_distance(unknown, symbol.name) <= 2
+            }
+            if len(candidates) == 1:
+                replacement = next(iter(candidates))
+                actions.append({
+                    'title': f'Change to "{replacement}"',
+                    'kind': 'quickfix',
+                    'diagnostics': [diagnostic],
+                    'edit': {'documentChanges': [{
+                        'textDocument': {'uri': document.uri, 'version': document.version},
+                        'edits': [{'range': diagnostic.get('range', _zero_range()), 'newText': replacement}],
+                    }]},
+                })
+            exact = [
+                symbol for symbol in self.semantic_model.symbols.values()
+                if symbol.name == unknown and symbol.public
+                and symbol.container_id is None
+            ]
+            if len(exact) == 1:
+                action = _import_code_action(document, diagnostic, exact[0])
+                if action is not None:
+                    actions.append(action)
+        return actions
 
     def _prepare_rename(self, params: JsonValue) -> JsonValue | None:
         document = self._document_from_position_request(params)
@@ -1110,7 +1312,10 @@ class LanguageServer:
         except Exception as err:  # pragma: no cover - defensive worker boundary
             self._log(f'Project analysis failed: {type(err).__name__}: {err}', 1)
             return
-        if not result.deferred_comptime or self.semantic_model is None:
+        if (
+            not result.syntax_incomplete
+            and (not result.deferred_comptime or self.semantic_model is None)
+        ):
             self.semantic_model = result.model
         diagnostics_by_uri: dict[str, list[JsonValue]] = {}
         for diagnostic in result.diagnostics:
@@ -1125,6 +1330,18 @@ class LanguageServer:
                 'severity': diagnostic.severity,
                 'source': 'jack',
                 'message': diagnostic.message,
+                'code': diagnostic.code,
+                'relatedInformation': [
+                    {
+                        'location': {
+                            'uri': uri_from_path(Path(related_span.source_path)),
+                            'range': range_from_span(related_span),
+                        },
+                        'message': message,
+                    }
+                    for message, related_span in diagnostic.related
+                    if related_span.source_path is not None
+                ],
             })
         current_uris = set(diagnostics_by_uri)
         for uri in sorted(self.published_semantic_uris | current_uris):
@@ -1244,6 +1461,123 @@ def _completion_kind(symbol: SemanticSymbol) -> int:
         'view': 8,
         'module': 9,
     }.get(symbol.kind, 1)
+
+
+def _semantic_symbol_type(symbol: SemanticSymbol) -> str:
+    return {
+        'type': 'struct', 'view': 'type', 'function': 'function',
+        'method': 'method', 'field': 'property', 'parameter': 'parameter',
+        'catch': 'variable', 'global': 'variable', 'variable': 'variable',
+        'module': 'namespace', 'alias': 'namespace',
+    }.get(symbol.kind, 'variable')
+
+
+def _lexical_semantic_token(token: Token) -> tuple[str, set[str]] | None:
+    if token.kind == 'IDENT' and token.value in JACK_KEYWORDS | {'elif'}:
+        return 'keyword', set()
+    if token.kind in {'STRING', 'FSTRING'}:
+        return 'string', set()
+    if token.kind in {'INT', 'FLOAT'}:
+        return 'number', set()
+    if token.kind not in {'IDENT', 'EOF'}:
+        return 'operator', set()
+    return None
+
+
+def _edit_distance(left: str, right: str) -> int:
+    previous = list(range(len(right) + 1))
+    for row, left_char in enumerate(left, 1):
+        current = [row]
+        for column, right_char in enumerate(right, 1):
+            current.append(min(
+                current[-1] + 1,
+                previous[column] + 1,
+                previous[column - 1] + (left_char != right_char),
+            ))
+        previous = current
+    return previous[-1]
+
+
+def _comment_tokens(source: str) -> list[tuple[int, int, int]]:
+    result = []
+    in_block = False
+    for line_number, line in enumerate(source.splitlines()):
+        index = 0
+        while index < len(line):
+            if in_block:
+                end = line.find('*/', index)
+                length = len(line) - index if end < 0 else end + 2 - index
+                result.append((line_number, index, max(length, 1)))
+                if end < 0:
+                    break
+                in_block = False
+                index = end + 2
+            else:
+                line_comment = line.find('//', index)
+                block_comment = line.find('/*', index)
+                starts = [value for value in (line_comment, block_comment) if value >= 0]
+                if not starts:
+                    break
+                start = min(starts)
+                if start == line_comment:
+                    result.append((line_number, start, len(line) - start))
+                    break
+                end = line.find('*/', start + 2)
+                length = len(line) - start if end < 0 else end + 2 - start
+                result.append((line_number, start, max(length, 1)))
+                if end < 0:
+                    in_block = True
+                    break
+                index = end + 2
+    return result
+
+
+def _import_code_action(
+    document: Document, diagnostic: JsonValue, symbol: SemanticSymbol
+) -> JsonValue | None:
+    source = document.text
+    module = re.escape(symbol.module_name)
+    alias = re.search(rf'(?m)^\s*import\s+{module}\s+as\s+([A-Za-z_]\w*)\s*;', source)
+    if alias is not None:
+        replacement = f'{alias.group(1)}.{symbol.name}'
+        edit_range = diagnostic.get('range', _zero_range())
+        title = f'Qualify as "{replacement}"'
+    else:
+        selective = re.search(rf'(?m)^(\s*import\s+{module}\.\{{)([^}}]*)(\}}\s*;)', source)
+        if selective is not None:
+            names = sorted({
+                value.strip() for value in selective.group(2).split(',') if value.strip()
+            } | {symbol.name})
+            start, end = selective.start(2), selective.end(2)
+            edit_range = _range_for_offsets(source, start, end)
+            replacement = ', '.join(names)
+            title = f'Add "{symbol.name}" to selective import'
+        else:
+            declarations = list(re.finditer(r'(?m)^\s*(?:module\s+[\w.]+|import\s+[^;]+);[^\n]*(?:\n|$)', source))
+            offset = declarations[-1].end() if declarations else 0
+            newline = '\r\n' if '\r\n' in source else '\n'
+            edit_range = _range_for_offsets(source, offset, offset)
+            replacement = f'import {symbol.module_name}.{{{symbol.name}}};{newline}'
+            title = f'Import "{symbol.name}" from {symbol.module_name}'
+    return {
+        'title': title,
+        'kind': 'quickfix',
+        'diagnostics': [diagnostic],
+        'edit': {'documentChanges': [{
+            'textDocument': {'uri': document.uri, 'version': document.version},
+            'edits': [{'range': edit_range, 'newText': replacement}],
+        }]},
+    }
+
+
+def _range_for_offsets(source: str, start: int, end: int) -> JsonValue:
+    def position(offset: int) -> JsonValue:
+        prefix = source[:offset]
+        return {
+            'line': prefix.count('\n'),
+            'character': len(prefix.rsplit('\n', 1)[-1]),
+        }
+    return {'start': position(start), 'end': position(end)}
 
 
 def main() -> int:

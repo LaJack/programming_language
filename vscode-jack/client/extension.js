@@ -4,6 +4,8 @@ const vscode = require('vscode');
 const { JackDebugSupport } = require('./debug');
 
 const JACK_LANGUAGE_ID = 'jack';
+const SEMANTIC_TOKEN_TYPES = ['namespace', 'type', 'struct', 'typeParameter', 'function', 'method', 'property', 'parameter', 'variable', 'keyword', 'string', 'number', 'operator', 'comment'];
+const SEMANTIC_TOKEN_MODIFIERS = ['declaration', 'definition', 'readonly', 'modification', 'comptime', 'extern', 'public', 'defaultLibrary'];
 
 class JackLanguageClient {
   constructor(context) {
@@ -92,6 +94,21 @@ class JackLanguageClient {
           prepareRename: (document, position) => this.prepareRename(document, position),
           provideRenameEdits: (document, position, newName) => this.provideRenameEdits(document, position, newName),
         },
+      ),
+      vscode.languages.registerDocumentSemanticTokensProvider(
+        { language: JACK_LANGUAGE_ID },
+        { provideDocumentSemanticTokens: (document) => this.provideSemanticTokens(document) },
+        new vscode.SemanticTokensLegend(SEMANTIC_TOKEN_TYPES, SEMANTIC_TOKEN_MODIFIERS),
+      ),
+      vscode.languages.registerSignatureHelpProvider(
+        { language: JACK_LANGUAGE_ID },
+        { provideSignatureHelp: (document, position) => this.provideSignatureHelp(document, position) },
+        '(', ',',
+      ),
+      vscode.languages.registerCodeActionsProvider(
+        { language: JACK_LANGUAGE_ID },
+        { provideCodeActions: (document, range, context) => this.provideCodeActions(document, range, context) },
+        { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] },
       ),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (
@@ -306,6 +323,47 @@ class JackLanguageClient {
     });
   }
 
+  provideSemanticTokens(document) {
+    return this.ready.then(() => this.sendRequest('textDocument/semanticTokens/full', {
+      textDocument: { uri: document.uri.toString() },
+    })).then((value) => new vscode.SemanticTokens(new Uint32Array((value && value.data) || [])))
+      .catch((error) => { this.output.appendLine(`Semantic tokens failed: ${error.message}`); return null; });
+  }
+
+  provideSignatureHelp(document, position) {
+    return this.ready.then(() => this.sendRequest('textDocument/signatureHelp', {
+      textDocument: { uri: document.uri.toString() },
+      position: this.toLspPosition(position),
+    })).then((value) => this.toVscodeSignatureHelp(value))
+      .catch((error) => { this.output.appendLine(`Signature help failed: ${error.message}`); return null; });
+  }
+
+  provideCodeActions(document, range, context) {
+    return this.ready.then(() => this.sendRequest('textDocument/codeAction', {
+      textDocument: { uri: document.uri.toString() },
+      range: this.toLspRange(range),
+      context: { diagnostics: (context.diagnostics || []).map((item) => this.toLspDiagnostic(item)) },
+    })).then((values) => (values || []).map((value) => {
+      const action = new vscode.CodeAction(value.title, vscode.CodeActionKind.QuickFix);
+      action.edit = this.toVscodeWorkspaceEdit(value.edit);
+      return action;
+    })).catch((error) => { this.output.appendLine(`Code actions failed: ${error.message}`); return []; });
+  }
+
+  toVscodeSignatureHelp(value) {
+    if (!value) return null;
+    const help = new vscode.SignatureHelp();
+    help.activeSignature = value.activeSignature || 0;
+    help.activeParameter = value.activeParameter || 0;
+    help.signatures = (value.signatures || []).map((item) => {
+      const signature = new vscode.SignatureInformation(item.label || '');
+      signature.activeParameter = item.activeParameter;
+      signature.parameters = (item.parameters || []).map((parameter) => new vscode.ParameterInformation(parameter.label || ''));
+      return signature;
+    });
+    return help;
+  }
+
   toVscodeHover(hover) {
     if (!hover) {
       return undefined;
@@ -513,6 +571,11 @@ class JackLanguageClient {
       const severity = this.toVscodeSeverity(diagnostic.severity);
       const vscodeDiagnostic = new vscode.Diagnostic(range, diagnostic.message || '', severity);
       vscodeDiagnostic.source = diagnostic.source || 'jack';
+      vscodeDiagnostic.code = diagnostic.code;
+      vscodeDiagnostic.relatedInformation = (diagnostic.relatedInformation || []).map((item) => new vscode.DiagnosticRelatedInformation(
+        new vscode.Location(vscode.Uri.parse(item.location.uri), this.toVscodeRange(item.location.range)),
+        item.message || '',
+      ));
       return vscodeDiagnostic;
     });
     this.diagnostics.set(uri, diagnostics);
@@ -523,6 +586,14 @@ class JackLanguageClient {
       line: position.line,
       character: position.character,
     };
+  }
+
+  toLspRange(range) {
+    return { start: this.toLspPosition(range.start), end: this.toLspPosition(range.end) };
+  }
+
+  toLspDiagnostic(value) {
+    return { range: this.toLspRange(value.range), message: value.message, code: value.code, source: value.source };
   }
 
   toVscodeRange(range) {

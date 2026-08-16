@@ -1,7 +1,9 @@
+import io
 import tempfile
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
+from unittest.mock import patch
 
 from jack.lsp_analysis import ProjectAnalyzer, uri_from_path
 from jack.lsp_server import Document, LanguageServer
@@ -27,7 +29,7 @@ class SemanticLspProjectTests(unittest.TestCase):
         )
 
     def server_for(self, entry: Path, analysis, version=1):
-        server = LanguageServer(None, None, None)
+        server = LanguageServer(None, io.BytesIO(), None)
         uri = uri_from_path(entry)
         server.documents[uri] = Document(uri, entry.read_text(), version)
         server.semantic_model = analysis.model
@@ -49,6 +51,14 @@ class SemanticLspProjectTests(unittest.TestCase):
         self.assertEqual([], analysis.diagnostics)
         self.assertIn('new_name', {symbol.name for symbol in analysis.model.symbols.values()})
         self.assertNotIn('old_name', {symbol.name for symbol in analysis.model.symbols.values()})
+
+    def test_checked_in_examples_have_no_editor_semantic_diagnostics(self):
+        examples = Path(__file__).resolve().parents[1] / 'examples'
+        entry = examples / 'borrows.jack'
+
+        analysis = ProjectAnalyzer([examples]).analyze(entry)
+
+        self.assertEqual([], analysis.diagnostics)
 
     def test_imported_semantic_error_keeps_imported_source_path(self):
         library = self.write(
@@ -113,6 +123,101 @@ class SemanticLspProjectTests(unittest.TestCase):
         })
 
         self.assertEqual({'reset', 'x'}, {item['label'] for item in completions})
+
+    def test_lexical_completion_uses_recovered_declarations(self):
+        entry = self.write(
+            'main.jack',
+            'i32 before = 1;\ni32 broken = ;\nbef\n',
+        )
+        server = LanguageServer(None, None, None)
+        uri = uri_from_path(entry)
+        server.documents[uri] = Document(uri, entry.read_text(), 1)
+
+        completions = server._completion({
+            'textDocument': {'uri': uri},
+            'position': {'line': 2, 'character': 3},
+        })
+
+        self.assertIn('before', {item['label'] for item in completions})
+
+    def test_semantic_tokens_and_signature_help_use_project_model(self):
+        entry = self.write(
+            'main.jack',
+            'i32 add(i32 left, i32 right) { return left + right; }\n'
+            'i32 value = add(1, 2);\n',
+        )
+        analysis = self.analyze(entry, versions={entry: 1})
+        server, uri = self.server_for(entry, analysis)
+
+        tokens = server._semantic_tokens({'textDocument': {'uri': uri}})
+        signature = server._signature_help({
+            'textDocument': {'uri': uri},
+            'position': {'line': 1, 'character': 19},
+        })
+
+        self.assertGreater(len(tokens['data']), 20)
+        self.assertEqual('i32 add(i32 left, i32 right)', signature['signatures'][0]['label'])
+        self.assertEqual(1, signature['activeParameter'])
+
+    def test_editor_validator_reports_multiple_independent_errors(self):
+        entry = self.write(
+            'main.jack',
+            'Missing value;\nprint(unknown_one);\nprint(unknown_two);\n',
+        )
+
+        analysis = self.analyze(entry)
+        codes = {item.code for item in analysis.diagnostics}
+
+        self.assertIn('unknown-type', codes)
+        self.assertIn('unknown-name', codes)
+
+    def test_typo_code_action_is_unique_and_versioned(self):
+        entry = self.write('main.jack', 'i32 value = 1;\nprint(vaule);\n')
+        analysis = self.analyze(entry, versions={entry: 3})
+        server, uri = self.server_for(entry, analysis, version=3)
+        diagnostic = {
+            'range': {
+                'start': {'line': 1, 'character': 6},
+                'end': {'line': 1, 'character': 11},
+            },
+            'message': 'Unknown name "vaule".',
+            'code': 'unknown-name',
+        }
+
+        actions = server._code_actions({
+            'textDocument': {'uri': uri},
+            'range': diagnostic['range'],
+            'context': {'diagnostics': [diagnostic]},
+        })
+
+        self.assertEqual(['Change to "value"'], [item['title'] for item in actions])
+        self.assertEqual(3, actions[0]['edit']['documentChanges'][0]['textDocument']['version'])
+
+    def test_missing_selective_import_code_action_is_unique(self):
+        self.write('math.jack', 'module math;\npub i32 add(i32 value) { return value; }\n')
+        entry = self.write('main.jack', 'module app;\nprint(add(1));\n')
+        analysis = self.analyze(entry, versions={entry: 1})
+        server, uri = self.server_for(entry, analysis)
+        diagnostic = {
+            'range': {
+                'start': {'line': 1, 'character': 6},
+                'end': {'line': 1, 'character': 9},
+            },
+            'message': 'Unknown function "add".',
+            'code': 'unknown-function',
+        }
+
+        actions = server._code_actions({
+            'textDocument': {'uri': uri},
+            'range': diagnostic['range'],
+            'context': {'diagnostics': [diagnostic]},
+        })
+
+        action = next(item for item in actions if item['title'].startswith('Import'))
+        self.assertEqual(
+            'import math.{add};\n',
+            action['edit']['documentChanges'][0]['edits'][0]['newText'],
+        )
 
     def test_rename_rejects_stale_open_document(self):
         entry = self.write(
@@ -204,6 +309,49 @@ class SemanticLspProjectTests(unittest.TestCase):
         second = analyzer.analyze(entry)
 
         self.assertIs(first, second)
+
+    def test_imported_parse_diagnostics_stop_comptime_and_keep_path(self):
+        library = self.write('broken.jack', 'module broken;\npub i32 bad = ;\n')
+        entry = self.write('main.jack', 'module app;\nimport broken;\n')
+        analyzer = ProjectAnalyzer([self.root])
+
+        with patch('jack.lsp_analysis.compile_to_hir') as compile_to_hir:
+            analysis = analyzer.analyze(entry)
+
+        self.assertTrue(analysis.syntax_incomplete)
+        self.assertFalse(compile_to_hir.called)
+        self.assertEqual(str(library), analysis.diagnostics[0].span.source_path)
+
+    def test_unresolved_module_diagnostic_points_to_owning_import(self):
+        broken = self.write(
+            'sample.jack',
+            'module sample;\nimport protocol.frame;\ni32 value = 1;\n',
+        )
+        entry = self.write('main.jack', 'module app;\ni32 value = 1;\n')
+
+        analysis = self.analyze(entry)
+
+        diagnostic = next(
+            item for item in analysis.diagnostics
+            if 'Cannot resolve module "protocol.frame"' in item.message
+        )
+        self.assertEqual(str(broken), diagnostic.span.source_path)
+        self.assertEqual(2, diagnostic.span.start_line)
+
+    def test_server_keeps_last_semantic_model_for_syntax_errors(self):
+        entry = self.write('main.jack', 'i32 original = 1;\n')
+        valid = self.analyze(entry)
+        entry.write_text('i32 broken = ;\n')
+        invalid = self.analyze(entry)
+        server = LanguageServer(None, io.BytesIO(), None)
+        server.semantic_model = valid.model
+        server.analysis_generation = 1
+        completed = Future()
+        completed.set_result(invalid)
+
+        server._analysis_finished(1, entry, completed)
+
+        self.assertIs(server.semantic_model, valid.model)
 
 
 if __name__ == '__main__':

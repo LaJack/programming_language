@@ -28,6 +28,15 @@ test('client registers semantic completion references and rename providers', () 
   assert.match(client, /textDocument\/rename/);
 });
 
+test('client registers semantic tokens signature help and code actions', () => {
+  assert.match(client, /registerDocumentSemanticTokensProvider/);
+  assert.match(client, /registerSignatureHelpProvider/);
+  assert.match(client, /registerCodeActionsProvider/);
+  assert.match(client, /textDocument\/semanticTokens\/full/);
+  assert.match(client, /textDocument\/signatureHelp/);
+  assert.match(client, /textDocument\/codeAction/);
+});
+
 test('client watches Jack files in workspaces and module roots', () => {
   assert.match(client, /createFileSystemWatcher/);
   assert.match(client, /\*\*\/\*\.\{jack,jk\}/);

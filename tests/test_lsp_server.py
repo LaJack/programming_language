@@ -28,6 +28,12 @@ class LspDiagnosticsTests(unittest.TestCase):
         self.assertIn('Expected expression.', diagnostic['message'])
         self.assertEqual({'line': 0, 'character': 12}, diagnostic['range']['start'])
 
+    def test_multiple_parse_errors_are_reported_in_source_order(self):
+        diagnostics = diagnostics_for_source('i32 first = ;\ni32 second = ;')
+
+        self.assertEqual(2, len(diagnostics))
+        self.assertEqual([0, 1], [item['range']['start']['line'] for item in diagnostics])
+
     def test_lsp_range_uses_structured_source_span(self):
         self.assertEqual(
             {
@@ -81,8 +87,16 @@ class LspDocumentSymbolTests(unittest.TestCase):
         self.assertEqual('i32', symbols[1]['children'][0]['detail'])
         self.assertEqual('void', symbols[1]['children'][2]['detail'])
 
-    def test_document_symbols_are_empty_for_parse_errors(self):
-        self.assertEqual([], document_symbols_for_source('i32 value = ;'))
+    def test_document_symbols_retain_recovered_declarations(self):
+        self.assertEqual(
+            ['value', 'later'],
+            [
+                symbol['name']
+                for symbol in document_symbols_for_source(
+                    'i32 value = ; i32 later = 2;'
+                )
+            ],
+        )
 
 
 class LspHoverAndDefinitionTests(unittest.TestCase):
@@ -194,6 +208,9 @@ class LspProtocolTests(unittest.TestCase):
         self.assertEqual(['.'], result['capabilities']['completionProvider']['triggerCharacters'])
         self.assertTrue(result['capabilities']['referencesProvider'])
         self.assertTrue(result['capabilities']['renameProvider']['prepareProvider'])
+        self.assertTrue(result['capabilities']['semanticTokensProvider']['full'])
+        self.assertEqual(['(', ','], result['capabilities']['signatureHelpProvider']['triggerCharacters'])
+        self.assertTrue(result['capabilities']['codeActionProvider'])
 
     def test_hover_and_definition_requests_use_open_document_text(self):
         server = LanguageServer(None, None, None)

@@ -21,6 +21,8 @@ try:
         LiteralExpression,
         ModuleDeclaration,
         ImportDeclaration,
+        InvalidExpression,
+        InvalidStatement,
         Print,
         Raise,
         Rethrow,
@@ -58,6 +60,8 @@ except ImportError:
         LiteralExpression,
         ModuleDeclaration,
         ImportDeclaration,
+        InvalidExpression,
+        InvalidStatement,
         Print,
         Raise,
         Rethrow,
@@ -115,6 +119,18 @@ class ParseError(Exception):
         self.span = span
 
 
+@dataclass(frozen=True)
+class ParseDiagnostic:
+    message: str
+    span: SourceSpan | None
+
+
+@dataclass(frozen=True)
+class ParseResult:
+    statements: list[Statement]
+    diagnostics: list[ParseDiagnostic]
+
+
 class Lexer:
     SYMBOLS = set('{}();,+.=<>![]&')
     TWO_CHAR_SYMBOLS = {'==', '!=', '<=', '>=', '..'}
@@ -169,6 +185,72 @@ class Lexer:
 
         tokens.append(self._make_token('EOF', '', self.line, self.column, self.index))
         return tokens
+
+    def tokenize_recovering(
+        self, diagnostics: list[ParseDiagnostic], max_diagnostics: int
+    ) -> list[Token]:
+        tokens: list[Token] = []
+        while not self._is_at_end() and len(diagnostics) < max_diagnostics:
+            start = self.index
+            try:
+                token = self._next_token()
+                if token is not None:
+                    tokens.append(token)
+            except ParseError as err:
+                diagnostics.append(ParseDiagnostic(err.message, err.span))
+                ended_at_newline = self.source[self.index - 1:self.index] == '\n'
+                if ended_at_newline and err.span is not None:
+                    tokens.append(Token(';', ';', SourceSpan(
+                        err.span.end_line,
+                        err.span.end_column,
+                        err.span.end_line,
+                        err.span.end_column,
+                        err.span.end_offset,
+                        err.span.end_offset,
+                        err.span.source_path,
+                    )))
+                if self.index == start:
+                    if self._peek() == '\n':
+                        self._advance_newline()
+                    else:
+                        self._advance()
+                elif ended_at_newline:
+                    self.line += 1
+                    self.column = 1
+        tokens.append(self._make_token('EOF', '', self.line, self.column, self.index))
+        return tokens
+
+    def _next_token(self) -> Token | None:
+        char = self._peek()
+        if char in ' \t\r':
+            self._advance()
+        elif char == '\n':
+            self._advance_newline()
+        elif char == '/' and self._peek_next() == '/':
+            self._skip_line_comment()
+        elif char == '/' and self._peek_next() == '*':
+            self._skip_block_comment()
+        elif char == 'f' and self._peek_next() == '"':
+            return self._formatted_string()
+        elif char.isalpha() or char == '_':
+            return self._identifier()
+        elif char.isdigit():
+            return self._number()
+        elif char == '"':
+            return self._string()
+        elif char + self._peek_next() in self.TWO_CHAR_SYMBOLS:
+            return self._fixed_token(char + self._peek_next())
+        elif char in self.SYMBOLS:
+            return self._fixed_token(char)
+        else:
+            raise ParseError(
+                f'Unexpected character {char!r} at {self.line}:{self.column}.',
+                self._span_from(
+                    self.line, self.column, self.index,
+                    self.line, self.column + 1, self.index + 1,
+                ),
+            )
+        return None
 
     def _identifier(self) -> Token:
         line = self.line
@@ -464,7 +546,7 @@ class Parser:
         start = self.current
         if self._can_start_type_reference():
             try:
-                declared_type = self._type_reference()
+                declared_type = self._speculative_type_reference()
             except ParseError:
                 self.current = start
             else:
@@ -740,6 +822,9 @@ class Parser:
         start_token = self._peek()
         return self._with_span(self._type_reference_inner(), start_token)
 
+    def _speculative_type_reference(self) -> TypeReference:
+        return self._type_reference()
+
     def _type_reference_inner(self) -> TypeReference:
         borrow = None
         if self._match('&'):
@@ -900,7 +985,7 @@ class Parser:
 
         if allow_variable_declaration and self._can_start_type_reference():
             try:
-                declared_type = self._type_reference()
+                declared_type = self._speculative_type_reference()
             except ParseError:
                 self.current = start
             else:
@@ -1046,7 +1131,7 @@ class Parser:
         if self._check('IDENT'):
             start = self.current
             try:
-                type_ref = self._type_reference()
+                type_ref = self._speculative_type_reference()
             except ParseError:
                 self.current = start
             else:
@@ -1372,7 +1457,343 @@ class Parser:
         )
 
 
+class RecoveringParser(Parser):
+    RECOVERY_KEYWORDS = {
+        'catch', 'comptime', 'elif', 'else', 'extern', 'for', 'if', 'import',
+        'module', 'print', 'pub', 'raise', 'rethrow', 'return', 'struct', 'try',
+        'view', 'while',
+    }
+
+    def __init__(
+        self,
+        tokens: list[Token],
+        diagnostics: list[ParseDiagnostic],
+        max_diagnostics: int,
+    ) -> None:
+        super().__init__(tokens)
+        self.diagnostics = diagnostics
+        self.max_diagnostics = max_diagnostics
+        self._diagnostic_offsets = {
+            item.span.start_offset for item in diagnostics if item.span is not None
+        }
+        self.limit_reached = len(diagnostics) >= max_diagnostics
+        self._speculative_depth = 0
+
+    def parse(self) -> list[Statement]:
+        statements: list[Statement] = []
+        while not self._check('EOF') and not self.limit_reached:
+            start = self.current
+            start_token = self._peek()
+            try:
+                statements.append(self._declaration())
+            except ParseError as err:
+                self._record(err)
+                self._synchronize(in_block=False, start=start)
+                statements.append(self._invalid_statement(err, start_token))
+        return statements
+
+    def _function_parameters(self) -> list[VariableDeclaration]:
+        return self._recover_parameter_list('Expected ) after function parameters.')
+
+    def _recover_parameter_list(self, closing_message: str) -> list[VariableDeclaration]:
+        parameters: list[VariableDeclaration] = []
+        while not self._check(')', 'EOF') and not self.limit_reached:
+            start = self.current
+            try:
+                parameters.append(self._parameter())
+            except ParseError as err:
+                self._record(err)
+                self._synchronize_list({',', ')'}, start)
+            if not self._match(','):
+                break
+        if self._check(')'):
+            self._advance()
+        elif not self.limit_reached:
+            self._record(self._error(self._peek(), closing_message))
+        return parameters
+
+    def _import_symbols(self) -> list[str]:
+        symbols: list[str] = []
+        while not self._check('}', 'EOF') and not self.limit_reached:
+            start = self.current
+            try:
+                symbols.append(self._identifier_value('Expected imported symbol name.'))
+            except ParseError as err:
+                self._record(err)
+                self._synchronize_list({',', '}'}, start)
+            if not self._match(','):
+                break
+        self._consume('}', 'Expected } after imported symbols.')
+        return symbols
+
+    def _type_declaration(self) -> TypeDeclaration:
+        name = self._identifier_value('Expected struct name.')
+        parameters: list[VariableDeclaration] = []
+        if self._match('('):
+            parameters = self._recover_parameter_list(
+                'Expected ) after struct parameters.'
+            )
+        self._consume('{', 'Expected { before struct members.')
+        fields: list[VariableDeclaration] = []
+        methods: list[FunctionDeclaration] = []
+        while not self._check('}', 'EOF') and not self.limit_reached:
+            start = self.current
+            member_start = self._peek()
+            try:
+                member_comptime = self._match_keyword('comptime')
+                if self._check_special_method_name() and self._check_next('('):
+                    member_name = self._identifier_value('Expected method name.')
+                    self._consume('(', f'Expected ( after {member_name}.')
+                    method = self._with_span(
+                        self._finish_function_declaration(
+                            member_name, TypeReference('void'), member_comptime
+                        ),
+                        member_start,
+                    )
+                    methods.append(self._method_declaration(name, method))
+                    continue
+                member_type = self._type_reference()
+                member_name = self._identifier_value('Expected member name.')
+                if self._match('('):
+                    method = self._with_span(
+                        self._finish_function_declaration(
+                            member_name, member_type, member_comptime
+                        ),
+                        member_start,
+                    )
+                    methods.append(self._method_declaration(name, method))
+                    continue
+                self._consume(';', 'Expected ; after field declaration.')
+                fields.append(self._with_span(
+                    VariableDeclaration(
+                        member_name, member_type, comptime=member_comptime
+                    ),
+                    member_start,
+                ))
+            except ParseError as err:
+                self._record(err)
+                self._synchronize(
+                    in_block=True, start=start, stop_at_declaration=False
+                )
+        if self._check('}'):
+            self._advance()
+        elif not self.limit_reached:
+            self._record(self._error(self._peek(), 'Expected } after struct members.'))
+        self._match(';')
+        return TypeDeclaration(name, fields, parameters, methods)
+
+    def _view_declaration(self) -> ViewDeclaration:
+        name = self._identifier_value('Expected view name.')
+        self._consume('{', 'Expected { before view fields.')
+        fields: list[ViewField] = []
+        while not self._check('}', 'EOF') and not self.limit_reached:
+            start = self.current
+            field_start = self._peek()
+            try:
+                mode = self._borrow_mode('in view field declaration')
+                field_type = self._type_reference()
+                field_name = self._identifier_value('Expected view field name.')
+                self._consume(';', 'Expected ; after view field declaration.')
+                fields.append(self._with_span(
+                    ViewField(field_name, field_type, mode), field_start
+                ))
+            except ParseError as err:
+                self._record(err)
+                self._synchronize(
+                    in_block=True, start=start, stop_at_declaration=False
+                )
+        if self._check('}'):
+            self._advance()
+        elif not self.limit_reached:
+            self._record(self._error(self._peek(), 'Expected } after view fields.'))
+        self._match(';')
+        return ViewDeclaration(name, fields)
+
+    def _block(self) -> list[Statement]:
+        self._consume('{', 'Expected { before block.')
+        statements: list[Statement] = []
+        while not self._check('}', 'EOF') and not self.limit_reached:
+            start = self.current
+            start_token = self._peek()
+            try:
+                statements.append(self._declaration())
+            except ParseError as err:
+                self._record(err)
+                self._synchronize(in_block=True, start=start)
+                statements.append(self._invalid_statement(err, start_token))
+        if self._check('}'):
+            self._advance()
+        elif not self.limit_reached:
+            self._record(self._error(self._peek(), 'Expected } after block.'))
+        return statements
+
+    def _expression(self) -> Expression:
+        if self._speculative_depth:
+            return super()._expression()
+        start = self.current
+        start_token = self._peek()
+        try:
+            return super()._expression()
+        except ParseError as err:
+            self._record(err)
+            self._synchronize_expression(start)
+            end_token = self._previous() if self.current > start else start_token
+            return InvalidExpression(
+                err.message,
+                span=self._span_from_tokens(start_token, end_token),
+            )
+
+    def _speculative_type_reference(self) -> TypeReference:
+        self._speculative_depth += 1
+        try:
+            return self._type_reference()
+        finally:
+            self._speculative_depth -= 1
+
+    def _record(self, err: ParseError) -> None:
+        offset = err.span.start_offset if err.span is not None else None
+        if offset is None or offset not in self._diagnostic_offsets:
+            self.diagnostics.append(ParseDiagnostic(err.message, err.span))
+            if offset is not None:
+                self._diagnostic_offsets.add(offset)
+        if len(self.diagnostics) >= self.max_diagnostics:
+            self.limit_reached = True
+
+    def _invalid_statement(
+        self, err: ParseError, start_token: Token
+    ) -> InvalidStatement:
+        end_token = self._previous() if self.current > 0 else start_token
+        return InvalidStatement(
+            err.message,
+            span=self._span_from_tokens(start_token, end_token),
+        )
+
+    def _synchronize(
+        self, *, in_block: bool, start: int, stop_at_declaration: bool = True
+    ) -> None:
+        parens = brackets = braces = 0
+        while not self._check('EOF'):
+            token = self._peek()
+            kind = token.kind
+            if parens == brackets == braces == 0:
+                if kind == ';':
+                    self._advance()
+                    return
+                if in_block and kind == '}':
+                    return
+                if (
+                    self.current > start
+                    and kind == 'IDENT'
+                    and token.value in self.RECOVERY_KEYWORDS
+                ):
+                    return
+                if (
+                    stop_at_declaration
+                    and
+                    self.current > start
+                    and kind == 'IDENT'
+                    and self.current + 1 < len(self.tokens)
+                    and self.tokens[self.current + 1].kind == 'IDENT'
+                ):
+                    return
+            if kind == '(':
+                parens += 1
+            elif kind == '[':
+                brackets += 1
+            elif kind == '{':
+                braces += 1
+            elif kind == ')':
+                if parens == 0:
+                    return
+                parens -= 1
+            elif kind == ']':
+                if brackets == 0:
+                    return
+                brackets -= 1
+            elif kind == '}':
+                if braces == 0:
+                    return
+                braces -= 1
+                if braces == 0 and not in_block:
+                    self._advance()
+                    return
+            self._advance()
+        if self.current == start and not self._check('EOF'):
+            self._advance()
+
+    def _synchronize_expression(self, start: int) -> None:
+        parens = brackets = braces = 0
+        while not self._check('EOF'):
+            kind = self._peek().kind
+            if parens == brackets == braces == 0 and kind in {';', ',', ')', ']', '}'}:
+                return
+            if kind == '(':
+                parens += 1
+            elif kind == '[':
+                brackets += 1
+            elif kind == '{':
+                braces += 1
+            elif kind == ')':
+                if parens == 0:
+                    return
+                parens -= 1
+            elif kind == ']':
+                if brackets == 0:
+                    return
+                brackets -= 1
+            elif kind == '}':
+                if braces == 0:
+                    return
+                braces -= 1
+            self._advance()
+        if self.current == start and not self._check('EOF'):
+            self._advance()
+
+    def _synchronize_list(self, terminators: set[str], start: int) -> None:
+        parens = brackets = braces = 0
+        while not self._check('EOF'):
+            kind = self._peek().kind
+            if parens == brackets == braces == 0 and kind in terminators:
+                return
+            if kind == '(':
+                parens += 1
+            elif kind == '[':
+                brackets += 1
+            elif kind == '{':
+                braces += 1
+            elif kind == ')' and parens:
+                parens -= 1
+            elif kind == ']' and brackets:
+                brackets -= 1
+            elif kind == '}' and braces:
+                braces -= 1
+            self._advance()
+        if self.current == start and not self._check('EOF'):
+            self._advance()
+
+
 def parse(
     source: str, source_path: str | Path | None = None
 ) -> list[Statement]:
     return Parser(Lexer(source, source_path=source_path).tokenize()).parse()
+
+
+def parse_recovering(
+    source: str,
+    source_path: str | Path | None = None,
+    max_diagnostics: int = 20,
+) -> ParseResult:
+    if max_diagnostics < 1:
+        raise ValueError('max_diagnostics must be at least 1.')
+    diagnostics: list[ParseDiagnostic] = []
+    lexer = Lexer(source, source_path=source_path)
+    tokens = lexer.tokenize_recovering(diagnostics, max_diagnostics)
+    parser = RecoveringParser(tokens, diagnostics, max_diagnostics)
+    statements = parser.parse()
+    if parser.limit_reached:
+        eof = tokens[-1].span
+        diagnostics.append(ParseDiagnostic(
+            f'Too many syntax errors; stopped after {max_diagnostics} diagnostics.',
+            eof,
+        ))
+    return ParseResult(statements, diagnostics)

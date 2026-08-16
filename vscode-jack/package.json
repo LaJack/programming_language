@@ -42,6 +42,21 @@
         "path": "./syntaxes/jack.tmLanguage.json"
       }
     ],
+    "semanticTokenScopes": [
+      {
+        "language": "jack",
+        "scopes": {
+          "namespace": ["entity.name.namespace"],
+          "type": ["entity.name.type"],
+          "struct": ["entity.name.type.struct"],
+          "function": ["entity.name.function"],
+          "method": ["entity.name.function.member"],
+          "property": ["variable.other.property"],
+          "parameter": ["variable.parameter"],
+          "variable.readonly": ["variable.other.constant"]
+        }
+      }
+    ],
     "breakpoints": [
       {
         "language": "jack"

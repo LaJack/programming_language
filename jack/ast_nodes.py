@@ -19,6 +19,11 @@ class Expression(AstNode):
 
 
 @dataclass
+class InvalidExpression(Expression):
+    message: str
+
+
+@dataclass
 class CompositeExpression(Expression):
     left: Expression
     right: Expression
@@ -94,6 +99,11 @@ class Statement(AstNode):
     source_name: str | None = None
     imports: List[ImportBinding] = field(default_factory=list)
     qualified_imports: List[ImportBinding] = field(default_factory=list)
+
+
+@dataclass
+class InvalidStatement(Statement):
+    message: str
 
 
 @dataclass

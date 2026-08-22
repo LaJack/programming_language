@@ -19,6 +19,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -43,6 +44,7 @@ try:
         StructLiteralField,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -69,6 +71,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -93,6 +96,7 @@ except ImportError:
         StructLiteralField,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -548,6 +552,7 @@ class CompileTimePass:
             ),
             tuple(self._constraint_type_key(error) for error in method.raises),
             method.raises_inferred,
+            method.unsafe,
         )
 
     def _constraint_type_key(self, type_ref: TypeReference) -> str:
@@ -627,6 +632,10 @@ class CompileTimePass:
             return self._apply_for(node, scope)
         if type(node) is Try:
             return self._apply_try(node, scope)
+        if type(node) is UnsafeBlock:
+            if node.comptime:
+                raise CompileTimeError('unsafe blocks cannot be comptime.')
+            return [UnsafeBlock(self._apply_statements(node.body, CompileTimeScope(scope)))]
         if type(node) is Print:
             return self._apply_print_statement(node, scope)
         if type(node) is FunctionDeclaration:
@@ -940,6 +949,7 @@ class CompileTimePass:
                 public=declaration.public,
                 raises=self._apply_raises_clause(declaration.raises, body_scope),
                 raises_inferred=declaration.raises_inferred,
+                unsafe=declaration.unsafe,
             )
         ]
 
@@ -962,6 +972,7 @@ class CompileTimePass:
             extern=True,
             abi=declaration.abi,
             raises=self._apply_raises_clause(declaration.raises, body_scope),
+            unsafe=declaration.unsafe,
         )
 
     def _apply_print_statement(self, prt: Print, scope: CompileTimeScope) -> list[Statement]:
@@ -1084,6 +1095,18 @@ class CompileTimePass:
                 CompositeExpression(left, right, expression.operator),
             )
         if type(expression) is FunctionCall:
+            if expression.function_name == 'Layout.of':
+                expression.function_name = 'layout_of'
+            elif expression.function_name.endswith('$Layout.of'):
+                expression.function_name = (
+                    expression.function_name[:-len('$Layout.of')] + '$layout_of'
+                )
+            elif expression.function_name == 'Layout.array':
+                expression.function_name = 'layout_array'
+            elif expression.function_name.endswith('$Layout.array'):
+                expression.function_name = (
+                    expression.function_name[:-len('$Layout.array')] + '$layout_array'
+                )
             if expression.function_name in self.TYPE_LAYOUT_QUERY_FUNCTIONS:
                 return [], self._eval_comptime_layout_function_call(expression, scope)
             if (
@@ -1101,6 +1124,9 @@ class CompileTimePass:
         if type(expression) is MoveExpression:
             prelude, expr = self._apply_expression(expression.expr, scope)
             return prelude, MoveExpression(expr)
+        if type(expression) is DereferenceExpression:
+            prelude, expr = self._apply_expression(expression.expr, scope)
+            return prelude, DereferenceExpression(expr)
         if type(expression) is IndexExpression:
             if self._expression_has_comptime_root(expression.target, scope):
                 return [], self._eval_comptime_expression(expression, scope)
@@ -1174,6 +1200,13 @@ class CompileTimePass:
     ) -> tuple[list[Statement], FunctionCall]:
         if call.function_name in self.TYPE_LAYOUT_QUERY_FUNCTIONS:
             raise CompileTimeError(f'{call.function_name} must be used as an expression.')
+        if call.function_name.endswith('.cast'):
+            if len(call.parameters) != 1 or type(call.parameters[0]) is not TypeExpression:
+                raise CompileTimeError('Raw pointer cast expects one type argument.')
+            return [], FunctionCall(
+                call.function_name,
+                [TypeExpression(self._apply_type_reference(call.parameters[0].type_ref, scope))],
+            )
 
         argument_preludes: list[Statement] = []
         arguments: list[Expression] = []
@@ -1260,6 +1293,7 @@ class CompileTimePass:
                 qualified_imports=list(declaration.qualified_imports),
                 raises=self._apply_raises_clause(declaration.raises, body_scope),
                 raises_inferred=declaration.raises_inferred,
+                unsafe=declaration.unsafe,
                 span=declaration.span,
             )
             self.generated_variants.append(variant)
@@ -1430,6 +1464,8 @@ class CompileTimePass:
         lowered.array_size = self._apply_array_size(type_ref.array_size, scope)
         lowered.is_slice = type_ref.is_slice
         lowered.borrow = type_ref.borrow
+        lowered.pointer_mode = type_ref.pointer_mode
+        lowered.nullable = type_ref.nullable
         lowered.span = type_ref.span
         return lowered
 
@@ -2874,6 +2910,7 @@ class CompileTimePass:
             qualified_imports=list(declaration.qualified_imports),
             interface_name=declaration.interface_name,
             synthetic=declaration.synthetic,
+            unsafe=declaration.unsafe,
             span=declaration.span,
         )
 
@@ -3393,19 +3430,27 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
     def _eval_composite_operator(
         self, operator: str, left: LiteralExpression, right: LiteralExpression
     ) -> LiteralExpression:
-        if operator == '+':
+        if operator in {'+', '-', '*', '/', '%'}:
             merged_type = self.compile_time_pass._merge_types(left, right)
             if not is_numeric_type(merged_type) or is_raw_byte_type(merged_type):
                 raise CompileTimeError(
                     f'Operator "{operator}" is not implemented for comptime values of type "{merged_type}".'
                 )
             try:
+                operations = {
+                    '+': lambda: left.value + right.value,
+                    '-': lambda: left.value - right.value,
+                    '*': lambda: left.value * right.value,
+                    '/': lambda: left.value / right.value if merged_type in {'f32', 'f64'} else left.value // right.value,
+                    '%': lambda: left.value % right.value,
+                }
+                result = operations[operator]()
                 return LiteralExpression(
-                    cast_builtin_value(left.value + right.value, merged_type), merged_type
+                    cast_builtin_value(result, merged_type), merged_type
                 )
-            except (TypeError, ValueError, OverflowError) as err:
+            except (TypeError, ValueError, OverflowError, ZeroDivisionError) as err:
                 raise CompileTimeError(
-                    f'Cannot convert {left.value + right.value!r} to type "{merged_type}".'
+                    f'Cannot evaluate {merged_type} operator "{operator}".'
                 ) from err
         if operator in {'==', '!=', '<', '>', '<=', '>='}:
             return LiteralExpression(

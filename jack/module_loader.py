@@ -8,6 +8,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -20,6 +21,7 @@ try:
         ImportDeclaration,
         IndexExpression,
         ModuleDeclaration,
+        MoveExpression,
         Print,
         Raise,
         Rethrow,
@@ -28,6 +30,7 @@ try:
         StructLiteralExpression,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -43,6 +46,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -55,6 +59,7 @@ except ImportError:
         ImportDeclaration,
         IndexExpression,
         ModuleDeclaration,
+        MoveExpression,
         Print,
         Raise,
         Rethrow,
@@ -63,6 +68,7 @@ except ImportError:
         StructLiteralExpression,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -491,6 +497,12 @@ class ModuleResolver:
                 used_aliases.update(
                     self._rewrite_statement_list_names(catch.body, context, catch_scope)
                 )
+        elif type(statement) is UnsafeBlock:
+            used_aliases.update(
+                self._rewrite_statement_list_names(
+                    statement.body, context, NameRewriteScope(scope)
+                )
+            )
         elif type(statement) is TypeDeclaration:
             for parameter in statement.parameters:
                 used_aliases.update(self._rewrite_parameter_names(parameter, context))
@@ -626,7 +638,7 @@ class ModuleResolver:
         elif type(expression) is CompositeExpression:
             self._rewrite_expression_names(expression.left, context, scope, used_aliases)
             self._rewrite_expression_names(expression.right, context, scope, used_aliases)
-        elif type(expression) is BorrowExpression:
+        elif type(expression) in {BorrowExpression, MoveExpression, DereferenceExpression}:
             self._rewrite_expression_names(expression.expr, context, scope, used_aliases)
         elif type(expression) is IndexExpression:
             self._rewrite_expression_names(expression.target, context, scope, used_aliases)

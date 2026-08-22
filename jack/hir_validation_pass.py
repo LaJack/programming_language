@@ -104,6 +104,7 @@ class BackendHIRValidator:
             'str',
             'c_void',
             'c_char',
+            'null',
             *self.types,
         }
         if type_ref.name not in known:

@@ -531,8 +531,58 @@ Runtime externs are visible to the interpreter through Python bindings and to
 the C emitter as declarations. `comptime extern` declarations are only callable
 during the compile-time pass and require host bindings.
 
-Opaque C types must be used behind explicit borrows. `c_char` and `c_void` can
-only appear as borrowed types.
+Opaque C types must be used behind explicit borrows or raw pointers. `c_char`
+and `c_void` cannot appear as ordinary by-value objects.
+
+## Unsafe Memory
+
+Unsafe operations are explicit at both declaration and use sites:
+
+```jack
+unsafe extern "c" ?*inout c_void malloc(usize size);
+unsafe extern "c" void free(?*inout c_void pointer);
+
+unsafe void inspect(?*in u8 pointer) {
+    if (pointer != null) {
+        unsafe {
+            u8 first = *pointer;
+        }
+    }
+}
+```
+
+`*in T` and `*inout T` are non-null raw pointers. Prefixing either with `?`
+makes it nullable. Raw pointers are copyable, do not own their pointee, and do
+not extend object or allocation lifetime. `raw(&in value)` and
+`raw(&inout value)` preserve the provenance of an existing place. Dereference,
+typed `offset`, and `cast(T)` require an unsafe context. Nullable pointers must
+first be refined by a `null` comparison; the refinement is lexical to the
+proven branch.
+
+Unsafe code disables none of Jack's ownership or borrow checks. Native code has
+undefined behavior when a raw pointer is null, dangling, misaligned,
+out-of-bounds, or points at storage that does not contain a live compatible
+object. The interpreter diagnoses these cases deterministically where its
+tracked provenance can prove them.
+
+Storage allocation, object initialization, ownership, borrowing, destruction,
+and storage deallocation are separate operations. A consuming destructor is
+declared as `deinit(move self)`. It may move fields from `self`; after its body,
+the compiler destroys each field that remains initialized in reverse
+declaration order. Callers invoke the destructor exactly once and do not
+recursively destroy its fields again.
+
+Partial moves are tracked for fields and constant fixed-array indexes. They are
+allowed only through owned locals and parameters. Globals, borrows, dynamic
+indexes, and ordinary values whose type declares `deinit` cannot be partially
+moved. The exception is a type's own consuming destructor. Reassignment starts
+a new object lifetime for a moved place.
+
+The bootstrap runtime has backend-neutral checked `Layout`, `MaybeUninit`, and
+linear allocation-token primitives in `jack.memory_model`. Their source-level
+language-item API and the `Allocator` interface are still being integrated;
+safe heap containers must not depend on raw `malloc` tokens until that API is
+available.
 
 ## Built-Ins
 
@@ -553,8 +603,10 @@ limitations include:
 
 - no interface inheritance, associated types, default methods, interface
   objects, or dynamic dispatch;
-- no heap allocator model beyond experiments in `std.collections.vector`;
+- the source-level `MaybeUninit`, `Allocation`, and `Allocator` language-item
+  APIs are not exposed yet;
 - no user-facing lifetime syntax;
-- partial moves and non-lexical borrow lifetimes are not supported;
+- partial moves are limited to fields and constant fixed-array indexes, and
+  non-lexical borrow lifetimes are not supported;
 - C emission is useful but not yet a stable ABI contract;
 - the language reference follows the implementation and may change quickly.

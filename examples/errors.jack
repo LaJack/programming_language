@@ -12,7 +12,7 @@ struct ExampleDriver(comptime type Accessor)
         self.device = move device;
     }
 
-    deinit(&inout self)
+    deinit(move self)
     {
         print(f"Example driver deinit.");
     }
@@ -36,7 +36,7 @@ struct CanAccessor
         self.slave_address = slave_address;
     }
     
-    deinit(&inout self)
+    deinit(move self)
     {
         print(f"CanAccessor deinit.");
     }

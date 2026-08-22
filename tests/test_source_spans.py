@@ -56,7 +56,7 @@ class SourceSpanTests(unittest.TestCase):
             source_path = Path(tmpdir) / 'program.jack'
             source = '''
                 struct Tracer {
-                    deinit(&inout self) {
+                    deinit(move self) {
                     }
                 }
 

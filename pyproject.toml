@@ -17,4 +17,4 @@ jack-lsp = "jack.lsp_server:main"
 include = ["jack*"]
 
 [tool.setuptools.package-data]
-jack = ["std/*.jack", "c_runtime/*"]
+jack = ["std/*.jack", "std/**/*.jack", "c_runtime/*"]

@@ -38,7 +38,7 @@ class SemanticPassTests(unittest.TestCase):
                 }
 
                 struct Nope {
-                    deinit(&inout self) raises CleanupError {
+                    deinit(move self) raises CleanupError {
                         CleanupError err;
                         err.code = 1;
                         raise err;

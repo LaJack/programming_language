@@ -124,6 +124,7 @@ class HIRFunctionDeclaration(HIRDeclaration):
     abi: str | None = None
     interface_name: str | None = None
     synthetic: bool = False
+    unsafe: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -167,6 +168,28 @@ class HIRBorrowExpression(HIRExpression):
 @dataclass(frozen=True, kw_only=True)
 class HIRMoveExpression(HIRExpression):
     expr: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRDereferenceExpression(HIRExpression):
+    expr: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRRawAddressExpression(HIRExpression):
+    mode: str
+    expr: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRPointerOffsetExpression(HIRExpression):
+    pointer: HIRExpression
+    offset: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRPointerCastExpression(HIRExpression):
+    pointer: HIRExpression
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -305,3 +328,8 @@ class HIRCatchClause(HIRNode):
 class HIRTry(HIRStatement):
     body: list[HIRStatement]
     catches: list[HIRCatchClause]
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRUnsafeBlock(HIRStatement):
+    body: list[HIRStatement]

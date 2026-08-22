@@ -1,0 +1,8 @@
+module bootstrap.source;
+
+pub struct SourceSpan {
+    usize start;
+    usize end;
+    usize line;
+    usize column;
+}

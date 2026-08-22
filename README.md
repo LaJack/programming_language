@@ -238,7 +238,7 @@ struct CanDriver {
         self.slave_address = slave_address;
     }
 
-    deinit(&inout self) {
+    deinit(move self) {
         print(self.slave_address);
     }
 }

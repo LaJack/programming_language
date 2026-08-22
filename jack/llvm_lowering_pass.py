@@ -13,6 +13,7 @@ from .hir_nodes import (
     HIRBorrowExpression,
     HIRCallExpression,
     HIRCompositeExpression,
+    HIRDereferenceExpression,
     HIRDeclaration,
     HIRExpression,
     HIRExpressionStatement,
@@ -25,8 +26,11 @@ from .hir_nodes import (
     HIRIndexExpression,
     HIRLiteralExpression,
     HIRMoveExpression,
+    HIRPointerCastExpression,
+    HIRPointerOffsetExpression,
     HIRPrint,
     HIRProgram,
+    HIRRawAddressExpression,
     HIRRaise,
     HIRRethrow,
     HIRReturn,
@@ -34,6 +38,7 @@ from .hir_nodes import (
     HIRStatement,
     HIRStructLiteralExpression,
     HIRTry,
+    HIRUnsafeBlock,
     HIRTypeDeclaration,
     HIRVariableDeclaration,
     HIRVariableExpression,
@@ -500,6 +505,9 @@ class LLVMLoweringPass:
         if isinstance(statement, HIRTry):
             self._try(statement, env)
             return
+        if isinstance(statement, HIRUnsafeBlock):
+            self._scoped_statements(statement.body, dict(env), statement.span)
+            return
         raise LLVMLoweringError(
             f'Unsupported HIR statement {type(statement).__name__}.', statement.span
         )
@@ -671,6 +679,29 @@ class LLVMLoweringPass:
             return self._borrow(expression, env)
         if isinstance(expression, HIRMoveExpression):
             return self._expression(expression.expr, env)
+        if isinstance(expression, HIRDereferenceExpression):
+            pointer = self._expression(expression.expr, env)
+            type_name = self._type(expression.type_ref)
+            value = self._b.temp('deref')
+            self._b.emit(f'{value} = load {type_name}, ptr {pointer.operand}')
+            return LLVMValue(type_name, value, expression.type_ref)
+        if isinstance(expression, HIRRawAddressExpression):
+            pointer, _ = self._lvalue(expression.expr, env)
+            return LLVMValue('ptr', pointer, expression.type_ref)
+        if isinstance(expression, HIRPointerOffsetExpression):
+            pointer = self._expression(expression.pointer, env)
+            offset = self._expression(expression.offset, env)
+            offset64 = self._integer_as_i64(offset)
+            result = self._b.temp('ptr.offset')
+            element = self._element_type(expression.type_ref)
+            self._b.emit(
+                f'{result} = getelementptr {self._type(element)}, ptr '
+                f'{pointer.operand}, i64 {offset64}'
+            )
+            return LLVMValue('ptr', result, expression.type_ref)
+        if isinstance(expression, HIRPointerCastExpression):
+            pointer = self._expression(expression.pointer, env)
+            return LLVMValue('ptr', pointer.operand, expression.type_ref)
         if isinstance(expression, HIRSliceExpression):
             return self._slice(expression, env, mutable=True)
         if isinstance(expression, HIRCompositeExpression):
@@ -728,6 +759,9 @@ class LLVMLoweringPass:
             else:
                 self._b.emit(f'{pointer} = getelementptr {self._type(element_type)}, ptr {target_ptr}, i64 {index_operand}')
             return pointer, element_type
+        if isinstance(expression, HIRDereferenceExpression):
+            pointer = self._expression(expression.expr, env)
+            return pointer.operand, expression.type_ref
         raise LLVMLoweringError(
             f'Expression {type(expression).__name__} is not assignable.', expression.span
         )
@@ -745,7 +779,9 @@ class LLVMLoweringPass:
 
     def _literal(self, expression: HIRLiteralExpression) -> LLVMValue:
         type_name = self._type(expression.type_ref)
-        if expression.literal_type == 'str':
+        if expression.literal_type == 'null':
+            operand = 'null'
+        elif expression.literal_type == 'str':
             data = str(expression.value).encode('utf-8')
             name = self._string(data)
             operand = (
@@ -1214,6 +1250,8 @@ class LLVMLoweringPass:
         return f'{owner}.{declaration.name}' if owner is not None else declaration.name
 
     def _type(self, type_ref: TypeReference) -> str:
+        if type_ref.pointer_mode is not None:
+            return 'ptr'
         if type_ref.borrow is not None:
             if type_ref.name in self.views:
                 return self._named_type(type_ref.name)

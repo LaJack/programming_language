@@ -30,6 +30,7 @@ try:
         HIRCallExpression,
         HIRCatchClause,
         HIRCompositeExpression,
+        HIRDereferenceExpression,
         HIRDeclaration,
         HIRExpression,
         HIRExpressionStatement,
@@ -42,14 +43,18 @@ try:
         HIRIndexExpression,
         HIRLiteralExpression,
         HIRMoveExpression,
+        HIRPointerCastExpression,
+        HIRPointerOffsetExpression,
         HIRPrint,
         HIRProgram,
+        HIRRawAddressExpression,
         HIRRaise,
         HIRRethrow,
         HIRReturn,
         HIRSliceExpression,
         HIRStatement,
         HIRTry,
+        HIRUnsafeBlock,
         HIRStructLiteralExpression,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
@@ -86,6 +91,7 @@ except ImportError:
         HIRCallExpression,
         HIRCatchClause,
         HIRCompositeExpression,
+        HIRDereferenceExpression,
         HIRDeclaration,
         HIRExpression,
         HIRExpressionStatement,
@@ -98,14 +104,18 @@ except ImportError:
         HIRIndexExpression,
         HIRLiteralExpression,
         HIRMoveExpression,
+        HIRPointerCastExpression,
+        HIRPointerOffsetExpression,
         HIRPrint,
         HIRProgram,
+        HIRRawAddressExpression,
         HIRRaise,
         HIRRethrow,
         HIRReturn,
         HIRSliceExpression,
         HIRStatement,
         HIRTry,
+        HIRUnsafeBlock,
         HIRStructLiteralExpression,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
@@ -621,6 +631,12 @@ class CEmitPass:
                 for declaration in header_views
             )
         )
+        public_api_nodes = [
+            *header_globals,
+            *header_functions,
+            *(method for _, method in header_methods),
+        ]
+        lines.extend(self._emit_slice_type_declarations_for(public_api_nodes))
         lines.extend(
             self._emit_hir_global_variable_extern_declaration(declaration)
             for declaration in header_globals
@@ -1414,6 +1430,10 @@ class CEmitPass:
             return self._emit_hir_try(statement, env)
         if isinstance(statement, HIRBlock):
             return self._emit_hir_scoped_block(statement, env)
+        if isinstance(statement, HIRUnsafeBlock):
+            return self._emit_hir_scoped_block(
+                HIRBlock(body=statement.body, span=statement.span), env
+            )
         raise CEmitError(f'Unknown HIR statement type "{type(statement).__name__}".')
 
     def _with_source_directive(self, lines: list[str], node: object) -> list[str]:
@@ -1874,6 +1894,20 @@ class CEmitPass:
             return self._emit_hir_borrow_expression(expression, env)
         if isinstance(expression, HIRMoveExpression):
             return self._emit_hir_expression(expression.expr, env)
+        if isinstance(expression, HIRDereferenceExpression):
+            return f'(*{self._emit_hir_expression(expression.expr, env)})'
+        if isinstance(expression, HIRRawAddressExpression):
+            return f'(&{self._emit_hir_expression(expression.expr, env)})'
+        if isinstance(expression, HIRPointerOffsetExpression):
+            return (
+                f'({self._emit_hir_expression(expression.pointer, env)} + '
+                f'{self._emit_hir_value_expression(expression.offset, env)})'
+            )
+        if isinstance(expression, HIRPointerCastExpression):
+            return (
+                f'(({self._emit_type(self._element_type(expression.type_ref))} *)'
+                f'{self._emit_hir_expression(expression.pointer, env)})'
+            )
         raise CEmitError(f'Unknown HIR expression type "{type(expression).__name__}".')
 
     def _emit_hir_field_access(
@@ -2302,6 +2336,8 @@ class CEmitPass:
 
 
     def _emit_literal_value(self, value: object, literal_type: str) -> str:
+        if literal_type == 'null':
+            return 'NULL'
         if is_builtin_type(literal_type):
             if literal_type == 'bool':
                 return 'true' if value else 'false'
@@ -2335,6 +2371,9 @@ class CEmitPass:
     def _emit_declaration(
         self, type_ref: TypeReference, name: str, env: dict[str, TypeReference]
     ) -> str:
+        if type_ref.pointer_mode is not None:
+            const_prefix = 'const ' if type_ref.pointer_mode == 'in' else ''
+            return f'{const_prefix}{self._emit_type(self._element_type(type_ref))} *{name}'
         if self._is_view_borrow_type(type_ref):
             return f'{self._emit_type(self._element_type(type_ref))} {name}'
         if self._is_borrow_type(type_ref):
@@ -2392,17 +2431,41 @@ class CEmitPass:
 
 
     def _emit_slice_type_declarations(self) -> list[str]:
+        return self._emit_selected_slice_type_declarations(set(self.slice_types))
+
+
+    def _emit_slice_type_declarations_for(self, nodes: Iterable[object]) -> list[str]:
+        selected: set[tuple[str, bool]] = set()
+        for node in nodes:
+            for child in self._walk_hir(node):
+                if isinstance(child, TypeReference) and self._is_slice_type(child):
+                    element = self._element_type(child)
+                    selected.add(
+                        (self._type_key(element), borrow_mode_can_write(child.borrow))
+                    )
+        return self._emit_selected_slice_type_declarations(selected)
+
+
+    def _emit_selected_slice_type_declarations(
+        self, selected: set[tuple[str, bool]]
+    ) -> list[str]:
         lines: list[str] = []
         for (element_key, mutable), name in sorted(self.slice_types.items(), key=lambda item: item[1]):
+            if (element_key, mutable) not in selected:
+                continue
             if self._runtime_declares_slice_type(element_key):
                 continue
             element_type = self._type_from_key(element_key)
             const_prefix = '' if mutable else 'const '
+            guard = f'{name.upper()}_DEFINED'
             lines.extend([
+                f'#ifndef {guard}',
+                f'#define {guard}',
                 f'typedef struct {name} {{',
                 f'    {const_prefix}{self._emit_type(element_type)} *data;',
                 '    int32_t len;',
                 f'}} {name};',
+                '#endif',
                 '',
             ])
         return lines
@@ -2455,6 +2518,7 @@ class CEmitPass:
                 type_ref.array_size is not None
                 or type_ref.is_slice
                 or type_ref.borrow is not None
+                or type_ref.pointer_mode is not None
             )
 
         if has_modifier:
@@ -2511,6 +2575,9 @@ class CEmitPass:
             name = f'{name}[]'
         if type_ref.borrow is not None:
             name = f'&{type_ref.borrow} {name}'
+        elif type_ref.pointer_mode is not None:
+            prefix = '?' if type_ref.nullable else ''
+            name = f'{prefix}*{type_ref.pointer_mode} {name}'
         return name
 
     def _type_key(self, expression: object) -> str:

@@ -1,7 +1,20 @@
 import sys
 
 from .builtin_types import JackPrimitiveValue
-from .interpreter import ExternHandler, JackArray, JackArrayElementBorrow, JackBorrow, JackSlice
+from .interpreter import (
+    ExternHandler,
+    JackAllocationRecord,
+    JackArray,
+    JackArrayElementBorrow,
+    JackBorrow,
+    JackRawPointer,
+    JackSlice,
+    _UNINITIALIZED_VALUE,
+)
+from .source_model import TypeReference
+
+
+_next_allocation_identity = 1
 
 
 def default_runtime_externs(stdout: object | None = None) -> dict[str, ExternHandler]:
@@ -13,7 +26,42 @@ def default_runtime_externs(stdout: object | None = None) -> dict[str, ExternHan
         'fread': fread,
         'fclose': fclose,
         'fwrite': fwrite,
+        'malloc': malloc,
+        'free': free,
     }
+
+
+def malloc(size: object) -> JackRawPointer | None:
+    global _next_allocation_identity
+    byte_count = _as_int(size)
+    if byte_count < 0:
+        raise ValueError('malloc size must be non-negative.')
+    # Keep a unique address even for zero-sized allocations.
+    storage = JackArray(
+        TypeReference('b8'),
+        [_UNINITIALIZED_VALUE for _ in range(max(1, byte_count))],
+    )
+    record = JackAllocationRecord(
+        _next_allocation_identity, storage, alignment=16
+    )
+    _next_allocation_identity += 1
+    return JackRawPointer(
+        JackArrayElementBorrow(storage, 0, mutable=True, mode='inout'),
+        mutable=True,
+        allocation=record,
+    )
+
+
+def free(pointer: object) -> None:
+    if pointer is None:
+        return
+    if not isinstance(pointer, JackRawPointer) or pointer.allocation is None:
+        raise ValueError('free requires a pointer returned by malloc.')
+    if not pointer.allocation.live:
+        raise ValueError(
+            f'allocation {pointer.allocation.identity} was already freed.'
+        )
+    pointer.allocation.live = False
 
 
 def fopen(path: object, mode: object) -> JackBorrow:

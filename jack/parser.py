@@ -8,6 +8,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -35,6 +36,7 @@ try:
         SourceSpan,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -51,6 +53,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -78,6 +81,7 @@ except ImportError:
         SourceSpan,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -140,7 +144,7 @@ class ParseResult:
 
 
 class Lexer:
-    SYMBOLS = set('{}();,:+.=<>![]&')
+    SYMBOLS = set('{}();,:+-.=<>![]&*?/%')
     TWO_CHAR_SYMBOLS = {'==', '!=', '<=', '>=', '..'}
 
     def __init__(self, source: str, source_path: str | Path | None = None) -> None:
@@ -449,6 +453,7 @@ class Parser:
         'interface',
         'module',
         'move',
+        'null',
         'in',
         'inout',
         'out',
@@ -461,10 +466,13 @@ class Parser:
         'struct',
         'true',
         'try',
+        'unsafe',
         'view',
         'while',
     }
-    STATEMENT_KEYWORDS = {'for', 'if', 'print', 'raise', 'return', 'rethrow', 'try', 'while'}
+    STATEMENT_KEYWORDS = {
+        'for', 'if', 'print', 'raise', 'return', 'rethrow', 'try', 'while',
+    }
 
     def __init__(self, tokens: list[Token]) -> None:
         self.tokens = tokens
@@ -515,18 +523,26 @@ class Parser:
 
         is_public = self._match_keyword('pub')
         is_comptime = self._match_keyword('comptime')
+        is_unsafe = self._match_keyword('unsafe')
         is_extern = self._match_keyword('extern')
         extern_abi = self._extern_abi() if is_extern else None
 
+        if is_unsafe and self._check('{'):
+            if is_public or is_comptime or is_extern:
+                raise self._error(
+                    self._peek(), 'unsafe blocks cannot have declaration modifiers.'
+                )
+            return UnsafeBlock(self._block())
+
         if self._match_keyword('interface'):
-            if is_comptime or is_extern:
-                raise self._error(self._previous(), 'interface cannot be comptime or extern.')
+            if is_comptime or is_unsafe or is_extern:
+                raise self._error(self._previous(), 'interface cannot be comptime, unsafe, or extern.')
             declaration = self._interface_declaration()
             declaration.public = is_public
             return declaration
 
         if self._looks_like_implementation():
-            if is_public or is_comptime or is_extern:
+            if is_public or is_comptime or is_unsafe or is_extern:
                 raise self._error(self._peek(), 'implementation declarations cannot have modifiers.')
             return self._implementation_declaration()
 
@@ -538,11 +554,15 @@ class Parser:
                 raise self._error(self._peek(), 'pub can only mark declarations.')
             if is_extern:
                 raise self._error(self._peek(), 'extern can only mark type, variable, or function declarations.')
+            if is_unsafe:
+                raise self._error(self._peek(), 'unsafe can only mark function declarations or blocks.')
             statement = self._statement()
             statement.comptime = is_comptime
             return statement
 
         if is_extern and self._match_keyword('type'):
+            if is_unsafe:
+                raise self._error(self._previous(), 'unsafe cannot mark extern type declarations.')
             name = self._identifier_value('Expected extern type name.')
             self._consume(';', 'Expected ; after extern type declaration.')
             declaration = TypeDeclaration(name, [], extern=True, abi=extern_abi)
@@ -550,8 +570,8 @@ class Parser:
             declaration.public = is_public
             return declaration
         if self._match_keyword('struct'):
-            if is_extern:
-                raise self._error(self._previous(), 'extern can only mark type, variable, or function declarations.')
+            if is_extern or is_unsafe:
+                raise self._error(self._previous(), 'struct cannot be unsafe or extern.')
             declaration = self._type_declaration()
             declaration.comptime = is_comptime
             declaration.public = is_public
@@ -562,6 +582,8 @@ class Parser:
                 raise self._error(self._previous(), 'extern can only mark type, variable, or function declarations.')
             if is_comptime:
                 raise self._error(self._previous(), 'comptime cannot mark view declarations.')
+            if is_unsafe:
+                raise self._error(self._previous(), 'unsafe cannot mark view declarations.')
             declaration = self._view_declaration()
             declaration.public = is_public
             return declaration
@@ -579,13 +601,17 @@ class Parser:
                     if self._check('('):
                         if is_extern:
                             self._advance()
-                            declaration = self._finish_extern_function_declaration(name, declared_type, is_comptime, extern_abi)
+                            declaration = self._finish_extern_function_declaration(
+                                name, declared_type, is_comptime, extern_abi, is_unsafe
+                            )
                             declaration.public = is_public
                             return declaration
 
                         if self._matching_paren_is_followed_by_function_suffix():
                             self._advance()
-                            declaration = self._finish_function_declaration(name, declared_type, is_comptime)
+                            declaration = self._finish_function_declaration(
+                                name, declared_type, is_comptime, is_unsafe
+                            )
                             declaration.public = is_public
                             return declaration
 
@@ -601,6 +627,8 @@ class Parser:
                         )
 
                     if is_extern:
+                        if is_unsafe:
+                            raise self._error(self._previous(), 'unsafe extern variables are not supported.')
                         self._consume(';', 'Expected ; after extern variable declaration.')
                         return VariableDeclaration(
                             name,
@@ -624,6 +652,8 @@ class Parser:
             raise self._error(self._peek(), 'pub can only mark declarations.')
         if is_extern:
             raise self._error(self._peek(), 'extern can only mark type, variable, or function declarations.')
+        if is_unsafe:
+            raise self._error(self._peek(), 'unsafe can only mark function declarations or blocks.')
         statement = self._statement()
         statement.comptime = is_comptime
         return statement
@@ -688,12 +718,14 @@ class Parser:
                 raise self._error(self._peek(), 'Expected } after struct members.')
             member_start_token = self._peek()
             member_comptime = self._match_keyword('comptime')
+            member_unsafe = self._match_keyword('unsafe')
             if self._check_special_method_name() and self._check_next('('):
                 member_name = self._identifier_value('Expected method name.')
                 self._consume('(', f'Expected ( after {member_name}.')
                 method = self._with_span(
                     self._finish_function_declaration(
-                        member_name, TypeReference('void'), member_comptime
+                        member_name, TypeReference('void'), member_comptime,
+                        member_unsafe,
                     ),
                     member_start_token,
                 )
@@ -705,7 +737,9 @@ class Parser:
 
             if self._match('('):
                 method = self._with_span(
-                    self._finish_function_declaration(member_name, member_type, member_comptime),
+                    self._finish_function_declaration(
+                        member_name, member_type, member_comptime, member_unsafe
+                    ),
                     member_start_token,
                 )
                 methods.append(self._method_declaration(name, method))
@@ -738,6 +772,7 @@ class Parser:
     def _interface_method(self) -> FunctionDeclaration:
         start = self._peek()
         is_comptime = self._match_keyword('comptime')
+        is_unsafe = self._match_keyword('unsafe')
         if self._check_special_method_name() and self._check_next('('):
             name = self._identifier_value('Expected interface method name.')
             return_type = TypeReference('void')
@@ -751,6 +786,7 @@ class Parser:
         method = FunctionDeclaration(
             name, parameters, [], return_type, comptime=is_comptime,
             raises=raises, raises_inferred=raises_inferred,
+            unsafe=is_unsafe,
         )
         return self._with_span(self._method_declaration('Self', method), start)
 
@@ -803,6 +839,7 @@ class Parser:
                 continue
             method_start = self._peek()
             is_comptime = self._match_keyword('comptime')
+            is_unsafe = self._match_keyword('unsafe')
             if self._check_special_method_name() and self._check_next('('):
                 name = self._identifier_value('Expected implementation method name.')
                 return_type = TypeReference('void')
@@ -811,7 +848,9 @@ class Parser:
                 name = self._identifier_value('Expected implementation method name.')
             self._consume('(', f'Expected ( after {name}.')
             method = self._with_span(
-                self._finish_function_declaration(name, return_type, is_comptime),
+                self._finish_function_declaration(
+                    name, return_type, is_comptime, is_unsafe
+                ),
                 method_start,
             )
             methods.append(self._method_declaration('Self', method))
@@ -850,7 +889,8 @@ class Parser:
         return ViewDeclaration(name, fields)
 
     def _finish_function_declaration(
-        self, name: str, return_type: TypeReference, is_comptime: bool
+        self, name: str, return_type: TypeReference, is_comptime: bool,
+        is_unsafe: bool = False,
     ) -> FunctionDeclaration:
         parameters = self._function_parameters()
         raises, raises_inferred = self._raises_clause()
@@ -863,10 +903,12 @@ class Parser:
             comptime=is_comptime,
             raises=raises,
             raises_inferred=raises_inferred,
+            unsafe=is_unsafe,
         )
 
     def _finish_extern_function_declaration(
-        self, name: str, return_type: TypeReference, is_comptime: bool, abi: str | None
+        self, name: str, return_type: TypeReference, is_comptime: bool,
+        abi: str | None, is_unsafe: bool = False,
     ) -> FunctionDeclaration:
         parameters = self._function_parameters()
         raises, raises_inferred = self._raises_clause()
@@ -881,6 +923,7 @@ class Parser:
             abi=abi,
             raises=raises,
             raises_inferred=raises_inferred,
+            unsafe=is_unsafe,
         )
 
     def _extern_abi(self) -> str | None:
@@ -913,6 +956,20 @@ class Parser:
         start_token = self._peek()
         is_comptime = self._match_keyword('comptime')
         passing_mode = 'move' if self._match_keyword('move') else 'copy'
+        if (
+            passing_mode == 'move'
+            and self._check('IDENT')
+            and self._peek().value == 'self'
+        ):
+            self_token = self._advance()
+            return self._with_span(
+                VariableDeclaration(
+                    'self', TypeReference('self'), comptime=is_comptime,
+                    passing_mode='move',
+                ),
+                start_token,
+                self_token,
+            )
         shorthand_start = self.current
         if self._match('&'):
             borrow_token = self._previous()
@@ -959,6 +1016,35 @@ class Parser:
         return self._type_reference()
 
     def _type_reference_inner(self) -> TypeReference:
+        nullable = self._match('?')
+        if nullable and not self._check('*'):
+            raise self._error(
+                self._peek(),
+                'Nullable types are currently restricted to raw pointers.',
+            )
+        if self._match('*'):
+            pointer_mode = None
+            for mode in ('inout', 'in'):
+                if self._match_keyword(mode):
+                    pointer_mode = mode
+                    break
+            if pointer_mode is None:
+                raise self._error(
+                    self._peek(), 'Expected in or inout after * in raw pointer type.'
+                )
+            pointee = self._type_reference()
+            if pointee.borrow is not None or pointee.pointer_mode is not None:
+                raise self._error(
+                    self._previous(), 'Raw pointer pointee must be an object type.'
+                )
+            return TypeReference(
+                pointee.name,
+                pointee.arguments,
+                array_size=pointee.array_size,
+                is_slice=pointee.is_slice,
+                pointer_mode=pointer_mode,
+                nullable=nullable,
+            )
         borrow = None
         if self._match('&'):
             borrow = self._borrow_mode('in type reference')
@@ -985,7 +1071,7 @@ class Parser:
         return TypeReference(name, arguments, array_size=array_size, is_slice=is_slice, borrow=borrow)
 
     def _type_argument(self) -> object:
-        if self._check('&'):
+        if self._check('&') or self._check('*') or self._check('?'):
             return self._type_reference()
         if self._check_keyword('bool') and self._check_next_type_suffix_or_arguments():
             return self._type_reference()
@@ -997,7 +1083,10 @@ class Parser:
         return self._check_next('(') or self._check_next('[')
 
     def _can_start_type_reference(self) -> bool:
-        return self._check('&') or self._check('IDENT')
+        return (
+            self._check('&') or self._check('*') or self._check('?')
+            or self._check('IDENT')
+        )
 
     def _block(self) -> list[Statement]:
         self._consume('{', 'Expected { before block.')
@@ -1016,6 +1105,9 @@ class Parser:
         return self._with_span(self._statement_inner(), start_token)
 
     def _statement_inner(self) -> Statement:
+        if self._match_keyword('unsafe'):
+            return UnsafeBlock(self._block())
+
         if self._match_keyword('raise'):
             return self._raise_statement()
 
@@ -1149,12 +1241,13 @@ class Parser:
 
     def _simple_statement(self, consume_semicolon: bool) -> Statement:
         start = self.current
-        target_name = self._name()
-        if self._match('('):
-            call = self._finish_function_call(target_name)
-            if consume_semicolon:
-                self._consume(';', 'Expected ; after function call.')
-            return call
+        if self._check('IDENT'):
+            target_name = self._name()
+            if self._match('('):
+                call = self._finish_function_call(target_name)
+                if consume_semicolon:
+                    self._consume(';', 'Expected ; after function call.')
+                return call
 
         self.current = start
         target = self._assignment_target()
@@ -1183,13 +1276,21 @@ class Parser:
         return expr
 
     def _addition(self) -> Expression:
-        expr = self._borrow()
+        expr = self._multiplication()
 
-        while self._match('+'):
+        while self._match('+', '-'):
+            operator = self._previous().value
+            right = self._multiplication()
+            expr = CompositeExpression(expr, right, operator)
+
+        return expr
+
+    def _multiplication(self) -> Expression:
+        expr = self._borrow()
+        while self._match('*', '/', '%'):
             operator = self._previous().value
             right = self._borrow()
             expr = CompositeExpression(expr, right, operator)
-
         return expr
 
     def _borrow(self) -> Expression:
@@ -1197,7 +1298,9 @@ class Parser:
             return MoveExpression(self._postfix())
         if self._match('&'):
             mode = self._borrow_mode('')
-            return BorrowExpression(mode, self._postfix())
+            return BorrowExpression(mode, self._borrow())
+        if self._match('*'):
+            return DereferenceExpression(self._borrow())
         return self._postfix()
 
     def _borrow_mode(self, context: str) -> str:
@@ -1231,9 +1334,14 @@ class Parser:
         return expr
 
     def _assignment_target(self) -> Expression:
+        if self._match('*'):
+            return DereferenceExpression(self._borrow())
         return self._postfix_from(VariableExpression(self._name()))
 
     def _primary(self) -> Expression:
+        if self._match_keyword('null'):
+            return LiteralExpression(None, 'null')
+
         if self._match_keyword('true'):
             return LiteralExpression(True, 'bool')
 
@@ -1296,7 +1404,7 @@ class Parser:
         return StructLiteralExpression(type_ref, fields)
 
     def _finish_function_call(self, function_name: str) -> FunctionCall:
-        if function_name in {'sizeof', 'alignof'}:
+        if function_name in {'sizeof', 'alignof'} or function_name.endswith('.cast'):
             return FunctionCall(function_name, self._finish_type_query_argument_list(function_name))
         return FunctionCall(function_name, self._finish_argument_list('function'))
 
@@ -1596,7 +1704,7 @@ class RecoveringParser(Parser):
     RECOVERY_KEYWORDS = {
         'catch', 'comptime', 'elif', 'else', 'extern', 'for', 'if', 'import',
         'interface', 'module', 'print', 'pub', 'raise', 'rethrow', 'return',
-        'struct', 'try', 'use', 'view', 'while',
+        'struct', 'try', 'unsafe', 'use', 'view', 'while',
     }
 
     def __init__(

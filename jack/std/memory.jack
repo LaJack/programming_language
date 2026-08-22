@@ -1,0 +1,85 @@
+module std.memory;
+
+pub struct LayoutError { }
+pub struct AllocationError { }
+
+pub struct Layout {
+    usize byte_size;
+    usize byte_alignment;
+
+    usize size(&in self) { return self.byte_size; }
+    usize alignment(&in self) { return self.byte_alignment; }
+}
+
+pub Layout layout_of(comptime type T) {
+    return Layout {
+        byte_size = sizeof(T),
+        byte_alignment = alignof(T)
+    };
+}
+
+pub Layout layout_array(comptime type T, usize count) raises LayoutError {
+    Layout element = Layout {
+        byte_size = sizeof(T),
+        byte_alignment = alignof(T)
+    };
+    usize element_size = element.size();
+    if (element_size != usize(0)) {
+        usize maximum = 18446744073709551615;
+        if (count > maximum / element_size) {
+            raise LayoutError { };
+        }
+    }
+    return Layout {
+        byte_size = element_size * count,
+        byte_alignment = element.alignment()
+    };
+}
+
+pub struct Allocation {
+    *inout b8 address;
+    Layout layout;
+    usize allocator_identity;
+
+    deinit(move self) { }
+}
+
+pub interface Allocator {
+    Allocation allocate(&inout self, Layout layout)
+        raises AllocationError;
+
+    unsafe void deallocate(&inout self, move Allocation allocation);
+}
+
+unsafe extern "c" ?*inout c_void malloc(usize size);
+unsafe extern "c" void free(?*inout c_void pointer);
+
+pub struct SystemAllocator {
+    usize identity;
+
+    init(&inout self) {
+        self.identity = 1;
+    }
+}
+
+SystemAllocator implements Allocator {
+    Allocation allocate(&inout self, Layout layout)
+        raises AllocationError
+    {
+        unsafe {
+            ?*inout c_void storage = malloc(layout.size());
+            if (storage != null) {
+                return Allocation {
+                    address = storage.cast(b8),
+                    layout = layout,
+                    allocator_identity = self.identity
+                };
+            }
+        }
+        raise AllocationError { };
+    }
+
+    unsafe void deallocate(&inout self, move Allocation allocation) {
+        free(allocation.address.cast(c_void));
+    }
+}

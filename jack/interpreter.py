@@ -26,6 +26,7 @@ try:
         HIRCallExpression,
         HIRCallTarget,
         HIRCompositeExpression,
+        HIRDereferenceExpression,
         HIRDeclaration,
         HIRExpression,
         HIRExpressionStatement,
@@ -38,14 +39,18 @@ try:
         HIRIndexExpression,
         HIRLiteralExpression,
         HIRMoveExpression,
+        HIRPointerCastExpression,
+        HIRPointerOffsetExpression,
         HIRPrint,
         HIRProgram,
+        HIRRawAddressExpression,
         HIRRaise,
         HIRRethrow,
         HIRReturn,
         HIRSliceExpression,
         HIRStatement,
         HIRTry,
+        HIRUnsafeBlock,
         HIRStructLiteralExpression,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
@@ -78,6 +83,7 @@ except ImportError:
         HIRCallExpression,
         HIRCallTarget,
         HIRCompositeExpression,
+        HIRDereferenceExpression,
         HIRDeclaration,
         HIRExpression,
         HIRExpressionStatement,
@@ -90,14 +96,18 @@ except ImportError:
         HIRIndexExpression,
         HIRLiteralExpression,
         HIRMoveExpression,
+        HIRPointerCastExpression,
+        HIRPointerOffsetExpression,
         HIRPrint,
         HIRProgram,
+        HIRRawAddressExpression,
         HIRRaise,
         HIRRethrow,
         HIRReturn,
         HIRSliceExpression,
         HIRStatement,
         HIRTry,
+        HIRUnsafeBlock,
         HIRStructLiteralExpression,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
@@ -215,6 +225,34 @@ class JackBorrow:
         return self.mode
 
 
+class JackSymbolBorrow(JackBorrow):
+    def __init__(
+        self, scope: 'SymbolTable', name: str, mutable: bool = False,
+        mode: str = 'in', field_modes: dict[str, str] | None = None,
+    ) -> None:
+        self.scope = scope
+        self.name = name
+        self.mode = 'inout' if mutable and mode == 'in' else mode
+        self.mutable = borrow_mode_can_write(self.mode)
+        self.field_modes = field_modes
+
+    @property
+    def value(self) -> object:
+        return self.scope.get(self.name)
+
+    @value.setter
+    def value(self, value: object) -> None:
+        if not self.mutable:
+            raise EvaluationError('Cannot assign through a read-only borrow.')
+        self.scope.assign(self.name, value)
+
+    def __deepcopy__(self, memo):
+        field_modes = None if self.field_modes is None else dict(self.field_modes)
+        return JackSymbolBorrow(
+            self.scope, self.name, self.mutable, self.mode, field_modes
+        )
+
+
 @dataclass
 class JackArrayElementBorrow:
     array: JackArray
@@ -260,7 +298,71 @@ class JackArrayElementBorrow:
         return self.mode
 
 
+@dataclass
+class JackRawPointer:
+    target: JackBorrow | JackArrayElementBorrow
+    mutable: bool
+    allocation: 'JackAllocationRecord | None' = None
+
+    def __deepcopy__(self, memo):
+        return JackRawPointer(self.target, self.mutable, self.allocation)
+
+    def get(self) -> object:
+        self._require_live()
+        if isinstance(self.target, JackArrayElementBorrow):
+            value = self.target.value
+        else:
+            value = self.target.value
+        if value is _UNINITIALIZED_VALUE:
+            raise EvaluationError('Cannot read uninitialized allocation storage.')
+        return value
+
+    def set(self, value: object) -> None:
+        self._require_live()
+        if not self.mutable:
+            raise EvaluationError('Cannot write through a *in raw pointer.')
+        if isinstance(self.target, JackArrayElementBorrow):
+            self.target.value = value
+        else:
+            self.target.value = value
+
+    def offset(self, count: int) -> 'JackRawPointer':
+        self._require_live()
+        if not isinstance(self.target, JackArrayElementBorrow):
+            if count != 0:
+                raise EvaluationError('Cannot offset a raw pointer without array provenance.')
+            return self
+        index = self.target.index + count
+        if index < 0 or index >= len(self.target.array.values):
+            raise EvaluationError('Raw pointer offset is out of bounds.')
+        return JackRawPointer(
+            JackArrayElementBorrow(
+                self.target.array,
+                index,
+                mutable=self.mutable,
+                mode='inout' if self.mutable else 'in',
+            ),
+            self.mutable,
+            self.allocation,
+        )
+
+    def _require_live(self) -> None:
+        if self.allocation is not None and not self.allocation.live:
+            raise EvaluationError(
+                f'Raw pointer uses freed allocation {self.allocation.identity}.'
+            )
+
+
+@dataclass
+class JackAllocationRecord:
+    identity: int
+    storage: JackArray
+    alignment: int
+    live: bool = True
+
+
 _MOVED_VALUE = object()
+_UNINITIALIZED_VALUE = object()
 
 
 class SymbolTable:
@@ -542,6 +644,8 @@ class Interpreter:
             return self._execute_hir_try(statement, scope, allow_return)
         elif isinstance(statement, HIRBlock):
             return self._execute_hir_block(statement.body, scope, allow_return)
+        elif isinstance(statement, HIRUnsafeBlock):
+            return self._execute_hir_block(statement.body, scope, allow_return)
         else:
             raise EvaluationError(f'Unknown HIR statement type "{type(statement).__name__}".')
         return None
@@ -726,9 +830,36 @@ class Interpreter:
         if isinstance(expression, HIRBorrowExpression):
             return self._eval_hir_borrow(expression, scope)
         if isinstance(expression, HIRMoveExpression):
-            if not isinstance(expression.expr, HIRVariableExpression):
-                return self._eval_hir_expression(expression.expr, scope)
-            return scope.take(expression.expr.name)
+            return self._take_hir_place(expression.expr, scope)
+        if isinstance(expression, HIRRawAddressExpression):
+            borrowed = self._eval_hir_borrow(
+                HIRBorrowExpression(
+                    mode=expression.mode,
+                    expr=expression.expr,
+                    type_ref=expression.type_ref,
+                    read_type=expression.read_type,
+                    span=expression.span,
+                ),
+                scope,
+            )
+            return JackRawPointer(
+                borrowed,
+                mutable=expression.type_ref.pointer_mode == 'inout',
+            )
+        if isinstance(expression, HIRDereferenceExpression):
+            pointer = self._eval_hir_expression(expression.expr, scope)
+            if pointer is None:
+                raise EvaluationError('Cannot dereference a null raw pointer.')
+            if not isinstance(pointer, JackRawPointer):
+                raise EvaluationError('Cannot dereference a non-pointer value.')
+            return pointer.get()
+        if isinstance(expression, HIRPointerOffsetExpression):
+            pointer = self._eval_hir_expression(expression.pointer, scope)
+            if not isinstance(pointer, JackRawPointer):
+                raise EvaluationError('Cannot offset a null or non-pointer value.')
+            return pointer.offset(self._hir_index_value(expression.offset, scope))
+        if isinstance(expression, HIRPointerCastExpression):
+            return self._eval_hir_expression(expression.pointer, scope)
         raise EvaluationError(f'Unknown HIR expression type "{type(expression).__name__}".')
 
     def _eval_hir_expression_as_type(
@@ -754,8 +885,14 @@ class Interpreter:
         target = self._eval_hir_expression(expression.target, scope)
         try:
             if isinstance(target, (JackBorrow, JackArrayElementBorrow)):
-                return target.get_field(expression.field_name)
-            return getattr(target, expression.field_name)
+                value = target.get_field(expression.field_name)
+            else:
+                value = getattr(target, expression.field_name)
+            if value is _MOVED_VALUE:
+                raise EvaluationError(
+                    f'Cannot use moved field "{expression.field_name}".'
+                )
+            return value
         except AttributeError as err:
             raise NameResolutionError(
                 f'Unknown field "{expression.field_name}" in HIR field access.'
@@ -968,6 +1105,15 @@ class Interpreter:
         self, expression: HIRBorrowExpression, scope: SymbolTable
     ) -> object:
         mutable = borrow_mode_can_write(expression.mode)
+        if isinstance(expression.expr, HIRDereferenceExpression):
+            pointer = self._eval_hir_expression(expression.expr.expr, scope)
+            if pointer is None:
+                raise EvaluationError('Cannot borrow through a null raw pointer.')
+            if not isinstance(pointer, JackRawPointer):
+                raise EvaluationError('Cannot borrow through a non-pointer value.')
+            if mutable and not pointer.mutable:
+                raise EvaluationError('Cannot create a writable borrow through *in pointer.')
+            return pointer.target
         if isinstance(expression.expr, HIRSliceExpression):
             return self._slice_from_hir_expression(
                 expression.expr, scope, mutable=mutable, mode=expression.mode
@@ -975,6 +1121,14 @@ class Interpreter:
         if isinstance(expression.expr, HIRIndexExpression):
             return self._eval_hir_index_borrow(
                 expression.expr, scope, mutable=mutable, mode=expression.mode
+            )
+
+        if isinstance(expression.expr, HIRVariableExpression):
+            return JackSymbolBorrow(
+                scope,
+                expression.expr.name,
+                mutable=mutable,
+                mode=expression.mode,
             )
 
         value = self._eval_hir_expression(expression.expr, scope)
@@ -1055,7 +1209,10 @@ class Interpreter:
         if field_types is None:
             raise EvaluationError(f'"{self._type_name(expression.type_ref)}" is not a Jack struct type.')
 
-        value = struct_type()
+        # A complete struct literal initializes every field itself; running the
+        # default constructor first would create objects that are immediately
+        # overwritten and would make non-defaultable fields impossible.
+        value = struct_type.__new__(struct_type)
         seen: set[str] = set()
         for field in expression.fields:
             if field.name in seen:
@@ -1090,6 +1247,8 @@ class Interpreter:
     def _eval_literal_value(
         self, value: object, literal_type_name: str, scope: SymbolTable
     ) -> object:
+        if literal_type_name == 'null':
+            return None
         literal_type = self._get_type(literal_type_name, scope)
         try:
             return literal_type(value)
@@ -1163,14 +1322,22 @@ class Interpreter:
         if not is_numeric_type(left.type_name) and operator not in {'==', '!='}:
             raise EvaluationError(f'Operator "{operator}" is not implemented for type "{left.type_name}".')
 
-        if operator == '+':
+        if operator in {'+', '-', '*', '/', '%'}:
             if not is_numeric_type(left.type_name) or is_raw_byte_type(left.type_name):
                 raise EvaluationError(f'Operator "{operator}" is not implemented for type "{left.type_name}".')
+            operations = {
+                '+': lambda: left.value + right.value,
+                '-': lambda: left.value - right.value,
+                '*': lambda: left.value * right.value,
+                '/': lambda: left.value / right.value if left.type_name in {'f32', 'f64'} else left.value // right.value,
+                '%': lambda: left.value % right.value,
+            }
             try:
-                return self.global_scope.get(left.type_name)(left.value + right.value)
-            except (TypeError, ValueError, OverflowError) as err:
+                result = operations[operator]()
+                return self.global_scope.get(left.type_name)(result)
+            except (TypeError, ValueError, OverflowError, ZeroDivisionError) as err:
                 raise EvaluationError(
-                    f'Cannot convert {left.value + right.value!r} to type "{left.type_name}".'
+                    f'Cannot evaluate {left.type_name} operator "{operator}".'
                 ) from err
         if operator == '==':
             return self.global_scope.get('bool')(left.value == right.value)
@@ -1237,6 +1404,8 @@ class Interpreter:
         self._execute_deinit_value(target_scope.get(name), target_scope)
 
     def _execute_deinit_value(self, value: object, scope: SymbolTable) -> None:
+        if value is _MOVED_VALUE:
+            return
         hir_deinit = self._hir_method_for_value(value, 'deinit')
         if hir_deinit is not None:
             target = HIRCallTarget(
@@ -1260,17 +1429,19 @@ class Interpreter:
         if declaration is None:
             if isinstance(value, JackArray):
                 for item in reversed(value.values):
-                    if self._value_needs_drop(item):
+                    if item is not _MOVED_VALUE and self._value_needs_drop(item):
                         self._execute_deinit_value(item, scope)
             return
         for field in reversed(declaration.fields):
             if field.type_ref.borrow is not None or field.type_ref.is_slice:
                 continue
             field_value = getattr(value, field.name)
-            if self._value_needs_drop(field_value):
+            if field_value is not _MOVED_VALUE and self._value_needs_drop(field_value):
                 self._execute_deinit_value(field_value, scope)
 
     def _value_needs_drop(self, value: object) -> bool:
+        if value is _MOVED_VALUE:
+            return False
         if isinstance(value, (JackBorrow, JackArrayElementBorrow, JackSlice)):
             return False
         if isinstance(value, JackArray):
@@ -1300,7 +1471,8 @@ class Interpreter:
 
     def _get_type(self, type_ref: str | TypeReference, scope: SymbolTable) -> type | BuiltinType:
         if isinstance(type_ref, TypeReference) and (
-            self._is_array_type(type_ref) or self._is_slice_type(type_ref) or self._is_borrow_type(type_ref)
+            self._is_array_type(type_ref) or self._is_slice_type(type_ref)
+            or self._is_borrow_type(type_ref) or type_ref.pointer_mode is not None
         ):
             raise EvaluationError(f'"{self._type_name(type_ref)}" is not a directly constructible type.')
         name = self._type_name(type_ref)
@@ -1326,6 +1498,14 @@ class Interpreter:
 
         if isinstance(type_ref, TypeReference) and self._is_borrow_type(type_ref):
             return self._coerce_borrow_value(value, type_ref)
+        if isinstance(type_ref, TypeReference) and type_ref.pointer_mode is not None:
+            if value is None and type_ref.nullable:
+                return None
+            if not isinstance(value, JackRawPointer):
+                raise EvaluationError(f'Cannot convert {value!r} to type "{type_name}".')
+            if type_ref.pointer_mode == 'inout' and not value.mutable:
+                raise EvaluationError('Cannot convert *in pointer to *inout pointer.')
+            return value
         if isinstance(type_ref, TypeReference) and self._is_slice_type(type_ref):
             if not isinstance(value, JackSlice):
                 raise EvaluationError(f'Cannot convert {value!r} to type "{type_name}".')
@@ -1453,7 +1633,51 @@ class Interpreter:
             index = self._hir_index_value(target.index, scope)
             self._set_indexed_value(indexed, index, value)
             return
+        if isinstance(target, HIRDereferenceExpression):
+            pointer = self._eval_hir_expression(target.expr, scope)
+            if pointer is None:
+                raise EvaluationError('Cannot assign through a null raw pointer.')
+            if not isinstance(pointer, JackRawPointer):
+                raise EvaluationError('Cannot assign through a non-pointer value.')
+            pointer.set(value)
+            return
         raise EvaluationError(f'Unsupported HIR assignment target "{type(target).__name__}".')
+
+    def _take_hir_place(
+        self, target: HIRExpression, scope: SymbolTable
+    ) -> object:
+        if isinstance(target, HIRVariableExpression):
+            return scope.take(target.name)
+        if isinstance(target, HIRFieldAccessExpression):
+            receiver = self._eval_hir_expression(target.target, scope)
+            owner = receiver.value if isinstance(receiver, JackBorrow) else receiver
+            if isinstance(owner, JackArrayElementBorrow):
+                owner = owner.value
+            try:
+                value = getattr(owner, target.field_name)
+            except AttributeError as err:
+                raise NameResolutionError(
+                    f'Unknown field "{target.field_name}" in move expression.'
+                ) from err
+            if value is _MOVED_VALUE:
+                raise EvaluationError(f'Cannot move field "{target.field_name}" twice.')
+            setattr(owner, target.field_name, _MOVED_VALUE)
+            return value
+        if isinstance(target, HIRIndexExpression):
+            indexed = self._eval_hir_expression(target.target, scope)
+            index = self._hir_index_value(target.index, scope)
+            if isinstance(indexed, JackBorrow):
+                indexed = indexed.value
+            if not isinstance(indexed, JackArray):
+                raise EvaluationError('Only fixed arrays support partial indexed moves.')
+            self._check_array_index(indexed, index)
+            value = indexed.values[index]
+            if value is _MOVED_VALUE:
+                raise EvaluationError(f'Cannot move array element {index} twice.')
+            indexed.values[index] = _MOVED_VALUE
+            return value
+        # Temporaries already own their result and need no source state update.
+        return self._eval_hir_expression(target, scope)
 
 
 
@@ -1468,7 +1692,10 @@ class Interpreter:
             return target.get(index)
         if isinstance(target, JackArray):
             self._check_array_index(target, index)
-            return target.values[index]
+            value = target.values[index]
+            if value is _MOVED_VALUE:
+                raise EvaluationError(f'Cannot use moved array element {index}.')
+            return value
         raise EvaluationError(f'Cannot index value of type "{type(target).__name__}".')
 
     def _set_indexed_value(self, target: object, index: int, value: object) -> None:
@@ -1541,6 +1768,9 @@ class Interpreter:
             name = f'{name}[]'
         if type_ref.borrow is not None:
             name = f'&{type_ref.borrow} {name}'
+        elif type_ref.pointer_mode is not None:
+            prefix = '?' if type_ref.nullable else ''
+            name = f'{prefix}*{type_ref.pointer_mode} {name}'
         return name
 
     def _type_size_name(self, expression: object) -> str:

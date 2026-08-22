@@ -70,6 +70,11 @@ class MoveExpression(Expression):
 
 
 @dataclass
+class DereferenceExpression(Expression):
+    expr: Expression
+
+
+@dataclass
 class IndexExpression(Expression):
     target: Expression
     index: Expression
@@ -191,6 +196,7 @@ class FunctionDeclaration(Statement):
     self_parameter: VariableDeclaration | None = None
     interface_name: str | None = None
     synthetic: bool = False
+    unsafe: bool = False
 
 
 @dataclass
@@ -230,6 +236,11 @@ class CatchClause(AstNode):
 class Try(Statement):
     body: List[Statement]
     catches: List[CatchClause]
+
+
+@dataclass
+class UnsafeBlock(Statement):
+    body: List[Statement]
 
 
 @dataclass

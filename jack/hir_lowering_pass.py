@@ -14,6 +14,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -34,7 +35,9 @@ try:
         Statement,
         StructLiteralExpression,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
+        TypeExpression,
         TypeReference,
         VariableDeclaration,
         VariableExpression,
@@ -48,6 +51,7 @@ try:
         HIRCallTarget,
         HIRCatchClause,
         HIRCompositeExpression,
+        HIRDereferenceExpression,
         HIRDeclaration,
         HIRExpression,
         HIRExpressionStatement,
@@ -63,8 +67,11 @@ try:
         HIRLiteralExpression,
         HIRModuleDeclaration,
         HIRMoveExpression,
+        HIRPointerCastExpression,
+        HIRPointerOffsetExpression,
         HIRPrint,
         HIRProgram,
+        HIRRawAddressExpression,
         HIRRaise,
         HIRRethrow,
         HIRReturn,
@@ -73,6 +80,7 @@ try:
         HIRStructLiteralExpression,
         HIRStructLiteralField,
         HIRTry,
+        HIRUnsafeBlock,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
         HIRVariableExpression,
@@ -91,6 +99,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -111,7 +120,9 @@ except ImportError:
         Statement,
         StructLiteralExpression,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
+        TypeExpression,
         TypeReference,
         VariableDeclaration,
         VariableExpression,
@@ -125,6 +136,7 @@ except ImportError:
         HIRCallTarget,
         HIRCatchClause,
         HIRCompositeExpression,
+        HIRDereferenceExpression,
         HIRDeclaration,
         HIRExpression,
         HIRExpressionStatement,
@@ -140,8 +152,11 @@ except ImportError:
         HIRLiteralExpression,
         HIRModuleDeclaration,
         HIRMoveExpression,
+        HIRPointerCastExpression,
+        HIRPointerOffsetExpression,
         HIRPrint,
         HIRProgram,
+        HIRRawAddressExpression,
         HIRRaise,
         HIRRethrow,
         HIRReturn,
@@ -150,6 +165,7 @@ except ImportError:
         HIRStructLiteralExpression,
         HIRStructLiteralField,
         HIRTry,
+        HIRUnsafeBlock,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
         HIRVariableExpression,
@@ -486,6 +502,7 @@ class HIRLoweringPass(SemanticPass):
             abi=declaration.abi,
             interface_name=declaration.interface_name,
             synthetic=declaration.synthetic,
+            unsafe=declaration.unsafe,
             span=declaration.span,
         )
 
@@ -493,7 +510,7 @@ class HIRLoweringPass(SemanticPass):
         self, type_decl: TypeDeclaration, method: FunctionDeclaration
     ) -> HIRFunctionDeclaration:
         scope = SemanticScope(self.global_scope)
-        self_parameter = self._method_self_parameter(type_decl, method)
+        self_parameter = self._hir_method_self_parameter(type_decl, method)
         scope.declare(
             'self',
             SymbolInfo(
@@ -532,6 +549,7 @@ class HIRLoweringPass(SemanticPass):
             abi=method.abi,
             interface_name=method.interface_name,
             synthetic=method.synthetic,
+            unsafe=method.unsafe,
             span=method.span,
         )
         self._record_statement(method, declaration)
@@ -633,6 +651,11 @@ class HIRLoweringPass(SemanticPass):
             return self._for_statement(statement, scope)
         if type(statement) is Try:
             return self._try_statement(statement, scope)
+        if type(statement) is UnsafeBlock:
+            return HIRUnsafeBlock(
+                body=self._block(statement.body, SemanticScope(scope)),
+                span=statement.span,
+            )
         raise HIRLoweringError(
             f'Statement "{type(statement).__name__}" cannot be lowered to HIR.',
             getattr(statement, 'span', None),
@@ -803,6 +826,57 @@ class HIRLoweringPass(SemanticPass):
                 source=expression,
             )
         if type(expression) is FunctionCall:
+            if expression.function_name == 'raw':
+                argument = expression.parameters[0]
+                assert type(argument) is BorrowExpression
+                inner = self._expression(argument.expr, scope)
+                type_ref = TypeReference(
+                    inner.type_ref.name,
+                    copy.deepcopy(inner.type_ref.arguments),
+                    pointer_mode=(
+                        'inout' if argument.mode in {'out', 'inout'} else 'in'
+                    ),
+                )
+                return self._record_expression(
+                    expression,
+                    HIRRawAddressExpression(
+                        mode=argument.mode,
+                        expr=inner,
+                        type_ref=type_ref,
+                        read_type=self._copy_type(type_ref),
+                        span=expression.span,
+                    ),
+                )
+            if expression.function_name.endswith('.offset'):
+                receiver_name = expression.function_name.rsplit('.', 1)[0]
+                pointer = self._name_expression(receiver_name, scope, expression.span)
+                return self._record_expression(
+                    expression,
+                    HIRPointerOffsetExpression(
+                        pointer=pointer,
+                        offset=self._expression(expression.parameters[0], scope),
+                        type_ref=self._copy_type(pointer.type_ref),
+                        read_type=self._copy_type(pointer.type_ref),
+                        span=expression.span,
+                    ),
+                )
+            if expression.function_name.endswith('.cast'):
+                receiver_name = expression.function_name.rsplit('.', 1)[0]
+                pointer = self._name_expression(receiver_name, scope, expression.span)
+                target = expression.parameters[0]
+                assert type(target) is TypeExpression
+                type_ref = self._copy_type(target.type_ref)
+                type_ref.pointer_mode = pointer.type_ref.pointer_mode
+                type_ref.nullable = pointer.type_ref.nullable
+                return self._record_expression(
+                    expression,
+                    HIRPointerCastExpression(
+                        pointer=pointer,
+                        type_ref=type_ref,
+                        read_type=self._copy_type(type_ref),
+                        span=expression.span,
+                    ),
+                )
             return self._call_expression(expression, scope)
         if type(expression) is FormattedStringExpression:
             return self._record_expression(
@@ -892,6 +966,18 @@ class HIRLoweringPass(SemanticPass):
                     expr=inner,
                     type_ref=self._copy_type(inner.type_ref),
                     read_type=self._copy_type(inner.read_type or inner.type_ref),
+                    span=expression.span,
+                ),
+            )
+        if type(expression) is DereferenceExpression:
+            inner = self._expression(expression.expr, scope)
+            type_ref = self._element_type(inner.type_ref)
+            return self._record_expression(
+                expression,
+                HIRDereferenceExpression(
+                    expr=inner,
+                    type_ref=type_ref,
+                    read_type=self._copy_type(type_ref),
                     span=expression.span,
                 ),
             )
@@ -1145,7 +1231,7 @@ class HIRLoweringPass(SemanticPass):
                 f'Type "{type_decl.name}" has no method "{method_name}" while lowering HIR.',
                 call.span,
             )
-        self_parameter = self._method_self_parameter(type_decl, method)
+        self_parameter = self._hir_method_self_parameter(type_decl, method)
         self_type = self._copy_type(self_parameter.type)
         implicit_self = HIRBorrowExpression(
             mode=self_type.borrow or 'inout',
@@ -1174,7 +1260,7 @@ class HIRLoweringPass(SemanticPass):
     def _composite_result_type(
         self, left: HIRExpression, operator: str
     ) -> TypeReference:
-        if operator == '+':
+        if operator in {'+', '-', '*', '/', '%'}:
             return self._copy_type(left.read_type or left.type_ref)
         return TypeReference('bool')
 
@@ -1213,6 +1299,14 @@ class HIRLoweringPass(SemanticPass):
             span=declaration.span,
         )
 
+    def _hir_method_self_parameter(
+        self, type_decl: TypeDeclaration, method: FunctionDeclaration
+    ) -> VariableDeclaration:
+        parameter = copy.deepcopy(self._method_self_parameter(type_decl, method))
+        if method.name == 'deinit' and parameter.passing_mode == 'move':
+            parameter.type.borrow = 'inout'
+        return parameter
+
     def _copy_type(self, type_ref: TypeReference) -> TypeReference:
         array_size = type_ref.array_size
         if array_size is not None:
@@ -1234,6 +1328,8 @@ class HIRLoweringPass(SemanticPass):
             array_size=array_size,
             is_slice=type_ref.is_slice,
             borrow=type_ref.borrow,
+            pointer_mode=type_ref.pointer_mode,
+            nullable=type_ref.nullable,
             span=type_ref.span,
         )
 

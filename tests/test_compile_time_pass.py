@@ -1003,7 +1003,7 @@ class CompileTimePassTests(unittest.TestCase):
                     self.value = value;
                 }
 
-                deinit(&inout self) {
+                deinit(move self) {
                     print(self.value);
                 }
             }
@@ -1042,7 +1042,7 @@ class CompileTimePassTests(unittest.TestCase):
             }
 
             struct Nope {
-                deinit(&inout self) raises CleanupError {
+                deinit(move self) raises CleanupError {
                     CleanupError err;
                     err.code = 1;
                     raise err;
@@ -1060,7 +1060,7 @@ class CompileTimePassTests(unittest.TestCase):
             }
 
             struct Nope {
-                deinit(&inout self) raises {
+                deinit(move self) raises {
                     CleanupError err;
                     err.code = 1;
                     raise err;

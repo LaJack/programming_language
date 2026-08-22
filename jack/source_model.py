@@ -22,4 +22,6 @@ class TypeReference:
     array_size: object | None = None
     is_slice: bool = False
     borrow: str | None = None
+    pointer_mode: str | None = None
+    nullable: bool = False
     span: SourceSpan | None = field(default=None, compare=False, kw_only=True)

@@ -84,7 +84,7 @@ class HIRInterpreterTests(unittest.TestCase):
             i32 cleaned = 0;
 
             struct Resource {
-                void deinit(&inout self) {
+                void deinit(move self) {
                     cleaned = cleaned + 1;
                 }
             }

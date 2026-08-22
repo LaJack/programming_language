@@ -302,7 +302,7 @@ class CEmitPassTests(unittest.TestCase):
                     self.slave_address = slave_address;
                 }
 
-                deinit(&inout self) {
+                deinit(move self) {
                     print(self.slave_address);
                 }
             }
@@ -328,7 +328,7 @@ class CEmitPassTests(unittest.TestCase):
                     self.value = value;
                 }
 
-                deinit(&inout self) {
+                deinit(move self) {
                     print(self.value);
                 }
             }

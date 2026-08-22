@@ -23,7 +23,7 @@ CONFORMANCE_CASES = (
                 i32 value;
 
                 init(&inout self, i32 value) { self.value = value; }
-                deinit(&inout self) { print(f"drop {self.value}"); }
+                deinit(move self) { print(f"drop {self.value}"); }
             }
 
             Resource implements Tagged {
@@ -55,7 +55,7 @@ CONFORMANCE_CASES = (
         source='''
             struct Resource {
                 i32 value;
-                deinit(&inout self) { print(f"drop {self.value}"); }
+                deinit(move self) { print(f"drop {self.value}"); }
             }
 
             Resource implements Copyable {
@@ -127,7 +127,7 @@ CONFORMANCE_CASES = (
                     self.value = value;
                 }
 
-                deinit(&inout self) {
+                deinit(move self) {
                     print(self.value);
                 }
             }
@@ -163,7 +163,7 @@ CONFORMANCE_CASES = (
 
             struct Tracer {
                 i32 value;
-                deinit(&inout self) { print(self.value); }
+                deinit(move self) { print(self.value); }
             }
 
             i32 fail(bool should_fail) raises FirstError, SecondError {
@@ -204,7 +204,7 @@ CONFORMANCE_CASES = (
             struct Resource {
                 i32 id;
                 init(&inout self, i32 id) { self.id = id; }
-                deinit(&inout self) { print(self.id); }
+                deinit(move self) { print(self.id); }
             }
 
             Resource make(i32 id) {
@@ -234,6 +234,37 @@ CONFORMANCE_CASES = (
             'copied[0] = 7\nresource.id = 1\nself.id = 1\n'
             'self.id = 2\nself.id = 3\n'
         ),
+    ),
+    ConformanceCase(
+        name='partial_moves_consuming_destructor_and_raw_pointer_write',
+        source='''
+            struct Resource {
+                i32 id;
+                deinit(move self) { print(self.id); }
+            }
+
+            struct Owner {
+                Resource first;
+                Resource second;
+
+                deinit(move self) {
+                    Resource extracted = move self.first;
+                }
+            }
+
+            void run() {
+                Owner owner = Owner {
+                    first = Resource { id = 1 },
+                    second = Resource { id = 2 }
+                };
+                i32 value = 3;
+                *inout i32 pointer = raw(&inout value);
+                unsafe { *pointer = 9; }
+                print(value);
+            }
+            run();
+        ''',
+        expected_stdout='value = 9\nself.id = 1\nself.id = 2\n',
     ),
     ConformanceCase(
         name='imported_module',

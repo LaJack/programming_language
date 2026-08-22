@@ -23,6 +23,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -46,6 +47,7 @@ try:
         StructLiteralExpression,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -77,6 +79,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -100,6 +103,7 @@ except ImportError:
         StructLiteralExpression,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -210,8 +214,11 @@ class SemanticPass:
         self.current_rethrow_errors: list[str] = []
         self.current_borrow_return_accesses: list[BorrowAccess] | None = None
         self.borrow_return_summaries: dict[int, tuple[BorrowAccess, ...]] = {}
-        self.ownership_states: dict[int, str] = {}
+        self.ownership_states: dict[object, str] = {}
         self.function_body_states: dict[int, str] = {}
+        self.unsafe_depth = 0
+        self.current_deinit_owner: str | None = None
+        self.refined_nonnull_pointers: set[str] = set()
 
     def validate(self, ast: list[Statement]) -> None:
         runtime_ast = [node for node in ast if type(node) not in {ModuleDeclaration, ImportDeclaration}]
@@ -676,6 +683,7 @@ class SemanticPass:
             not self._is_void_type(declaration.return_type)
             and self._is_opaque_extern_type(declaration.return_type)
             and not self._is_borrow_type(declaration.return_type)
+            and declaration.return_type.pointer_mode is None
         ):
             raise SemanticError(
                 f'Opaque extern type "{declaration.return_type.name}" cannot be returned by value; use an explicit borrow type.'
@@ -719,6 +727,10 @@ class SemanticPass:
             raise SemanticError('Method "deinit" cannot have parameters.')
         if declaration.name == 'deinit' and declaration.raises:
             raise SemanticError('Method "deinit" cannot raise errors.')
+        if declaration.name == 'deinit' and declaration.unsafe:
+            raise SemanticError(
+                'Method "deinit" cannot be unsafe; use explicit unsafe blocks inside it.'
+            )
 
     def _validate_method_self_parameter(
         self, type_decl: TypeDeclaration, method: FunctionDeclaration
@@ -733,6 +745,17 @@ class SemanticPass:
             raise SemanticError(f'Method "{context}" self parameter must be named "self".')
         if parameter.type.name == 'self':
             parameter.type.name = type_decl.name
+        if method.name == 'deinit':
+            if parameter.passing_mode != 'move' or self._is_borrow_type(parameter.type):
+                raise SemanticError(
+                    'Method "deinit" must declare a consuming `move self` parameter.'
+                )
+            self._validate_parameter(parameter, context)
+            if self._type_name(parameter.type) != type_decl.name:
+                raise SemanticError(
+                    f'Method "{context}" self parameter must consume "{type_decl.name}".'
+                )
+            return
         self._validate_parameter(parameter, context)
         if not self._is_borrow_type(parameter.type):
             raise SemanticError(f'Method "{context}" self parameter must be an explicit borrow type.')
@@ -855,6 +878,8 @@ class SemanticPass:
         self.current_caught_errors = set()
         self.current_rethrow_errors = []
         self.current_borrow_return_accesses = borrow_return_accesses
+        previous_unsafe_depth = self.unsafe_depth
+        self.unsafe_depth = 1 if declaration.unsafe else 0
         try:
             self._validate_statements(declaration.body, scope, allow_return=True)
             if borrow_return_accesses is not None:
@@ -871,18 +896,21 @@ class SemanticPass:
             self.current_caught_errors = previous_caught_errors
             self.current_rethrow_errors = previous_rethrow_errors
             self.current_borrow_return_accesses = previous_borrow_return_accesses
+            self.unsafe_depth = previous_unsafe_depth
 
     def _validate_method_body(self, type_decl: TypeDeclaration, method: FunctionDeclaration) -> None:
         scope = SemanticScope(self.global_scope)
-        scope.declare(
-            'self',
-            SymbolInfo(
-                'variable',
-                self._method_self_type(type_decl, method),
-                module_name=type_decl.module_name,
-                can_return_borrow=True,
-            ),
+        self_info = SymbolInfo(
+            'variable',
+            self._method_self_type(type_decl, method),
+            module_name=type_decl.module_name,
+            can_return_borrow=method.name != 'deinit',
+            passing_mode=method.self_parameter.passing_mode,
+            owned_local=method.name == 'deinit',
         )
+        scope.declare('self', self_info)
+        if self_info.owned_local:
+            self.ownership_states[id(self_info)] = 'initialized'
         for parameter in method.parameters:
             info = SymbolInfo(
                 'variable', parameter.type,
@@ -915,6 +943,10 @@ class SemanticPass:
         self.current_caught_errors = set()
         self.current_rethrow_errors = []
         self.current_borrow_return_accesses = borrow_return_accesses
+        previous_unsafe_depth = self.unsafe_depth
+        self.unsafe_depth = 1 if method.unsafe else 0
+        previous_deinit_owner = self.current_deinit_owner
+        self.current_deinit_owner = type_decl.name if method.name == 'deinit' else None
         try:
             self._validate_statements(method.body, scope, allow_return=True)
             if borrow_return_accesses is not None:
@@ -931,6 +963,8 @@ class SemanticPass:
             self.current_caught_errors = previous_caught_errors
             self.current_rethrow_errors = previous_rethrow_errors
             self.current_borrow_return_accesses = previous_borrow_return_accesses
+            self.unsafe_depth = previous_unsafe_depth
+            self.current_deinit_owner = previous_deinit_owner
 
     def _validate_statements(
         self, statements: list[Statement], scope: SemanticScope, allow_return: bool
@@ -977,6 +1011,14 @@ class SemanticPass:
                 self._validate_for(statement, scope, allow_return)
             elif type(statement) is Try:
                 self._validate_try(statement, scope, allow_return)
+            elif type(statement) is UnsafeBlock:
+                self.unsafe_depth += 1
+                try:
+                    self._validate_statements(
+                        statement.body, SemanticScope(scope), allow_return
+                    )
+                finally:
+                    self.unsafe_depth -= 1
             elif type(statement) is TypeDeclaration:
                 raise SemanticError('Nested type declarations are not supported.')
             elif type(statement) is ViewDeclaration:
@@ -1075,20 +1117,124 @@ class SemanticPass:
             )
         expr_type = self._expression_type_for_target(assignment.expr, target_type, scope)
         self._expect_assignable(target_type, expr_type, assignment.expr, 'assignment')
-        if isinstance(assignment.name, str) and '.' not in assignment.name:
-            info = scope.get(assignment.name)
-            if info is not None and info.owned_local:
-                self.ownership_states[id(info)] = 'initialized'
+        place = self._ownership_place(assignment.name, scope, require_static_index=False)
+        if place is not None:
+            self._set_place_state(place, 'initialized')
 
     def _require_initialized(self, name: str, scope: SemanticScope) -> None:
-        root = name.split('.')[0]
+        place = self._ownership_place(name, scope, require_static_index=False)
+        if place is None:
+            return
+        self._require_place_initialized(place)
+
+    def _ownership_place(
+        self,
+        target: str | Expression,
+        scope: SemanticScope,
+        *,
+        require_static_index: bool,
+    ) -> tuple[int, str, tuple[str, ...]] | None:
+        if isinstance(target, str):
+            parts = target.split('.')
+            root, projections = parts[0], tuple(parts[1:])
+        elif type(target) is VariableExpression:
+            parts = target.name.split('.')
+            root, projections = parts[0], tuple(parts[1:])
+        elif type(target) is IndexExpression:
+            base = self._ownership_place(
+                target.target, scope, require_static_index=require_static_index
+            )
+            if base is None:
+                return None
+            if type(target.index) is not LiteralExpression or not self._is_integer_type(
+                TypeReference(target.index.type)
+            ):
+                if require_static_index:
+                    raise SemanticError(
+                        'Partial moves require a compile-time fixed-array index.'
+                    )
+                return None
+            return (base[0], base[1], (*base[2], f'[{int(target.index.value)}]'))
+        else:
+            return None
         info = scope.get(root)
         if info is None or not info.owned_local:
-            return
-        state = self.ownership_states.get(id(info), 'initialized')
-        if state != 'initialized':
-            description = 'possibly moved' if state == 'conditional' else state
+            return None
+        return (id(info), root, projections)
+
+    def _require_place_initialized(
+        self, place: tuple[int, str, tuple[str, ...]]
+    ) -> None:
+        symbol_id, root, projections = place
+        root_state = self.ownership_states.get(symbol_id, 'initialized')
+        if root_state in {'moved', 'conditional'} or (
+            root_state == 'partial' and not projections
+        ):
+            description = (
+                'possibly moved' if root_state == 'conditional'
+                else 'partially moved' if root_state == 'partial'
+                else root_state
+            )
             raise SemanticError(f'Cannot use "{root}" because it is {description}.')
+        for length in range(1, len(projections) + 1):
+            state = self.ownership_states.get((symbol_id, projections[:length]))
+            if state is not None and state != 'initialized':
+                label = root + ''.join(
+                    item if item.startswith('[') else f'.{item}'
+                    for item in projections[:length]
+                )
+                description = 'possibly moved' if state == 'conditional' else state
+                raise SemanticError(f'Cannot use "{label}" because it is {description}.')
+        descendants = [
+            state
+            for key, state in self.ownership_states.items()
+            if isinstance(key, tuple)
+            and len(key) == 2
+            and key[0] == symbol_id
+            and key[1][:len(projections)] == projections
+            and len(key[1]) > len(projections)
+            and state != 'initialized'
+        ]
+        if descendants:
+            label = root + ''.join(
+                item if item.startswith('[') else f'.{item}' for item in projections
+            )
+            raise SemanticError(f'Cannot use "{label}" because it is partially moved.')
+
+    def _set_place_state(
+        self, place: tuple[int, str, tuple[str, ...]], state: str
+    ) -> None:
+        symbol_id, _, projections = place
+        if not projections:
+            self.ownership_states[symbol_id] = state
+            if state == 'initialized':
+                for key in list(self.ownership_states):
+                    if isinstance(key, tuple) and key[0] == symbol_id:
+                        del self.ownership_states[key]
+            return
+        self.ownership_states[(symbol_id, projections)] = state
+        outstanding = any(
+            value != 'initialized'
+            for key, value in self.ownership_states.items()
+            if isinstance(key, tuple) and key[0] == symbol_id
+        )
+        self.ownership_states[symbol_id] = 'partial' if outstanding else 'initialized'
+
+    def _ownership_place_label(
+        self, place: tuple[int, str, tuple[str, ...]]
+    ) -> str:
+        _, root, projections = place
+        return root + ''.join(
+            item if item.startswith('[') else f'.{item}' for item in projections
+        )
+
+    def _type_declares_deinit(self, type_ref: TypeReference) -> bool:
+        if type_ref.borrow is not None or type_ref.pointer_mode is not None:
+            return False
+        declaration = self.types.get(type_ref.name)
+        return declaration is not None and any(
+            method.name == 'deinit' for method in declaration.methods
+        )
 
     def _validate_raise(self, statement: Raise, scope: SemanticScope) -> None:
         error_type = self._expression_value_type(statement.expr, scope)
@@ -1173,34 +1319,79 @@ class SemanticPass:
 
     def _validate_if(self, statement: If, scope: SemanticScope, allow_return: bool) -> None:
         initial = dict(self.ownership_states)
-        outcomes: list[dict[int, str]] = []
+        outcomes: list[dict[object, str]] = []
+        previous_refinements = set(self.refined_nonnull_pointers)
         for branch in statement.branches:
             self.ownership_states = dict(initial)
+            self.refined_nonnull_pointers = set(previous_refinements)
             self._validate_condition(branch.condition, scope, 'if condition')
-            self._validate_statements(branch.body, SemanticScope(scope), allow_return)
+            self.refined_nonnull_pointers.update(
+                self._nonnull_refinements(branch.condition, when_true=True)
+            )
+            self._validate_statements(
+                branch.body, SemanticScope(scope), allow_return
+            )
             outcomes.append(dict(self.ownership_states))
         if statement.else_body is not None:
             self.ownership_states = dict(initial)
+            self.refined_nonnull_pointers = set(previous_refinements)
+            if len(statement.branches) == 1:
+                self.refined_nonnull_pointers.update(
+                    self._nonnull_refinements(
+                        statement.branches[0].condition, when_true=False
+                    )
+                )
             self._validate_statements(statement.else_body, SemanticScope(scope), allow_return)
             outcomes.append(dict(self.ownership_states))
         else:
             outcomes.append(initial)
+        self.refined_nonnull_pointers = previous_refinements
         self.ownership_states = self._join_ownership_states(initial, outcomes)
 
+    def _nonnull_refinements(
+        self, expression: Expression, *, when_true: bool
+    ) -> set[str]:
+        if type(expression) is not CompositeExpression:
+            return set()
+        proves_nonnull = (
+            expression.operator == '!=' and when_true
+        ) or (
+            expression.operator == '==' and not when_true
+        )
+        if not proves_nonnull:
+            return set()
+        for candidate, other in (
+            (expression.left, expression.right),
+            (expression.right, expression.left),
+        ):
+            if (
+                type(candidate) is VariableExpression
+                and type(other) is LiteralExpression
+                and other.type == 'null'
+            ):
+                return {candidate.name}
+        return set()
+
     def _join_ownership_states(
-        self, initial: dict[int, str], outcomes: list[dict[int, str]]
-    ) -> dict[int, str]:
-        joined = dict(initial)
-        for symbol_id in initial:
-            states = {outcome.get(symbol_id, initial[symbol_id]) for outcome in outcomes}
-            joined[symbol_id] = next(iter(states)) if len(states) == 1 else 'conditional'
+        self, initial: dict[object, str], outcomes: list[dict[object, str]]
+    ) -> dict[object, str]:
+        joined: dict[object, str] = {}
+        keys = set(initial)
+        for outcome in outcomes:
+            keys.update(outcome)
+        for key in keys:
+            default = initial.get(key, 'initialized')
+            states = {outcome.get(key, default) for outcome in outcomes}
+            joined[key] = next(iter(states)) if len(states) == 1 else 'conditional'
         return joined
 
     def _validate_loop_back_edge(
-        self, initial: dict[int, str], outcome: dict[int, str]
+        self, initial: dict[object, str], outcome: dict[object, str]
     ) -> None:
-        for symbol_id, initial_state in initial.items():
-            if initial_state == 'initialized' and outcome.get(symbol_id) != 'initialized':
+        keys = set(initial) | set(outcome)
+        for key in keys:
+            initial_state = initial.get(key, 'initialized')
+            if initial_state == 'initialized' and outcome.get(key, 'initialized') != 'initialized':
                 raise SemanticError(
                     'A loop-carried value moved in the loop body must be reinitialized '
                     'on every continuing path.'
@@ -1294,32 +1485,75 @@ class SemanticPass:
         self, expression: Expression, scope: SemanticScope, check_reads: bool = True
     ) -> TypeReference:
         if type(expression) is LiteralExpression:
+            if expression.type == 'null':
+                return TypeReference('null')
             return TypeReference(expression.type)
         if type(expression) is VariableExpression:
             if check_reads:
                 self._require_initialized(expression.name, scope)
             value_type = self._resolve_name_type(expression.name, scope)
+            if (
+                value_type.pointer_mode is not None
+                and value_type.nullable
+                and expression.name in self.refined_nonnull_pointers
+            ):
+                value_type = copy.deepcopy(value_type)
+                value_type.nullable = False
             if check_reads and self._expression_reads_place(value_type):
                 self._validate_read_access(expression, scope, f'read of "{expression.name}"')
             return value_type
         if type(expression) is MoveExpression:
-            if type(expression.expr) is not VariableExpression or '.' in expression.expr.name:
-                raise SemanticError('move requires a whole local variable or owned parameter.')
-            info = scope.get(expression.expr.name)
-            if info is None or not info.owned_local or self._is_borrow_type(info.type_ref):
+            place = self._ownership_place(
+                expression.expr, scope, require_static_index=True
+            )
+            if place is None:
                 raise SemanticError(
-                    f'Cannot move "{expression.expr.name}"; only owned locals and parameters can be moved.'
+                    'move requires an owned local, owned parameter, field, or '
+                    'compile-time fixed-array index.'
                 )
-            self._require_initialized(expression.expr.name, scope)
-            if any(
-                borrow.access.path.root == expression.expr.name
-                for borrow in scope.live_borrows()
+            _, root, projections = place
+            info = scope.get(root)
+            assert info is not None and info.type_ref is not None
+            if projections and self._type_declares_deinit(info.type_ref) and not (
+                root == 'self' and self.current_deinit_owner == info.type_ref.name
             ):
                 raise SemanticError(
-                    f'Cannot move "{expression.expr.name}" while it is borrowed.'
+                    f'Cannot partially move "{root}" because type '
+                    f'"{self._type_name(info.type_ref)}" declares deinit.'
                 )
-            self.ownership_states[id(info)] = 'moved'
-            return info.type_ref
+            self._require_place_initialized(place)
+            move_accesses = self._place_accesses(expression.expr, 'inout', scope)
+            try:
+                self._check_borrow_conflicts(
+                    move_accesses,
+                    scope,
+                    f'move of "{self._ownership_place_label(place)}"',
+                    ignore_owners=self._place_source_owners(expression.expr, scope),
+                )
+            except SemanticError as error:
+                raise SemanticError(
+                    f'Cannot move "{self._ownership_place_label(place)}" while it is borrowed.'
+                ) from error
+            result_type = self._expression_type(expression.expr, scope, check_reads=False)
+            if self._is_borrow_type(result_type):
+                raise SemanticError('Borrowed values cannot be moved.')
+            self._set_place_state(place, 'moved')
+            return result_type
+        if type(expression) is DereferenceExpression:
+            if self.unsafe_depth == 0:
+                raise SemanticError('Raw pointer dereference requires an unsafe context.')
+            pointer_type = self._expression_type(expression.expr, scope)
+            if pointer_type.pointer_mode is None:
+                raise SemanticError('Only raw pointers can be dereferenced.')
+            refined = (
+                type(expression.expr) is VariableExpression
+                and expression.expr.name in self.refined_nonnull_pointers
+            )
+            if pointer_type.nullable and not refined:
+                raise SemanticError(
+                    'Nullable raw pointer must be refined before dereference.'
+                )
+            return TypeReference(pointer_type.name, copy.deepcopy(pointer_type.arguments))
         if type(expression) is FunctionCall:
             return self._function_call_type(expression, scope)
         if type(expression) is TypeExpression:
@@ -1357,6 +1591,15 @@ class SemanticPass:
                 raise SemanticError('Cannot create a writable borrow from a read-only borrow.')
             if borrow_mode_can_read(expression.mode) and self._contains_non_readable_borrow(expression.expr, scope):
                 raise SemanticError('Cannot create a readable borrow from a write-only borrow.')
+            if type(expression.expr) is DereferenceExpression:
+                pointer_type = self._expression_type(expression.expr.expr, scope)
+                if (
+                    borrow_mode_can_write(expression.mode)
+                    and pointer_type.pointer_mode != 'inout'
+                ):
+                    raise SemanticError(
+                        'Cannot create a writable borrow through a *in raw pointer.'
+                    )
             return TypeReference(
                 inner_type.name,
                 copy.deepcopy(inner_type.arguments),
@@ -1403,16 +1646,28 @@ class SemanticPass:
         left_name = self._type_name(left_type)
         right_name = self._type_name(right_type)
 
-        if expression.operator == '+':
+        if expression.operator in {'==', '!='} and (
+            left_name == 'null' or right_name == 'null'
+        ):
+            pointer_type = right_type if left_name == 'null' else left_type
+            if pointer_type.pointer_mode is None or not pointer_type.nullable:
+                raise SemanticError('null can only be compared with a nullable raw pointer.')
+            return TypeReference('bool')
+
+        if expression.operator in {'+', '-', '*', '/', '%'}:
             if left_name != right_name:
                 raise SemanticError(f'Cannot combine values of type "{left_name}" and "{right_name}".')
             if not is_numeric_type(left_name) or is_raw_byte_type(left_name):
-                raise SemanticError(f'Operator "+" is not implemented for type "{left_name}".')
+                raise SemanticError(f'Operator "{expression.operator}" is not implemented for type "{left_name}".')
             return left_type
 
         if expression.operator in {'==', '!=', '<', '>', '<=', '>='}:
             if left_name != right_name:
                 raise SemanticError(f'Cannot compare values of type "{left_name}" and "{right_name}".')
+            if left_type.pointer_mode is not None:
+                if expression.operator not in {'==', '!='}:
+                    raise SemanticError('Raw pointers support only equality comparisons.')
+                return TypeReference('bool')
             if self._is_str_type(left_type) and expression.operator not in {'==', '!='}:
                 raise SemanticError(f'Operator "{expression.operator}" is not implemented for strings.')
             if is_bool_type(left_name) and expression.operator not in {'==', '!='}:
@@ -1433,6 +1688,49 @@ class SemanticPass:
     def _function_call_type(self, call: FunctionCall, scope: SemanticScope) -> TypeReference:
         if call.function_name in {'sizeof', 'alignof'}:
             raise SemanticError(f'{call.function_name} must be folded by the compile-time pass.')
+        if call.function_name == 'raw':
+            if len(call.parameters) != 1 or type(call.parameters[0]) is not BorrowExpression:
+                raise SemanticError('raw expects one explicit borrow expression.')
+            argument = call.parameters[0]
+            pointee = self._borrow_target_type(argument.expr, scope)
+            return TypeReference(
+                pointee.name,
+                copy.deepcopy(pointee.arguments),
+                pointer_mode='inout' if borrow_mode_can_write(argument.mode) else 'in',
+            )
+        if call.function_name.endswith('.offset'):
+            if self.unsafe_depth == 0:
+                raise SemanticError('Raw pointer offset requires an unsafe context.')
+            receiver_name = call.function_name.rsplit('.', 1)[0]
+            pointer_type = self._expression_type(
+                VariableExpression(receiver_name), scope
+            )
+            if pointer_type.pointer_mode is None or pointer_type.nullable:
+                raise SemanticError('offset requires a non-null raw pointer receiver.')
+            if len(call.parameters) != 1:
+                raise SemanticError('offset expects one element count.')
+            self._expect_integer_expression(call.parameters[0], scope, 'pointer offset')
+            return copy.deepcopy(pointer_type)
+        if call.function_name.endswith('.cast'):
+            if self.unsafe_depth == 0:
+                raise SemanticError('Raw pointer cast requires an unsafe context.')
+            receiver_name = call.function_name.rsplit('.', 1)[0]
+            pointer_type = self._expression_type(
+                VariableExpression(receiver_name), scope
+            )
+            if pointer_type.pointer_mode is None:
+                raise SemanticError('cast requires a raw pointer receiver.')
+            if len(call.parameters) != 1 or type(call.parameters[0]) is not TypeExpression:
+                raise SemanticError('cast expects one type argument.')
+            target = call.parameters[0].type_ref
+            if target.name not in {'c_void', 'c_char'}:
+                self._validate_type_reference(target, allow_void=False)
+            return TypeReference(
+                target.name,
+                copy.deepcopy(target.arguments),
+                pointer_mode=pointer_type.pointer_mode,
+                nullable=pointer_type.nullable,
+            )
         if '.' in call.function_name:
             return self._validate_method_call(call, scope)
         if call.function_name == 'len':
@@ -1444,6 +1742,10 @@ class SemanticPass:
         if declaration is None:
             raise SemanticError(f'Unknown function "{call.function_name}".')
         self._require_declaration_visible('Function', call.function_name, declaration)
+        if declaration.unsafe and self.unsafe_depth == 0:
+            raise SemanticError(
+                f'Call to unsafe function "{call.function_name}" requires an unsafe context.'
+            )
         self._validate_call_arguments(call.function_name, declaration.parameters, call.parameters, scope)
         self._validate_call_raises(call.function_name, declaration.raises)
         return declaration.return_type
@@ -1489,6 +1791,10 @@ class SemanticPass:
         method = self._visible_method_for_call(type_decl, method_name, call.interface_name)
         if method is None:
             raise SemanticError(f'Type "{type_decl.name}" has no method "{method_name}".')
+        if method.unsafe and self.unsafe_depth == 0:
+            raise SemanticError(
+                f'Call to unsafe method "{type_decl.name}.{method_name}" requires an unsafe context.'
+            )
         self_parameter = self._method_self_parameter(type_decl, method)
         self_argument = VariableExpression(receiver_name)
         self_argument.span = call.span
@@ -1860,6 +2166,8 @@ class SemanticPass:
     def _place_accesses(
         self, target: str | Expression, mode: str, scope: SemanticScope
     ) -> tuple[BorrowAccess, ...]:
+        if type(target) is DereferenceExpression:
+            return ()
         paths = self._raw_place_paths(target)
         if not paths:
             raise SemanticError('Cannot borrow a temporary value.')
@@ -2102,6 +2410,19 @@ class SemanticPass:
             if self._is_read_only_index_target(container_type):
                 raise SemanticError('Cannot assign through a read-only borrow or slice.')
             return self._indexed_element_type(container_type)
+        if type(target) is DereferenceExpression:
+            if self.unsafe_depth == 0:
+                raise SemanticError('Raw pointer assignment requires an unsafe context.')
+            pointer_type = self._expression_type(target.expr, scope)
+            if pointer_type.pointer_mode != 'inout':
+                raise SemanticError('Raw pointer assignment requires a *inout pointer.')
+            if pointer_type.nullable:
+                raise SemanticError(
+                    'Nullable raw pointer must be refined before assignment.'
+                )
+            return TypeReference(
+                pointer_type.name, copy.deepcopy(pointer_type.arguments)
+            )
         raise SemanticError(f'Unsupported assignment target "{type(target).__name__}".')
 
     def _indexed_element_type(self, type_ref: TypeReference) -> TypeReference:
@@ -2175,6 +2496,20 @@ class SemanticPass:
             return self._is_void_type(target_type) and self._is_void_type(source_type)
         if self._is_borrow_type(target_type):
             return self._borrow_compatible(target_type, source_type)
+        if target_type.pointer_mode is not None:
+            if source_type.name == 'null':
+                return target_type.nullable
+            return (
+                (
+                    source_type.pointer_mode == target_type.pointer_mode
+                    or (
+                        target_type.pointer_mode == 'in'
+                        and source_type.pointer_mode == 'inout'
+                    )
+                )
+                and (target_type.nullable or not source_type.nullable)
+                and self._same_element_type(target_type, source_type)
+            )
         if self._is_array_type(target_type):
             return (
                 self._is_array_type(source_type)
@@ -2202,6 +2537,8 @@ class SemanticPass:
         self, type_ref: TypeReference, seen: set[str] | None = None
     ) -> bool:
         if type_ref.borrow == 'in':
+            return True
+        if type_ref.pointer_mode is not None:
             return True
         if type_ref.borrow in {'out', 'inout'} or type_ref.is_slice:
             return False
@@ -2291,7 +2628,11 @@ class SemanticPass:
             raise SemanticError(f'Variable "{name}" cannot have type "void".')
         if self._is_type_type(type_ref):
             raise SemanticError(f'Type variable "{name}" must be consumed during the compile-time pass.')
-        if self._is_opaque_extern_type(type_ref) and not self._is_borrow_type(type_ref):
+        if (
+            self._is_opaque_extern_type(type_ref)
+            and not self._is_borrow_type(type_ref)
+            and type_ref.pointer_mode is None
+        ):
             raise SemanticError(
                 f'Opaque extern type "{type_ref.name}" cannot be used by value; use an explicit borrow type.'
             )
@@ -2301,6 +2642,15 @@ class SemanticPass:
             raise SemanticError(f'Unresolved generic type "{type_ref.name}".')
         if type_ref.borrow is not None and type_ref.borrow not in BORROW_MODES:
             raise SemanticError(f'Unknown borrow mode "{type_ref.borrow}".')
+        if (
+            type_ref.pointer_mode is not None
+            and type_ref.pointer_mode not in {'in', 'inout'}
+        ):
+            raise SemanticError(f'Unknown raw pointer mode "{type_ref.pointer_mode}".')
+        if type_ref.nullable and type_ref.pointer_mode is None:
+            raise SemanticError('Only raw pointer types may be nullable.')
+        if type_ref.borrow is not None and type_ref.pointer_mode is not None:
+            raise SemanticError('A type cannot be both a borrow and a raw pointer.')
         if type_ref.array_size is not None and type_ref.is_slice:
             raise SemanticError(f'Type "{type_ref.name}" cannot be both array and slice.')
         if type_ref.name == 'void' and not allow_void:
@@ -2317,8 +2667,14 @@ class SemanticPass:
             view = self.views[type_ref.name]
             self._require_declaration_visible('View', type_ref.name, view)
             return
-        if type_ref.name in {'c_char', 'c_void'} and type_ref.borrow is None:
-            raise SemanticError(f'{type_ref.name} can only be used behind an explicit borrow type.')
+        if (
+            type_ref.name in {'c_char', 'c_void'}
+            and type_ref.borrow is None
+            and type_ref.pointer_mode is None
+        ):
+            raise SemanticError(
+                f'{type_ref.name} can only be used behind an explicit borrow or raw pointer type.'
+            )
         if type_ref.name == 'type':
             raise SemanticError('Comptime type value reached semantic validation.')
         if type_ref.is_slice and type_ref.borrow is None:
@@ -2480,6 +2836,9 @@ class SemanticPass:
             name = f'{name}[]'
         if type_ref.borrow is not None:
             name = f'&{type_ref.borrow} {name}'
+        elif type_ref.pointer_mode is not None:
+            prefix = '?' if type_ref.nullable else ''
+            name = f'{prefix}*{type_ref.pointer_mode} {name}'
         return name
 
     def _array_size_key(self, expression: Expression | None) -> str:

@@ -73,7 +73,7 @@ class ErrorEffectsTests(unittest.TestCase):
     def test_hir_cleanup_lowering_inserts_deinit_before_return(self):
         program = lower_to_hir(compile_and_validate('''
             struct Tracer {
-                deinit(&inout self) {
+                deinit(move self) {
                 }
             }
 
@@ -102,7 +102,7 @@ class ErrorEffectsTests(unittest.TestCase):
         program = lower_to_hir(compile_and_validate(
             access_error_source() + fail_source() + '''
                 struct Tracer {
-                    deinit(&inout self) {
+                    deinit(move self) {
                     }
                 }
 
@@ -134,7 +134,7 @@ class ErrorEffectsTests(unittest.TestCase):
         program = lower_to_hir(compile_and_validate(
             access_error_source() + '''
                 struct Tracer {
-                    deinit(&inout self) {
+                    deinit(move self) {
                     }
                 }
 
@@ -313,7 +313,7 @@ class ErrorEffectsTests(unittest.TestCase):
     def test_cleanup_lowering_prepares_hir_call_targets(self):
         ast = compile_and_validate(access_error_source() + fail_source() + '''
             struct Tracer {
-                deinit(&inout self) {
+                deinit(move self) {
                 }
             }
 
@@ -350,7 +350,7 @@ class ErrorEffectsTests(unittest.TestCase):
 
         program = lower_to_hir(compile_and_validate(access_error_source() + fail_source() + '''
             struct Tracer {
-                deinit(&inout self) {
+                deinit(move self) {
                 }
             }
 
@@ -395,7 +395,7 @@ class ErrorEffectsTests(unittest.TestCase):
 
         program = lower_to_hir(compile_and_validate(access_error_source() + fail_source() + '''
             struct Tracer {
-                deinit(&inout self) {
+                deinit(move self) {
                 }
             }
 
@@ -417,7 +417,7 @@ class ErrorEffectsTests(unittest.TestCase):
             struct Tracer {
                 i32 value;
 
-                deinit(&inout self) {
+                deinit(move self) {
                     print(self.value);
                 }
             }
@@ -449,7 +449,7 @@ class ErrorEffectsTests(unittest.TestCase):
             }
 
             struct Tracer {
-                deinit(&inout self) {
+                deinit(move self) {
                 }
             }
 
@@ -469,7 +469,7 @@ class ErrorEffectsTests(unittest.TestCase):
         program = lower_to_hir(compile_and_validate(
             access_error_source() + fail_source() + '''
                 struct Tracer {
-                    deinit(&inout self) {
+                    deinit(move self) {
                     }
                 }
 
@@ -478,7 +478,7 @@ class ErrorEffectsTests(unittest.TestCase):
                         fail();
                     }
 
-                    deinit(&inout self) {
+                    deinit(move self) {
                     }
                 }
 
@@ -521,7 +521,7 @@ class ErrorEffectsTests(unittest.TestCase):
             }
 
             struct Tracer {
-                deinit(&inout self) {
+                deinit(move self) {
                 }
             }
 
@@ -544,7 +544,7 @@ class ErrorEffectsTests(unittest.TestCase):
     def test_cleanup_lowering_supports_raising_expressions_in_statements(self):
         c_source = emit_c(parse(access_error_source() + fail_source() + '''
             struct Tracer {
-                deinit(&inout self) {
+                deinit(move self) {
                 }
             }
 
@@ -587,7 +587,7 @@ class ErrorEffectsTests(unittest.TestCase):
         program = lower_hir_static_cleanups(lower_to_hir(compile_and_validate(
             access_error_source() + fail_source() + '''
                 struct Tracer {
-                    deinit(&inout self) {
+                    deinit(move self) {
                     }
                 }
 
@@ -631,7 +631,7 @@ class ErrorEffectsTests(unittest.TestCase):
         program = lower_hir_static_cleanups(lower_to_hir(compile_and_validate(
             access_error_source() + fail_source() + '''
                 struct Tracer {
-                    deinit(&inout self) {
+                    deinit(move self) {
                     }
                 }
 

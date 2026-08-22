@@ -86,7 +86,7 @@ class LLVMEmitPassTests(unittest.TestCase):
                     self.value = self.value + amount;
                 }
 
-                deinit(&inout self) {
+                deinit(move self) {
                     print(self.value);
                 }
             }
@@ -207,7 +207,7 @@ class LLVMEmitPassTests(unittest.TestCase):
             struct Tracer {
                 i32 value;
 
-                deinit(&inout self) {
+                deinit(move self) {
                     print(self.value);
                 }
             }

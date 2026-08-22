@@ -6,6 +6,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -27,6 +28,7 @@ try:
         StructLiteralExpression,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -41,6 +43,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        DereferenceExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -62,6 +65,7 @@ except ImportError:
         StructLiteralExpression,
         Statement,
         Try,
+        UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -129,6 +133,11 @@ class JackEmitPass:
             return self._for_statement(statement, level)
         if type(statement) is Try:
             return self._try_statement(statement, level)
+        if type(statement) is UnsafeBlock:
+            lines = [self._line(level, 'unsafe {')]
+            lines.extend(self._block_lines(statement.body, level + 1))
+            lines.append(self._line(level, '}'))
+            return '\n'.join(lines)
         raise JackEmitError(f'Unknown statement type "{type(statement).__name__}".')
 
     def _import_declaration(self, statement: ImportDeclaration) -> str:
@@ -267,8 +276,9 @@ class JackEmitPass:
         if (
             declaration.name == 'self'
             and declaration.type.name == 'self'
-            and declaration.type.borrow is not None
         ):
+            if declaration.passing_mode == 'move':
+                return 'move self'
             return f'{prefix}&{declaration.type.borrow} self'
         result = f'{prefix}{self._type_reference(declaration.type)} {declaration.name}'
         if declaration.constraints:
@@ -355,6 +365,8 @@ class JackEmitPass:
             parts.append('pub')
         if statement.comptime:
             parts.append('comptime')
+        if getattr(statement, 'unsafe', False):
+            parts.append('unsafe')
         if allow_extern and getattr(statement, 'extern', False):
             abi = getattr(statement, 'abi', None)
             if abi is None:
@@ -367,6 +379,9 @@ class JackEmitPass:
         prefix = ''
         if type_ref.borrow is not None:
             prefix = f'&{type_ref.borrow} '
+        elif type_ref.pointer_mode is not None:
+            nullable = '?' if type_ref.nullable else ''
+            prefix = f'{nullable}*{type_ref.pointer_mode} '
         source = prefix + type_ref.name
         if type_ref.arguments:
             source += '(' + ', '.join(self._type_argument(argument) for argument in type_ref.arguments) + ')'
@@ -410,6 +425,8 @@ class JackEmitPass:
             source = f'&{expression.mode} {self._expression(expression.expr, precedence)}'
         elif type(expression) is MoveExpression:
             source = f'move {self._expression(expression.expr, precedence)}'
+        elif type(expression) is DereferenceExpression:
+            source = f'*{self._expression(expression.expr, precedence)}'
         elif type(expression) is IndexExpression:
             source = f'{self._expression(expression.target, precedence)}[{self._expression(expression.index)}]'
         elif type(expression) is SliceExpression:
@@ -439,6 +456,8 @@ class JackEmitPass:
         return f'{self._expression(expression.target, precedence)}[{start}..{end}]'
 
     def _literal(self, literal: LiteralExpression) -> str:
+        if literal.type == 'null':
+            return 'null'
         if literal.type == 'bool' or type(literal.value) is bool:
             return 'true' if bool(literal.value) else 'false'
         if literal.type == 'str' or type(literal.value) is str:
@@ -490,7 +509,7 @@ class JackEmitPass:
             if expression.operator == '+':
                 return 2
             return 1
-        if type(expression) in {BorrowExpression, MoveExpression}:
+        if type(expression) in {BorrowExpression, MoveExpression, DereferenceExpression}:
             return 3
         if type(expression) in {FunctionCall, IndexExpression, SliceExpression}:
             return 4

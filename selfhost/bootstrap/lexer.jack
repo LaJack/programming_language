@@ -1,0 +1,289 @@
+module bootstrap.lexer;
+
+import bootstrap.source;
+
+pub struct Token {
+    u8 kind;
+    SourceSpan span;
+}
+
+pub u8 token_eof() { return u8(0); }
+pub u8 token_identifier() { return u8(1); }
+pub u8 token_integer() { return u8(2); }
+pub u8 token_float() { return u8(3); }
+pub u8 token_string() { return u8(4); }
+pub u8 token_symbol() { return u8(5); }
+pub u8 token_invalid() { return u8(6); }
+
+bool is_alpha(u8 value) {
+    if (value >= u8(97)) {
+        if (value <= u8(122)) { return true; }
+    }
+    if (value >= u8(65)) {
+        if (value <= u8(90)) { return true; }
+    }
+    return value == u8(95);
+}
+
+bool is_digit(u8 value) {
+    if (value < u8(48)) { return false; }
+    return value <= u8(57);
+}
+
+bool is_symbol(u8 value) {
+    if (value == u8(123)) { return true; }
+    if (value == u8(125)) { return true; }
+    if (value == u8(40)) { return true; }
+    if (value == u8(41)) { return true; }
+    if (value == u8(91)) { return true; }
+    if (value == u8(93)) { return true; }
+    if (value == u8(59)) { return true; }
+    if (value == u8(44)) { return true; }
+    if (value == u8(58)) { return true; }
+    if (value == u8(43)) { return true; }
+    if (value == u8(46)) { return true; }
+    if (value == u8(61)) { return true; }
+    if (value == u8(60)) { return true; }
+    if (value == u8(62)) { return true; }
+    if (value == u8(33)) { return true; }
+    return value == u8(38);
+}
+
+void emit(
+    &out Token[] tokens,
+    usize count,
+    u8 kind,
+    usize start,
+    usize end,
+    usize line,
+    usize column
+) {
+    tokens[count] = Token {
+        kind = kind;
+        span = SourceSpan {
+            start = start;
+            end = end;
+            line = line;
+            column = column;
+        };
+    };
+}
+
+pub usize lex(&in u8[] source, &out Token[] tokens) {
+    usize index = 0;
+    usize line = 1;
+    usize column = 1;
+    usize count = 0;
+
+    while (index < usize(len(source))) {
+        u8 current = source[index];
+        if (current == u8(32)) {
+            index = index + usize(1);
+            column = column + usize(1);
+        } elif (current == u8(9)) {
+            index = index + usize(1);
+            column = column + usize(1);
+        } elif (current == u8(13)) {
+            index = index + usize(1);
+            column = column + usize(1);
+        } elif (current == u8(10)) {
+            index = index + usize(1);
+            line = line + usize(1);
+            column = 1;
+        } elif (is_alpha(current)) {
+            usize start = index;
+            usize start_column = column;
+            bool scanning = true;
+            while (scanning) {
+                index = index + usize(1);
+                column = column + usize(1);
+                if (index >= usize(len(source))) {
+                    scanning = false;
+                } elif (is_alpha(source[index])) {
+                } elif (is_digit(source[index])) {
+                } else {
+                    scanning = false;
+                }
+            }
+            emit(tokens, count, token_identifier(), start, index, line, start_column);
+            count = count + usize(1);
+        } elif (is_digit(current)) {
+            usize start = index;
+            usize start_column = column;
+            bool scanning = true;
+            bool floating = false;
+            while (scanning) {
+                index = index + usize(1);
+                column = column + usize(1);
+                if (index >= usize(len(source))) {
+                    scanning = false;
+                } elif (is_digit(source[index])) {
+                } else {
+                    scanning = false;
+                }
+            }
+            if (index < usize(len(source))) {
+                if (source[index] == u8(46)) {
+                    if (index + usize(1) < usize(len(source))) {
+                        if (is_digit(source[index + usize(1)])) {
+                            floating = true;
+                            index = index + usize(1);
+                            column = column + usize(1);
+                            bool fraction = true;
+                            while (fraction) {
+                                index = index + usize(1);
+                                column = column + usize(1);
+                                if (index >= usize(len(source))) {
+                                    fraction = false;
+                                } elif (is_digit(source[index])) {
+                                } else {
+                                    fraction = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (floating) {
+                emit(tokens, count, token_float(), start, index, line, start_column);
+            } else {
+                emit(tokens, count, token_integer(), start, index, line, start_column);
+            }
+            count = count + usize(1);
+        } elif (current == u8(34)) {
+            usize start = index;
+            usize start_line = line;
+            usize start_column = column;
+            index = index + usize(1);
+            column = column + usize(1);
+            bool scanning = true;
+            bool valid = true;
+            while (scanning) {
+                if (index >= usize(len(source))) {
+                    scanning = false;
+                    valid = false;
+                } elif (source[index] == u8(10)) {
+                    scanning = false;
+                    valid = false;
+                } elif (source[index] == u8(34)) {
+                    index = index + usize(1);
+                    column = column + usize(1);
+                    scanning = false;
+                } elif (source[index] == u8(92)) {
+                    index = index + usize(1);
+                    column = column + usize(1);
+                    if (index < usize(len(source))) {
+                        index = index + usize(1);
+                        column = column + usize(1);
+                    } else {
+                        scanning = false;
+                        valid = false;
+                    }
+                } else {
+                    index = index + usize(1);
+                    column = column + usize(1);
+                }
+            }
+            if (valid) {
+                emit(tokens, count, token_string(), start, index, start_line, start_column);
+            } else {
+                emit(tokens, count, token_invalid(), start, index, start_line, start_column);
+            }
+            count = count + usize(1);
+        } elif (current == u8(47)) {
+            bool line_comment = false;
+            bool block_comment = false;
+            if (index + usize(1) < usize(len(source))) {
+                if (source[index + usize(1)] == u8(47)) { line_comment = true; }
+                if (source[index + usize(1)] == u8(42)) { block_comment = true; }
+            }
+            if (line_comment) {
+                index = index + usize(2);
+                column = column + usize(2);
+                bool scanning = true;
+                while (scanning) {
+                    if (index >= usize(len(source))) {
+                        scanning = false;
+                    } elif (source[index] == u8(10)) {
+                        scanning = false;
+                    } else {
+                        index = index + usize(1);
+                        column = column + usize(1);
+                    }
+                }
+            } elif (block_comment) {
+                usize start = index;
+                usize start_line = line;
+                usize start_column = column;
+                index = index + usize(2);
+                column = column + usize(2);
+                bool scanning = true;
+                bool valid = false;
+                while (scanning) {
+                    if (index >= usize(len(source))) {
+                        scanning = false;
+                    } elif (index + usize(1) < usize(len(source))) {
+                        if (source[index] == u8(42)) {
+                            if (source[index + usize(1)] == u8(47)) {
+                                index = index + usize(2);
+                                column = column + usize(2);
+                                scanning = false;
+                                valid = true;
+                            } else {
+                                index = index + usize(1);
+                                column = column + usize(1);
+                            }
+                        } elif (source[index] == u8(10)) {
+                            index = index + usize(1);
+                            line = line + usize(1);
+                            column = 1;
+                        } else {
+                            index = index + usize(1);
+                            column = column + usize(1);
+                        }
+                    } else {
+                        index = index + usize(1);
+                        column = column + usize(1);
+                    }
+                }
+                if (valid == false) {
+                    emit(tokens, count, token_invalid(), start, index, start_line, start_column);
+                    count = count + usize(1);
+                }
+            } else {
+                emit(tokens, count, token_symbol(), index, index + usize(1), line, column);
+                index = index + usize(1);
+                column = column + usize(1);
+                count = count + usize(1);
+            }
+        } elif (is_symbol(current)) {
+            usize width = 1;
+            if (index + usize(1) < usize(len(source))) {
+                u8 next = source[index + usize(1)];
+                if (current == u8(61)) {
+                    if (next == u8(61)) { width = 2; }
+                } elif (current == u8(33)) {
+                    if (next == u8(61)) { width = 2; }
+                } elif (current == u8(60)) {
+                    if (next == u8(61)) { width = 2; }
+                } elif (current == u8(62)) {
+                    if (next == u8(61)) { width = 2; }
+                } elif (current == u8(46)) {
+                    if (next == u8(46)) { width = 2; }
+                }
+            }
+            emit(tokens, count, token_symbol(), index, index + width, line, column);
+            index = index + width;
+            column = column + width;
+            count = count + usize(1);
+        } else {
+            emit(tokens, count, token_invalid(), index, index + usize(1), line, column);
+            index = index + usize(1);
+            column = column + usize(1);
+            count = count + usize(1);
+        }
+    }
+
+    emit(tokens, count, token_eof(), index, index, line, column);
+    return count + usize(1);
+}

@@ -54,7 +54,7 @@ class OwnershipTests(unittest.TestCase):
         with self.assertRaisesRegex((SemanticError, CompileTimeError), 'Copyable|copyable|non-copyable'):
             validate_source('''
                 struct Resource {
-                    deinit(&inout self) { }
+                    deinit(move self) { }
                 }
 
                 void inspect(comptime type T, T value) { }
@@ -74,20 +74,83 @@ class OwnershipTests(unittest.TestCase):
             ):
                 validate_source(source)
 
-    def test_rejects_partial_and_global_moves(self):
-        cases = (
-            'i32 global = 1; void run() { i32 value = move global; }',
-            '''
+    def test_partial_moves_preserve_siblings_and_allow_reinitialization(self):
+        validate_source('''
+            struct Pair { i32 left; i32 right; }
+            void run() {
+                Pair pair = Pair { left = 1, right = 2 };
+                i32 left = move pair.left;
+                print(pair.right);
+                pair.left = 3;
+                print(pair.left);
+
+                i32[2] values;
+                values[0] = 4;
+                values[1] = 5;
+                i32 first = move values[0];
+                print(values[1]);
+                values[0] = 6;
+                print(values[0]);
+            }
+        ''')
+
+    def test_partial_moves_reject_aggregate_reads_until_reinitialized(self):
+        with self.assertRaisesRegex(SemanticError, 'partially moved'):
+            validate_source('''
                 struct Pair { i32 left; i32 right; }
-                void run() { Pair pair; i32 value = move pair.left; }
-            ''',
-            'void run() { i32[2] values; i32 value = move values[0]; }',
+                void run() {
+                    Pair pair = Pair { left = 1, right = 2 };
+                    i32 left = move pair.left;
+                    Pair copy = pair;
+                }
+            ''')
+
+    def test_rejects_global_dynamic_and_destructor_partial_moves(self):
+        cases = (
+            ('i32 global = 1; void run() { i32 value = move global; }', 'owned local'),
+            (
+                'void run(i32 index) { i32[2] values; i32 value = move values[index]; }',
+                'compile-time fixed-array index',
+            ),
+            ('''
+                struct Resource {
+                    i32 value;
+                    deinit(move self) { }
+                }
+                void run() { Resource value; i32 field = move value.value; }
+            ''', 'declares deinit'),
         )
-        for source in cases:
-            with self.subTest(source=source), self.assertRaisesRegex(
-                SemanticError, 'whole local|owned locals'
-            ):
+        for source, message in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(SemanticError, message):
                 validate_source(source)
+
+    def test_consuming_destructor_may_move_its_own_fields(self):
+        validate_source('''
+            struct Resource {
+                i32 value;
+                deinit(move self) {
+                    i32 extracted = move self.value;
+                    print(extracted);
+                }
+            }
+        ''')
+
+    def test_nullable_raw_pointer_refinement_is_branch_local(self):
+        validate_source('''
+            unsafe void read(?*in i32 pointer) {
+                if (pointer != null) {
+                    unsafe { i32 value = *pointer; }
+                }
+            }
+        ''')
+
+        with self.assertRaisesRegex(SemanticError, 'must be refined'):
+            validate_source('''
+                unsafe void read(?*in i32 pointer) {
+                    if (pointer != null) { }
+                    unsafe { i32 value = *pointer; }
+                }
+            ''')
 
     def test_branch_and_loop_dataflow_reject_maybe_moved_values(self):
         with self.assertRaisesRegex(SemanticError, 'possibly moved'):
@@ -116,7 +179,7 @@ class OwnershipTests(unittest.TestCase):
                 struct Resource {
                     i32 id;
                     init(&inout self, i32 id) { self.id = id; }
-                    deinit(&inout self) { print(self.id); }
+                    deinit(move self) { print(self.id); }
                 }
 
                 Resource make(i32 id) {

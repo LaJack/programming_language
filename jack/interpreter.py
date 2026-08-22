@@ -1,10 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Self
 import copy
 try:
     from .borrow_modes import borrow_mode_can_read, borrow_mode_can_write, borrow_mode_compatible
     from .builtin_types import (
+        BUILTIN_TYPE_SPECS,
         BuiltinType,
         JackPrimitiveValue,
         is_bool_type,
@@ -38,6 +39,9 @@ try:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMaybeUninitBorrowExpression,
+        HIRMaybeUninitTakeExpression,
+        HIRMaybeUninitWriteExpression,
         HIRMoveExpression,
         HIRPointerCastExpression,
         HIRPointerOffsetExpression,
@@ -59,9 +63,11 @@ try:
         HIRWhile,
     )
     from .parser import parse
+    from .memory_model import MaybeUninit as MemoryMaybeUninit
 except ImportError:
     from borrow_modes import borrow_mode_can_read, borrow_mode_can_write, borrow_mode_compatible
     from builtin_types import (
+        BUILTIN_TYPE_SPECS,
         BuiltinType,
         JackPrimitiveValue,
         is_bool_type,
@@ -95,6 +101,9 @@ except ImportError:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMaybeUninitBorrowExpression,
+        HIRMaybeUninitTakeExpression,
+        HIRMaybeUninitWriteExpression,
         HIRMoveExpression,
         HIRPointerCastExpression,
         HIRPointerOffsetExpression,
@@ -116,6 +125,7 @@ except ImportError:
         HIRWhile,
     )
     from parser import parse
+    from memory_model import MaybeUninit as MemoryMaybeUninit
 
 
 class InterpreterError(Exception):
@@ -253,6 +263,27 @@ class JackSymbolBorrow(JackBorrow):
         )
 
 
+class JackMaybeUninitBorrow(JackBorrow):
+    def __init__(self, slot: MemoryMaybeUninit, mode: str) -> None:
+        self.slot = slot
+        self.mode = mode
+        self.mutable = borrow_mode_can_write(mode)
+        self.field_modes = None
+
+    @property
+    def value(self) -> object:
+        return self.slot.get()
+
+    @value.setter
+    def value(self, value: object) -> None:
+        if not self.mutable:
+            raise EvaluationError('Cannot assign through a read-only borrow.')
+        self.slot.set_initialized(value)
+
+    def __deepcopy__(self, memo):
+        return JackMaybeUninitBorrow(self.slot, self.mode)
+
+
 @dataclass
 class JackArrayElementBorrow:
     array: JackArray
@@ -346,6 +377,42 @@ class JackRawPointer:
             self.allocation,
         )
 
+    def as_maybe_uninit(self, element_key: str, element_size: int) -> 'JackRawPointer':
+        self._require_live()
+        if self.allocation is None:
+            return self
+        if element_size <= 0:
+            raise EvaluationError('MaybeUninit pointer element size must be positive.')
+        byte_offset = (
+            self.target.index
+            if isinstance(self.target, JackArrayElementBorrow)
+            else 0
+        )
+        if byte_offset % element_size:
+            raise EvaluationError('MaybeUninit pointer has invalid alignment.')
+        key = (element_key, element_size)
+        storage = self.allocation.typed_views.get(key)
+        if storage is None:
+            count = len(self.allocation.storage.values) // element_size
+            storage = JackArray(
+                TypeReference(element_key),
+                [MemoryMaybeUninit() for _ in range(count)],
+            )
+            self.allocation.typed_views[key] = storage
+        index = byte_offset // element_size
+        if index < 0 or index >= len(storage.values):
+            raise EvaluationError('Typed pointer is out of allocation bounds.')
+        return JackRawPointer(
+            JackArrayElementBorrow(
+                storage,
+                index,
+                mutable=self.mutable,
+                mode='inout' if self.mutable else 'in',
+            ),
+            self.mutable,
+            self.allocation,
+        )
+
     def _require_live(self) -> None:
         if self.allocation is not None and not self.allocation.live:
             raise EvaluationError(
@@ -359,6 +426,7 @@ class JackAllocationRecord:
     storage: JackArray
     alignment: int
     live: bool = True
+    typed_views: dict[tuple[str, int], JackArray] = field(default_factory=dict)
 
 
 _MOVED_VALUE = object()
@@ -579,6 +647,9 @@ class Interpreter:
     def _execute_hir_type_declaration(
         self, type_decl: HIRTypeDeclaration, scope: SymbolTable
     ) -> None:
+        if type_decl.language_item == 'MaybeUninit':
+            scope.declare(type_decl.name, MemoryMaybeUninit)
+            return
         if type_decl.extern:
             scope.declare(type_decl.name, type(type_decl.name, (), {}))
             return
@@ -831,6 +902,29 @@ class Interpreter:
             return self._eval_hir_borrow(expression, scope)
         if isinstance(expression, HIRMoveExpression):
             return self._take_hir_place(expression.expr, scope)
+        if isinstance(expression, HIRMaybeUninitWriteExpression):
+            slot = self._method_receiver_value(
+                self._eval_hir_expression(expression.slot, scope)
+            )
+            if not isinstance(slot, MemoryMaybeUninit):
+                raise EvaluationError('MaybeUninit.write requires an uninitialized slot.')
+            slot.write(self._eval_hir_expression(expression.value, scope))
+            return None
+        if isinstance(expression, HIRMaybeUninitTakeExpression):
+            slot = self._method_receiver_value(
+                self._eval_hir_expression(expression.slot, scope)
+            )
+            if not isinstance(slot, MemoryMaybeUninit):
+                raise EvaluationError('MaybeUninit.take requires a storage slot.')
+            return slot.take()
+        if isinstance(expression, HIRMaybeUninitBorrowExpression):
+            slot = self._method_receiver_value(
+                self._eval_hir_expression(expression.slot, scope)
+            )
+            if not isinstance(slot, MemoryMaybeUninit):
+                raise EvaluationError('MaybeUninit.borrow requires a storage slot.')
+            slot.get()
+            return JackMaybeUninitBorrow(slot, expression.mode)
         if isinstance(expression, HIRRawAddressExpression):
             borrowed = self._eval_hir_borrow(
                 HIRBorrowExpression(
@@ -859,7 +953,19 @@ class Interpreter:
                 raise EvaluationError('Cannot offset a null or non-pointer value.')
             return pointer.offset(self._hir_index_value(expression.offset, scope))
         if isinstance(expression, HIRPointerCastExpression):
-            return self._eval_hir_expression(expression.pointer, scope)
+            pointer = self._eval_hir_expression(expression.pointer, scope)
+            if not isinstance(pointer, JackRawPointer):
+                return pointer
+            target = self._element_type(expression.type_ref)
+            declaration = self.hir_types_by_name.get(target.name)
+            if declaration is not None and declaration.language_item == 'MaybeUninit':
+                element = declaration.language_item_type
+                assert element is not None
+                return pointer.as_maybe_uninit(
+                    target.name,
+                    self._interpreter_type_size(element),
+                )
+            return pointer
         raise EvaluationError(f'Unknown HIR expression type "{type(expression).__name__}".')
 
     def _eval_hir_expression_as_type(
@@ -1442,6 +1548,8 @@ class Interpreter:
     def _value_needs_drop(self, value: object) -> bool:
         if value is _MOVED_VALUE:
             return False
+        if isinstance(value, MemoryMaybeUninit):
+            return False
         if isinstance(value, (JackBorrow, JackArrayElementBorrow, JackSlice)):
             return False
         if isinstance(value, JackArray):
@@ -1542,6 +1650,12 @@ class Interpreter:
             raise EvaluationError(
                 f'Cannot create a default value for type "{self._type_name(type_ref)}".'
             )
+        if type_ref.pointer_mode is not None:
+            if type_ref.nullable:
+                return None
+            raise EvaluationError(
+                f'Cannot create a default value for type "{self._type_name(type_ref)}".'
+            )
         if self._is_array_type(type_ref):
             size = self._array_size_value(type_ref.array_size)
             element_type = self._element_type(type_ref)
@@ -1557,6 +1671,34 @@ class Interpreter:
             raise EvaluationError(
                 f'Cannot create a default value for type "{self._type_name(type_ref)}".'
             ) from err
+
+    def _interpreter_type_size(self, type_ref: TypeReference) -> int:
+        if type_ref.pointer_mode is not None or type_ref.borrow is not None:
+            return 8
+        if type_ref.is_slice or type_ref.name == 'str':
+            return 16
+        if type_ref.array_size is not None:
+            return (
+                self._interpreter_type_size(self._element_type(type_ref))
+                * self._array_size_value(type_ref.array_size)
+            )
+        if is_builtin_type(type_ref.name):
+            return max(1, BUILTIN_TYPE_SPECS[type_ref.name].bits // 8)
+        declaration = self.hir_types_by_name.get(type_ref.name)
+        if declaration is None:
+            return 8
+        if declaration.language_item == 'MaybeUninit':
+            assert declaration.language_item_type is not None
+            return self._interpreter_type_size(declaration.language_item_type)
+        offset = 0
+        maximum_alignment = 1
+        for field_declaration in declaration.fields:
+            size = self._interpreter_type_size(field_declaration.type_ref)
+            alignment = min(max(size, 1), 8)
+            offset = (offset + alignment - 1) // alignment * alignment
+            offset += size
+            maximum_alignment = max(maximum_alignment, alignment)
+        return max(1, (offset + maximum_alignment - 1) // maximum_alignment * maximum_alignment)
 
     def _coerce_borrow_value(self, value: object, type_ref: TypeReference) -> object:
         type_name = self._type_name(type_ref)

@@ -65,6 +65,9 @@ try:
         HIRImportDeclaration,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMaybeUninitBorrowExpression,
+        HIRMaybeUninitTakeExpression,
+        HIRMaybeUninitWriteExpression,
         HIRModuleDeclaration,
         HIRMoveExpression,
         HIRPointerCastExpression,
@@ -150,6 +153,9 @@ except ImportError:
         HIRImportDeclaration,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMaybeUninitBorrowExpression,
+        HIRMaybeUninitTakeExpression,
+        HIRMaybeUninitWriteExpression,
         HIRModuleDeclaration,
         HIRMoveExpression,
         HIRPointerCastExpression,
@@ -448,6 +454,9 @@ class HIRLoweringPass(SemanticPass):
             source_name=declaration.source_name,
             extern=declaration.extern,
             abi=declaration.abi,
+            language_item=declaration.language_item,
+            language_item_type=self._copy_type(declaration.language_item_type)
+            if declaration.language_item_type is not None else None,
             span=declaration.span,
         )
 
@@ -877,6 +886,50 @@ class HIRLoweringPass(SemanticPass):
                         span=expression.span,
                     ),
                 )
+            if '.' in expression.function_name:
+                receiver_name, method_name = expression.function_name.rsplit('.', 1)
+                receiver = self._name_expression(
+                    receiver_name, scope, expression.span
+                )
+                declaration = self.types.get(
+                    self._type_name(self._element_type(receiver.type_ref))
+                )
+                if declaration is not None and declaration.language_item == 'MaybeUninit':
+                    assert declaration.language_item_type is not None
+                    element = self._copy_type(declaration.language_item_type)
+                    if method_name == 'write':
+                        value = self._expression(expression.parameters[0], scope)
+                        if isinstance(value, HIRVariableExpression):
+                            value = HIRMoveExpression(
+                                expr=value,
+                                type_ref=self._copy_type(value.type_ref),
+                                read_type=self._copy_type(value.read_type),
+                                span=expression.parameters[0].span,
+                            )
+                        return HIRMaybeUninitWriteExpression(
+                            slot=receiver,
+                            value=value,
+                            type_ref=TypeReference('void'),
+                            read_type=TypeReference('void'),
+                            span=expression.span,
+                        )
+                    if method_name == 'take':
+                        return HIRMaybeUninitTakeExpression(
+                            slot=receiver,
+                            type_ref=element,
+                            read_type=self._copy_type(element),
+                            span=expression.span,
+                        )
+                    mode = 'in' if method_name == 'borrow' else 'inout'
+                    borrowed = self._copy_type(element)
+                    borrowed.borrow = mode
+                    return HIRMaybeUninitBorrowExpression(
+                        slot=receiver,
+                        mode=mode,
+                        type_ref=borrowed,
+                        read_type=self._copy_type(borrowed),
+                        span=expression.span,
+                    )
             return self._call_expression(expression, scope)
         if type(expression) is FormattedStringExpression:
             return self._record_expression(

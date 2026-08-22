@@ -578,11 +578,27 @@ indexes, and ordinary values whose type declares `deinit` cannot be partially
 moved. The exception is a type's own consuming destructor. Reassignment starts
 a new object lifetime for a moved place.
 
-The bootstrap runtime has backend-neutral checked `Layout`, `MaybeUninit`, and
-linear allocation-token primitives in `jack.memory_model`. Their source-level
-language-item API and the `Allocator` interface are still being integrated;
-safe heap containers must not depend on raw `malloc` tokens until that API is
-available.
+`MaybeUninit(T)` has exactly `T`'s layout but does not begin an object lifetime
+and never destroys its contents. Its unsafe `write`, `take`, `borrow`, and
+`borrow_mut` operations are the only way to assert or change slot
+initialization. The interpreter checks those transitions; invalid native use is
+undefined behavior.
+
+`Allocation` is an opaque, non-copyable token. `Allocator.allocate` grants at
+least a requested `Layout`, `Allocation.layout()` reports the actual grant, and
+the allocator resolves temporary raw addresses relative to itself. Containers
+must not cache those addresses. `StaticAllocator(T, N)` owns inline
+`MaybeUninit(T)[N]` storage and permits one live allocation; its first compatible
+request grants all `N` slots. `SystemAllocator` uses host `malloc` and `free`.
+
+`Vector(T, A: Allocator)` owns its allocator and allocation token. `push` is
+constant time while capacity remains. When full it requests twice the current
+capacity (or one from zero), then moves elements in index order only after the
+replacement allocation succeeds. Heap growth is therefore linear; a bounded
+static allocator rejects the growth attempt with `CapacityError`. A failed
+`push` leaves the vector unchanged and consumes and destroys its moved argument
+during error propagation. `pop`, `clear`, and destruction remove elements in
+reverse index order.
 
 ## Built-Ins
 
@@ -603,8 +619,8 @@ limitations include:
 
 - no interface inheritance, associated types, default methods, interface
   objects, or dynamic dispatch;
-- the source-level `MaybeUninit`, `Allocation`, and `Allocator` language-item
-  APIs are not exposed yet;
+- allocator borrowing, shrinking containers, insertion and removal in the
+  middle, pinning, and stable allocator ABI are not implemented;
 - no user-facing lifetime syntax;
 - partial moves are limited to fields and constant fixed-array indexes, and
   non-lexical borrow lifetimes are not supported;

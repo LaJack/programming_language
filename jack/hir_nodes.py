@@ -93,6 +93,8 @@ class HIRTypeDeclaration(HIRDeclaration):
     source_name: str | None = None
     extern: bool = False
     abi: str | None = None
+    language_item: str | None = None
+    language_item_type: TypeReference | None = None
 
     @property
     def parameters(self) -> list[HIRVariableSymbol]:
@@ -190,6 +192,23 @@ class HIRPointerOffsetExpression(HIRExpression):
 @dataclass(frozen=True, kw_only=True)
 class HIRPointerCastExpression(HIRExpression):
     pointer: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRMaybeUninitWriteExpression(HIRExpression):
+    slot: HIRExpression
+    value: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRMaybeUninitTakeExpression(HIRExpression):
+    slot: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRMaybeUninitBorrowExpression(HIRExpression):
+    slot: HIRExpression
+    mode: str
 
 
 @dataclass(frozen=True, kw_only=True)

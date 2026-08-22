@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import copy
 
 try:
@@ -134,6 +134,7 @@ class SymbolInfo:
     can_return_borrow: bool = False
     passing_mode: str = 'copy'
     owned_local: bool = False
+    ownership_key: object = field(default_factory=object, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -855,7 +856,7 @@ class SemanticPass:
                 owned_local=not self._is_borrow_type(parameter.type),
             )
             scope.declare(parameter.name, info)
-            self.ownership_states[id(info)] = 'initialized'
+            self.ownership_states[info.ownership_key] = 'initialized'
 
         previous_module_name = self.current_module_name
         previous_imports = self.current_imports
@@ -906,11 +907,14 @@ class SemanticPass:
             module_name=type_decl.module_name,
             can_return_borrow=method.name != 'deinit',
             passing_mode=method.self_parameter.passing_mode,
-            owned_local=method.name == 'deinit',
+            owned_local=(
+                method.name == 'deinit'
+                or method.self_parameter.type.borrow == 'inout'
+            ),
         )
         scope.declare('self', self_info)
         if self_info.owned_local:
-            self.ownership_states[id(self_info)] = 'initialized'
+            self.ownership_states[self_info.ownership_key] = 'initialized'
         for parameter in method.parameters:
             info = SymbolInfo(
                 'variable', parameter.type,
@@ -920,7 +924,7 @@ class SemanticPass:
                 owned_local=not self._is_borrow_type(parameter.type),
             )
             scope.declare(parameter.name, info)
-            self.ownership_states[id(info)] = 'initialized'
+            self.ownership_states[info.ownership_key] = 'initialized'
 
         previous_module_name = self.current_module_name
         previous_imports = self.current_imports
@@ -1097,7 +1101,7 @@ class SemanticPass:
             owned_local=scope is not self.global_scope and not self._is_borrow_type(declaration.type),
         )
         scope.declare(declaration.name, info)
-        self.ownership_states[id(info)] = 'initialized'
+        self.ownership_states[info.ownership_key] = 'initialized'
         for access in borrow_accesses:
             scope.add_borrow(declaration.name, access)
         if declaration.constructor_args:
@@ -1133,7 +1137,7 @@ class SemanticPass:
         scope: SemanticScope,
         *,
         require_static_index: bool,
-    ) -> tuple[int, str, tuple[str, ...]] | None:
+    ) -> tuple[object, str, tuple[str, ...]] | None:
         if isinstance(target, str):
             parts = target.split('.')
             root, projections = parts[0], tuple(parts[1:])
@@ -1160,10 +1164,10 @@ class SemanticPass:
         info = scope.get(root)
         if info is None or not info.owned_local:
             return None
-        return (id(info), root, projections)
+        return (info.ownership_key, root, projections)
 
     def _require_place_initialized(
-        self, place: tuple[int, str, tuple[str, ...]]
+        self, place: tuple[object, str, tuple[str, ...]]
     ) -> None:
         symbol_id, root, projections = place
         root_state = self.ownership_states.get(symbol_id, 'initialized')
@@ -1202,7 +1206,7 @@ class SemanticPass:
             raise SemanticError(f'Cannot use "{label}" because it is partially moved.')
 
     def _set_place_state(
-        self, place: tuple[int, str, tuple[str, ...]], state: str
+        self, place: tuple[object, str, tuple[str, ...]], state: str
     ) -> None:
         symbol_id, _, projections = place
         if not projections:
@@ -1221,7 +1225,7 @@ class SemanticPass:
         self.ownership_states[symbol_id] = 'partial' if outstanding else 'initialized'
 
     def _ownership_place_label(
-        self, place: tuple[int, str, tuple[str, ...]]
+        self, place: tuple[object, str, tuple[str, ...]]
     ) -> str:
         _, root, projections = place
         return root + ''.join(
@@ -1388,9 +1392,7 @@ class SemanticPass:
     def _validate_loop_back_edge(
         self, initial: dict[object, str], outcome: dict[object, str]
     ) -> None:
-        keys = set(initial) | set(outcome)
-        for key in keys:
-            initial_state = initial.get(key, 'initialized')
+        for key, initial_state in initial.items():
             if initial_state == 'initialized' and outcome.get(key, 'initialized') != 'initialized':
                 raise SemanticError(
                     'A loop-carried value moved in the loop body must be reinitialized '
@@ -1437,7 +1439,7 @@ class SemanticPass:
                     owned_local=True,
                 )
                 catch_scope.declare(catch.name, info)
-                self.ownership_states[id(info)] = 'initialized'
+                self.ownership_states[info.ownership_key] = 'initialized'
             self.current_rethrow_errors.append(error_name)
             try:
                 self._validate_statements(catch.body, catch_scope, allow_return)
@@ -1512,6 +1514,10 @@ class SemanticPass:
                     'compile-time fixed-array index.'
                 )
             _, root, projections = place
+            if root == 'self' and not projections and self.current_deinit_owner is None:
+                raise SemanticError(
+                    'Only a consuming destructor may move its complete self value.'
+                )
             info = scope.get(root)
             assert info is not None and info.type_ref is not None
             if projections and self._type_declares_deinit(info.type_ref) and not (
@@ -1617,6 +1623,10 @@ class SemanticPass:
         declaration = self.types.get(type_name)
         if declaration is None or declaration.extern or declaration.parameters:
             raise SemanticError(f'Struct literal type "{type_name}" must be a concrete struct type.')
+        if declaration.language_item is not None:
+            raise SemanticError(
+                f'Language item "{declaration.source_name or declaration.name}" cannot be constructed as a struct literal.'
+            )
 
         declared_fields = {field.name: field for field in declaration.fields}
         seen: set[str] = set()
@@ -1732,6 +1742,14 @@ class SemanticPass:
                 nullable=pointer_type.nullable,
             )
         if '.' in call.function_name:
+            receiver_name, method_name = call.function_name.rsplit('.', 1)
+            receiver_type = self._resolve_name_type(receiver_name, scope)
+            declaration = self.types.get(self._type_name(self._element_type(receiver_type)))
+            if declaration is not None and declaration.language_item == 'MaybeUninit':
+                return self._validate_maybe_uninit_call(
+                    call, receiver_name, receiver_type, method_name, declaration, scope
+                )
+        if '.' in call.function_name:
             return self._validate_method_call(call, scope)
         if call.function_name == 'len':
             return self._validate_len_call(call, scope)
@@ -1749,6 +1767,51 @@ class SemanticPass:
         self._validate_call_arguments(call.function_name, declaration.parameters, call.parameters, scope)
         self._validate_call_raises(call.function_name, declaration.raises)
         return declaration.return_type
+
+    def _validate_maybe_uninit_call(
+        self,
+        call: FunctionCall,
+        receiver_name: str,
+        receiver_type: TypeReference,
+        method_name: str,
+        declaration: TypeDeclaration,
+        scope: SemanticScope,
+    ) -> TypeReference:
+        if self.unsafe_depth == 0:
+            raise SemanticError(
+                f'MaybeUninit.{method_name} requires an unsafe context.'
+            )
+        element = declaration.language_item_type
+        assert element is not None
+        if method_name == 'write':
+            if len(call.parameters) != 1:
+                raise SemanticError('MaybeUninit.write expects one value.')
+            argument = call.parameters[0]
+            expression: Expression = argument
+            if type(argument) is VariableExpression:
+                expression = MoveExpression(argument, span=argument.span)
+            actual = self._expression_type_for_target(expression, element, scope)
+            self._expect_assignable(element, actual, expression, 'MaybeUninit.write value')
+            if receiver_type.borrow == 'in':
+                raise SemanticError('MaybeUninit.write requires writable storage.')
+            return TypeReference('void')
+        if call.parameters:
+            raise SemanticError(f'MaybeUninit.{method_name} expects no arguments.')
+        if method_name == 'take':
+            if receiver_type.borrow == 'in':
+                raise SemanticError('MaybeUninit.take requires writable storage.')
+            return copy.deepcopy(element)
+        if method_name == 'borrow':
+            result = copy.deepcopy(element)
+            result.borrow = 'in'
+            return result
+        if method_name == 'borrow_mut':
+            if receiver_type.borrow == 'in':
+                raise SemanticError('MaybeUninit.borrow_mut requires writable storage.')
+            result = copy.deepcopy(element)
+            result.borrow = 'inout'
+            return result
+        raise SemanticError(f'MaybeUninit has no operation "{method_name}".')
 
     def _validate_len_call(self, call: FunctionCall, scope: SemanticScope) -> TypeReference:
         if len(call.parameters) != 1:
@@ -1890,7 +1953,13 @@ class SemanticPass:
             mode = parameter.type.borrow or 'in'
             if borrow_mode_can_read(mode):
                 for access in borrow_accesses:
-                    self._require_initialized(access.path.root, scope)
+                    info = scope.get(access.path.root)
+                    if info is not None and info.owned_local:
+                        self._require_place_initialized(
+                            (info.ownership_key, access.path.root, access.path.fields)
+                        )
+                    else:
+                        self._require_initialized(access.path.root, scope)
             self._check_borrow_conflicts(
                 borrow_accesses,
                 scope,
@@ -1900,7 +1969,7 @@ class SemanticPass:
             if mode == 'out' and type(argument) is VariableExpression and '.' not in argument.name:
                 info = scope.get(argument.name)
                 if info is not None and info.owned_local:
-                    self.ownership_states[id(info)] = 'initialized'
+                    self.ownership_states[info.ownership_key] = 'initialized'
             return borrow_accesses
 
         expression = argument
@@ -1923,6 +1992,16 @@ class SemanticPass:
     def _validate_borrow_return(
         self, expression: Expression, return_type: TypeReference, scope: SemanticScope
     ) -> None:
+        if type(expression) is FunctionCall and '.' in expression.function_name:
+            receiver_name, method_name = expression.function_name.rsplit('.', 1)
+            receiver_type = self._resolve_name_type(receiver_name, scope)
+            receiver_decl = self._type_declaration_for(receiver_type)
+            if (
+                receiver_decl.language_item == 'MaybeUninit'
+                and method_name in {'borrow', 'borrow_mut'}
+                and self.unsafe_depth > 0
+            ):
+                return
         accesses = self._borrow_return_accesses(expression, return_type, scope)
         if not accesses:
             raise SemanticError(
@@ -2549,6 +2628,8 @@ class SemanticPass:
         declaration = self.types.get(name)
         if declaration is None:
             return True
+        if declaration.language_item == 'MaybeUninit':
+            return False
         if (name, 'Copyable') in self.implementations:
             return True
         if declaration.extern or any(method.name == 'deinit' for method in declaration.methods):

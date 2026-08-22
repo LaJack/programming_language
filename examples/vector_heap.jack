@@ -2,23 +2,15 @@ import std.collections.vector;
 import std.memory;
 
 void run() raises CapacityError, LayoutError, AllocationError, BoundsError {
-    StaticAllocator(i32, 4) storage;
-    Vector(i32, StaticAllocator(i32, 4)) values(storage, 3);
-
+    SystemAllocator storage;
+    Vector(i32, SystemAllocator) values(storage, 1);
     values.push(10);
     values.push(20);
     values.push(30);
-    values.push(40);
 
-    usize length = values.len();
-    &in i32 first = values.get(0);
-    &in i32 second = values.get(1);
-    &in i32 third = values.get(2);
-
-    print(length);
-    print(first);
-    print(second);
-    print(third);
+    print(values.len());
+    &in i32 last = values.get(2);
+    print(last);
 }
 
 try {

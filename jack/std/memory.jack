@@ -1,6 +1,7 @@
 module std.memory;
 
 pub struct LayoutError { }
+pub struct CapacityError { }
 pub struct AllocationError { }
 
 pub struct Layout {
@@ -37,16 +38,26 @@ pub Layout layout_array(comptime type T, usize count) raises LayoutError {
 }
 
 pub struct Allocation {
-    *inout b8 address;
-    Layout layout;
+    ?*inout b8 host_address;
+    Layout granted_layout;
     usize allocator_identity;
+    bool live;
+
+    Layout layout(&in self) {
+        return self.granted_layout;
+    }
 
     deinit(move self) { }
 }
 
 pub interface Allocator {
-    Allocation allocate(&inout self, Layout layout)
-        raises AllocationError;
+    Allocation allocate(&inout self, Layout minimum)
+        raises CapacityError, AllocationError;
+
+    unsafe *inout b8 address(
+        &inout self,
+        &in Allocation allocation
+    );
 
     unsafe void deallocate(&inout self, move Allocation allocation);
 }
@@ -63,23 +74,88 @@ pub struct SystemAllocator {
 }
 
 SystemAllocator implements Allocator {
-    Allocation allocate(&inout self, Layout layout)
-        raises AllocationError
+    Allocation allocate(&inout self, Layout minimum)
+        raises CapacityError, AllocationError
     {
         unsafe {
-            ?*inout c_void storage = malloc(layout.size());
+            ?*inout c_void storage = malloc(minimum.size());
             if (storage != null) {
                 return Allocation {
-                    address = storage.cast(b8),
-                    layout = layout,
-                    allocator_identity = self.identity
+                    host_address = storage.cast(b8),
+                    granted_layout = minimum,
+                    allocator_identity = self.identity,
+                    live = true
                 };
             }
         }
         raise AllocationError { };
     }
 
+    unsafe *inout b8 address(
+        &inout self,
+        &in Allocation allocation
+    ) {
+        if (allocation.host_address != null) {
+            return allocation.host_address;
+        }
+        *inout SystemAllocator pointer = raw(&inout self);
+        return pointer.cast(b8);
+    }
+
     unsafe void deallocate(&inout self, move Allocation allocation) {
-        free(allocation.address.cast(c_void));
+        if (allocation.host_address != null) {
+            free(allocation.host_address.cast(c_void));
+        }
+    }
+}
+
+pub struct StaticAllocator(comptime type T, comptime usize N) {
+    MaybeUninit(T)[N] storage;
+    bool allocated;
+    usize identity;
+
+    init(&inout self) {
+        self.allocated = false;
+        self.identity = 2;
+    }
+}
+
+StaticAllocator(comptime type T, comptime usize N) implements Allocator {
+    Allocation allocate(&inout self, Layout minimum)
+        raises CapacityError, AllocationError
+    {
+        Layout available = Layout {
+            byte_size = sizeof(T) * N,
+            byte_alignment = alignof(T)
+        };
+        if (self.allocated) {
+            raise CapacityError { };
+        }
+        if (minimum.size() > available.size()) {
+            raise CapacityError { };
+        }
+        self.allocated = true;
+        return Allocation {
+            host_address = null,
+            granted_layout = available,
+            allocator_identity = self.identity,
+            live = true
+        };
+    }
+
+    unsafe *inout b8 address(
+        &inout self,
+        &in Allocation allocation
+    ) {
+        if (N == usize(0)) {
+            *inout StaticAllocator(T, N) pointer = raw(&inout self);
+            return pointer.cast(b8);
+        }
+        *inout MaybeUninit(T) pointer = raw(&inout self.storage[0]);
+        return pointer.cast(b8);
+    }
+
+    unsafe void deallocate(&inout self, move Allocation allocation) {
+        self.allocated = false;
     }
 }

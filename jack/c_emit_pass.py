@@ -42,6 +42,9 @@ try:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMaybeUninitBorrowExpression,
+        HIRMaybeUninitTakeExpression,
+        HIRMaybeUninitWriteExpression,
         HIRMoveExpression,
         HIRPointerCastExpression,
         HIRPointerOffsetExpression,
@@ -103,6 +106,9 @@ except ImportError:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMaybeUninitBorrowExpression,
+        HIRMaybeUninitTakeExpression,
+        HIRMaybeUninitWriteExpression,
         HIRMoveExpression,
         HIRPointerCastExpression,
         HIRPointerOffsetExpression,
@@ -1188,6 +1194,8 @@ class CEmitPass:
 
     def _emit_type_declaration(self, declaration: TypeDeclaration) -> str:
         self._ensure_runtime_statement(declaration)
+        if getattr(declaration, 'language_item', None) == 'MaybeUninit':
+            return ''
         if declaration.extern:
             if declaration.abi != 'c':
                 raise CEmitError(f'Extern type "{declaration.name}" must use the "c" ABI.')
@@ -1478,6 +1486,26 @@ class CEmitPass:
         self, statement: HIRVariableDeclaration, env: dict[str, TypeReference]
     ) -> list[str]:
         symbol = statement.symbol
+        if (
+            statement.initializer is None
+            and statement.constructor_call is None
+            and self._is_borrow_type(symbol.type_ref)
+        ):
+            env[symbol.name] = symbol.type_ref
+            return [
+                f'{self._emit_declaration(symbol.type_ref, self._mangle(symbol.name), env)};'
+            ]
+        type_declaration = self.type_declarations.get(symbol.type_ref.name)
+        if (
+            statement.initializer is None
+            and statement.constructor_call is None
+            and type_declaration is not None
+            and type_declaration.language_item == 'MaybeUninit'
+        ):
+            env[symbol.name] = symbol.type_ref
+            return [
+                f'{self._emit_declaration(symbol.type_ref, self._mangle(symbol.name), env)};'
+            ]
         if symbol.type_ref.array_size is not None and statement.initializer is not None:
             env[symbol.name] = symbol.type_ref
             target = self._mangle(symbol.name)
@@ -1894,9 +1922,29 @@ class CEmitPass:
             return self._emit_hir_borrow_expression(expression, env)
         if isinstance(expression, HIRMoveExpression):
             return self._emit_hir_expression(expression.expr, env)
+        if isinstance(expression, HIRMaybeUninitWriteExpression):
+            slot = self._emit_hir_expression(expression.slot, env)
+            if expression.slot.type_ref.borrow is not None:
+                slot = f'(*{slot})'
+            return (
+                f'({slot} = '
+                f'{self._emit_hir_value_expression(expression.value, env)})'
+            )
+        if isinstance(expression, HIRMaybeUninitTakeExpression):
+            slot = self._emit_hir_expression(expression.slot, env)
+            return f'(*{slot})' if expression.slot.type_ref.borrow is not None else slot
+        if isinstance(expression, HIRMaybeUninitBorrowExpression):
+            slot = self._emit_hir_expression(expression.slot, env)
+            return slot if expression.slot.type_ref.borrow is not None else f'(&{slot})'
         if isinstance(expression, HIRDereferenceExpression):
             return f'(*{self._emit_hir_expression(expression.expr, env)})'
         if isinstance(expression, HIRRawAddressExpression):
+            if (
+                isinstance(expression.expr, HIRVariableExpression)
+                and env.get(expression.expr.name) is not None
+                and env[expression.expr.name].borrow is not None
+            ):
+                return self._emit_hir_expression(expression.expr, env)
             return f'(&{self._emit_hir_expression(expression.expr, env)})'
         if isinstance(expression, HIRPointerOffsetExpression):
             return (
@@ -2535,6 +2583,11 @@ class CEmitPass:
             return 'void'
         if name == 'type':
             raise CEmitError('Comptime type value reached C emission.')
+        declaration = self.type_declarations.get(name)
+        if declaration is not None and declaration.language_item == 'MaybeUninit':
+            if declaration.language_item_type is None:
+                raise CEmitError('MaybeUninit declaration has no element type.')
+            return self._emit_type(declaration.language_item_type)
         return self._mangle(name)
 
     def _zero_value(self, type_ref: TypeReference) -> str:
@@ -2554,6 +2607,12 @@ class CEmitPass:
         return '{0}'
 
     def _return_zero_value(self, type_ref: TypeReference) -> str:
+        if (
+            self._is_borrow_type(type_ref)
+            and not self._is_slice_type(type_ref)
+            and not self._is_view_borrow_type(type_ref)
+        ):
+            return 'NULL'
         if is_builtin_type(self._type_name(type_ref)):
             type_name = self._type_name(type_ref)
             if is_bool_type(type_name):

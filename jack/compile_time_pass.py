@@ -1208,10 +1208,31 @@ class CompileTimePass:
                 [TypeExpression(self._apply_type_reference(call.parameters[0].type_ref, scope))],
             )
 
+        declaration = self.functions.get(call.function_name)
         argument_preludes: list[Statement] = []
         arguments: list[Expression] = []
-        for argument in call.parameters:
-            prelude, expression = self._apply_expression_for_argument(argument, scope)
+        for index, argument in enumerate(call.parameters):
+            parameter = (
+                declaration.parameters[index]
+                if declaration is not None and index < len(declaration.parameters)
+                else None
+            )
+            if (
+                parameter is not None
+                and parameter.comptime
+                and parameter.type.name == 'type'
+                and type(argument) is VariableExpression
+            ):
+                value = scope.get(argument.name)
+                if value is not None and value.type == 'type':
+                    prelude, expression = [], copy.deepcopy(value)
+                else:
+                    prelude, expression = [], LiteralExpression(
+                        self._apply_type_reference(TypeReference(argument.name), scope),
+                        'type',
+                    )
+            else:
+                prelude, expression = self._apply_expression_for_argument(argument, scope)
             argument_preludes.extend(prelude)
             arguments.append(expression)
 
@@ -1220,7 +1241,6 @@ class CompileTimePass:
             receiver_prelude, receiver_call = comptime_method_call
             return [*argument_preludes, *receiver_prelude], receiver_call
 
-        declaration = self.functions.get(call.function_name)
         if declaration is not None and declaration.extern and declaration.comptime:
             raise CompileTimeError(
                 f'Comptime extern function "{call.function_name}" cannot be called at runtime.'
@@ -1319,7 +1339,11 @@ class CompileTimePass:
         if '.' not in function_name:
             return None
         receiver_name, method_name = function_name.rsplit('.', 1)
-        interfaces = self.active_interface_dispatch.get(receiver_name.split('.', 1)[0], set())
+        interfaces = self.active_interface_dispatch.get(receiver_name, set())
+        if not interfaces:
+            interfaces = self.active_interface_dispatch.get(
+                receiver_name.split('.', 1)[0], set()
+            )
         matches = []
         for interface_name in sorted(interfaces):
             declaration = self.interfaces.get(interface_name)
@@ -1472,6 +1496,41 @@ class CompileTimePass:
     def _apply_generic_type_reference(
         self, type_ref: TypeReference, scope: CompileTimeScope
     ) -> TypeReference:
+        if type_ref.name == 'MaybeUninit':
+            if len(type_ref.arguments) != 1:
+                raise CompileTimeError(
+                    f'MaybeUninit expects 1 type argument, got {len(type_ref.arguments)}.'
+                )
+            value = self._eval_comptime_argument(
+                type_ref.arguments[0], TypeReference('type'), scope
+            )
+            if value.type != 'type' or type(value.value) is not TypeReference:
+                raise CompileTimeError('MaybeUninit requires a type argument.')
+            element = self._apply_type_reference(value.value, scope)
+            if self._type_name(element) in {'void', 'type', 'c_void'}:
+                raise CompileTimeError(
+                    f'MaybeUninit cannot contain "{self._type_name(element)}".'
+                )
+            key = (
+                'MaybeUninit',
+                (('T', self._key_value(element), 'type'),),
+            )
+            variant_name = self.type_variant_names.get(key)
+            if variant_name is None:
+                variant_name = self._variant_name('MaybeUninit', key[1])
+                self.type_variant_names[key] = variant_name
+                generated_type = TypeDeclaration(
+                    variant_name,
+                    [],
+                    language_item='MaybeUninit',
+                    language_item_type=copy.deepcopy(element),
+                    public=True,
+                    source_name='MaybeUninit',
+                    span=type_ref.span,
+                )
+                self.generated_types.append(generated_type)
+                self.types[variant_name] = generated_type
+            return TypeReference(variant_name, span=type_ref.span)
         declaration = self.types.get(type_ref.name)
         if declaration is None:
             raise CompileTimeError(f'Unknown generic type "{type_ref.name}".')
@@ -1499,15 +1558,29 @@ class CompileTimePass:
             self.type_variant_names[key] = variant_name
             self._reject_unsupported_comptime_type_features(declaration)
             fields = [self._runtime_variable_declaration(field, field_scope) for field in declaration.fields]
-            methods = [
-                self._runtime_method_declaration(
-                    method,
-                    field_scope,
-                    owner_type=TypeReference(variant_name),
-                    owner_source_name=declaration.name,
-                )
-                for method in declaration.methods
-            ]
+            constraints = {
+                parameter.name: {constraint.name for constraint in parameter.constraints}
+                for parameter in declaration.parameters
+                if parameter.comptime and parameter.type.name == 'type'
+            }
+            previous_dispatch = self.active_interface_dispatch
+            self.active_interface_dispatch = {
+                f'self.{field.name}': set(constraints[field.type.name])
+                for field in declaration.fields
+                if field.type.name in constraints
+            }
+            try:
+                methods = [
+                    self._runtime_method_declaration(
+                        method,
+                        field_scope,
+                        owner_type=TypeReference(variant_name),
+                        owner_source_name=declaration.name,
+                    )
+                    for method in declaration.methods
+                ]
+            finally:
+                self.active_interface_dispatch = previous_dispatch
             for implementation in self.implementations:
                 if implementation.type_name != declaration.name:
                     continue
@@ -1572,7 +1645,11 @@ class CompileTimePass:
         )
         if any(
             implementation.interface.name == interface
-            and implementation.type_name in {name, source_name}
+            and implementation.type_name in {
+                name,
+                source_name,
+                self._generic_source_name(name),
+            }
             for implementation in self.implementations
         ):
             return True
@@ -1626,6 +1703,12 @@ class CompileTimePass:
         )
 
     def _eval_comptime_type_argument(self, argument: object, scope: CompileTimeScope) -> TypeReference:
+        if (
+            type(argument) is LiteralExpression
+            and argument.type == 'type'
+            and type(argument.value) is TypeReference
+        ):
+            return self._apply_type_reference(argument.value, scope)
         if type(argument) is TypeReference:
             return self._apply_type_reference(argument, scope)
         if type(argument) is FunctionCall:
@@ -2389,6 +2472,9 @@ class CompileTimePass:
             raise CompileTimeError(
                 f'Cannot query layout of opaque extern type "{type_name}" by value; use an explicit borrow type.'
             )
+        if declaration.language_item == 'MaybeUninit':
+            assert declaration.language_item_type is not None
+            return self._layout_of_type(declaration.language_item_type, scope)
         if declaration.parameters:
             raise CompileTimeError(f'Generic type "{type_name}" requires comptime arguments.')
         if not declaration.fields:

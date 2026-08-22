@@ -73,6 +73,11 @@ class MaybeUninit:
             raise UninitializedStorageError('MaybeUninit slot is not initialized.')
         return self._value
 
+    def set_initialized(self, value: object) -> None:
+        if not self.initialized:
+            raise UninitializedStorageError('MaybeUninit slot is not initialized.')
+        self._value = value
+
 
 @dataclass
 class AllocationToken:

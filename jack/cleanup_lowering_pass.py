@@ -28,6 +28,9 @@ try:
         HIRIfBranch,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMaybeUninitBorrowExpression,
+        HIRMaybeUninitTakeExpression,
+        HIRMaybeUninitWriteExpression,
         HIRMoveExpression,
         HIRPointerCastExpression,
         HIRPointerOffsetExpression,
@@ -72,6 +75,9 @@ except ImportError:
         HIRIfBranch,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMaybeUninitBorrowExpression,
+        HIRMaybeUninitTakeExpression,
+        HIRMaybeUninitWriteExpression,
         HIRMoveExpression,
         HIRPointerCastExpression,
         HIRPointerOffsetExpression,
@@ -273,6 +279,20 @@ class HIRStaticCleanupLoweringPass:
         elif isinstance(expression, HIRPointerCastExpression):
             self._merge_errors(
                 errors, self._hir_expression_raised_errors(expression.pointer)
+            )
+        elif isinstance(expression, HIRMaybeUninitWriteExpression):
+            self._merge_errors(
+                errors, self._hir_expression_raised_errors(expression.slot)
+            )
+            self._merge_errors(
+                errors, self._hir_expression_raised_errors(expression.value)
+            )
+        elif isinstance(
+            expression,
+            (HIRMaybeUninitTakeExpression, HIRMaybeUninitBorrowExpression),
+        ):
+            self._merge_errors(
+                errors, self._hir_expression_raised_errors(expression.slot)
             )
         elif isinstance(expression, HIRIndexExpression):
             self._merge_errors(

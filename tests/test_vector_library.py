@@ -11,26 +11,33 @@ from jack.module_loader import load_source_file
 
 VECTOR_PROGRAM = """
     import std.collections.vector;
+    import std.memory;
 
-    Vector(i32, StaticAllocator(i32, 4)) values(3);
-    bool pushed0 = values.push(10);
-    bool pushed1 = values.push(20);
-    bool pushed2 = values.push(30);
-    bool pushed3 = values.push(40);
+    void run() raises CapacityError, LayoutError, AllocationError, BoundsError {
+        StaticAllocator(i32, 4) storage;
+        Vector(i32, StaticAllocator(i32, 4)) values(storage, 3);
+        values.push(10);
+        values.push(20);
+        values.push(30);
+        values.push(40);
 
-    usize length = values.len();
-    i32 first = values.get(0);
-    i32 second = values.get(1);
-    i32 third = values.get(2);
+        usize length = values.len();
+        &in i32 first = values.get(0);
+        &in i32 second = values.get(1);
+        &in i32 third = values.get(2);
 
-    print(pushed0);
-    print(pushed1);
-    print(pushed2);
-    print(pushed3);
-    print(length);
-    print(first);
-    print(second);
-    print(third);
+        print(length);
+        print(first);
+        print(second);
+        print(third);
+    }
+
+    try {
+        run();
+    } catch CapacityError { print("capacity error");
+    } catch LayoutError { print("layout error");
+    } catch AllocationError { print("allocation error");
+    } catch BoundsError { print("bounds error"); }
 """
 
 
@@ -46,11 +53,7 @@ class VectorLibraryTests(unittest.TestCase):
 
         self.assertEqual(0, status)
         self.assertEqual(
-            'pushed0 = true\n'
-            'pushed1 = true\n'
-            'pushed2 = true\n'
-            'pushed3 = false\n'
-            'length = 3\n'
+            'length = 4\n'
             'first = 10\n'
             'second = 20\n'
             'third = 30\n',
@@ -64,11 +67,52 @@ class VectorLibraryTests(unittest.TestCase):
 
             c_source = emit_c(load_source_file(source), print_handler=None)
 
-        self.assertIn('typedef struct std_collections_vector_StaticAllocator_comptime_T_i32_N_4 {', c_source)
-        vector_name = 'std_collections_vector_Vector_comptime_T_i32_Allocator_std_collections_vector_StaticAllocator_comptime_T_i32_N_4'
+        self.assertIn('typedef struct std_memory_StaticAllocator_comptime_T_i32_N_4 {', c_source)
+        vector_name = 'std_collections_vector_Vector_comptime_T_i32_A_std_memory_StaticAllocator_comptime_T_i32_N_4'
         self.assertIn(f'typedef struct {vector_name} {{', c_source)
         self.assertIn(f'{vector_name}_push', c_source)
-        self.assertIn(f'pushed3 = {vector_name}_push(&values, 40);', c_source)
+        self.assertIn(f'{vector_name}_push(&values, 40);', c_source)
+
+    def test_static_growth_failure_preserves_elements_and_pop_clear_work(self):
+        source_text = '''
+import std.collections.vector;
+import std.memory;
+
+void run() raises CapacityError, LayoutError, AllocationError, BoundsError {
+    StaticAllocator(i32, 2) storage;
+    Vector(i32, StaticAllocator(i32, 2)) values(storage, 1);
+    values.push(10);
+    values.push(20);
+    try {
+        values.push(30);
+    } catch CapacityError {
+        print(values.len());
+    }
+    i32 last = values.pop();
+    print(last);
+    values.clear();
+    print(values.len());
+    print(values.capacity());
+}
+
+try { run();
+} catch CapacityError { print("unexpected capacity error");
+} catch LayoutError { print("layout error");
+} catch AllocationError { print("allocation error");
+} catch BoundsError { print("bounds error"); }
+'''
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'main.jack'
+            source.write_text(source_text)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(['-i', str(source)])
+
+        self.assertEqual(0, status)
+        self.assertEqual(
+            'values.len() = 2\nlast = 20\nvalues.len() = 0\nvalues.capacity() = 2\n',
+            output.getvalue(),
+        )
 
 
 if __name__ == '__main__':

@@ -148,6 +148,8 @@ class TypeDeclaration(Statement):
     methods: List['FunctionDeclaration'] = field(default_factory=list)
     extern: bool = False
     abi: str | None = None
+    language_item: str | None = None
+    language_item_type: TypeReference | None = None
 
 
 @dataclass

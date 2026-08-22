@@ -25,6 +25,9 @@ from .hir_nodes import (
     HIRIf,
     HIRIndexExpression,
     HIRLiteralExpression,
+    HIRMaybeUninitBorrowExpression,
+    HIRMaybeUninitTakeExpression,
+    HIRMaybeUninitWriteExpression,
     HIRMoveExpression,
     HIRPointerCastExpression,
     HIRPointerOffsetExpression,
@@ -225,6 +228,8 @@ class LLVMLoweringPass:
 
     def _declare_types(self) -> None:
         for declaration in self.types.values():
+            if declaration.language_item == 'MaybeUninit':
+                continue
             fields = ', '.join(self._type(field.type_ref) for field in declaration.fields)
             if not fields:
                 fields = 'i8'
@@ -439,7 +444,12 @@ class LLVMLoweringPass:
             type_name = self._type(statement.symbol.type_ref)
             slot = self._b.alloca(type_name, 'local')
             env[statement.symbol.name] = (slot, statement.symbol.type_ref)
-            self._b.emit(f'store {type_name} zeroinitializer, ptr {slot}')
+            type_declaration = self.types.get(statement.symbol.type_ref.name)
+            if not (
+                type_declaration is not None
+                and type_declaration.language_item == 'MaybeUninit'
+            ):
+                self._b.emit(f'store {type_name} zeroinitializer, ptr {slot}')
             if not statement.symbol.synthetic:
                 self._b.declare_debug_variable(
                     statement.symbol.source_name or statement.symbol.name,
@@ -679,6 +689,23 @@ class LLVMLoweringPass:
             return self._borrow(expression, env)
         if isinstance(expression, HIRMoveExpression):
             return self._expression(expression.expr, env)
+        if isinstance(expression, HIRMaybeUninitWriteExpression):
+            pointer = self._maybe_uninit_slot_pointer(expression.slot, env)
+            value = self._coerce(
+                self._expression(expression.value, env),
+                expression.value.type_ref,
+            )
+            self._b.emit(f'store {value.type_name} {value.operand}, ptr {pointer}')
+            return LLVMValue('void', '', expression.type_ref)
+        if isinstance(expression, HIRMaybeUninitTakeExpression):
+            pointer = self._maybe_uninit_slot_pointer(expression.slot, env)
+            type_name = self._type(expression.type_ref)
+            value = self._b.temp('take')
+            self._b.emit(f'{value} = load {type_name}, ptr {pointer}')
+            return LLVMValue(type_name, value, expression.type_ref)
+        if isinstance(expression, HIRMaybeUninitBorrowExpression):
+            pointer = self._maybe_uninit_slot_pointer(expression.slot, env)
+            return LLVMValue('ptr', pointer, expression.type_ref)
         if isinstance(expression, HIRDereferenceExpression):
             pointer = self._expression(expression.expr, env)
             type_name = self._type(expression.type_ref)
@@ -686,6 +713,12 @@ class LLVMLoweringPass:
             self._b.emit(f'{value} = load {type_name}, ptr {pointer.operand}')
             return LLVMValue(type_name, value, expression.type_ref)
         if isinstance(expression, HIRRawAddressExpression):
+            if isinstance(expression.expr, HIRVariableExpression):
+                storage, source_type = env[expression.expr.name]
+                if source_type.borrow is not None:
+                    pointer = self._b.temp('raw')
+                    self._b.emit(f'{pointer} = load ptr, ptr {storage}')
+                    return LLVMValue('ptr', pointer, expression.type_ref)
             pointer, _ = self._lvalue(expression.expr, env)
             return LLVMValue('ptr', pointer, expression.type_ref)
         if isinstance(expression, HIRPointerOffsetExpression):
@@ -713,6 +746,16 @@ class LLVMLoweringPass:
         raise LLVMLoweringError(
             f'Unsupported HIR expression {type(expression).__name__}.', expression.span
         )
+
+    def _maybe_uninit_slot_pointer(self, expression: HIRExpression, env) -> str:
+        if isinstance(expression, HIRVariableExpression):
+            storage, type_ref = env[expression.name]
+            if type_ref.borrow is not None:
+                pointer = self._b.temp('slot.ptr')
+                self._b.emit(f'{pointer} = load ptr, ptr {storage}')
+                return pointer
+        pointer, _ = self._lvalue(expression, env)
+        return pointer
 
     def _lvalue(self, expression: HIRExpression, env) -> tuple[str, TypeReference]:
         if isinstance(expression, HIRVariableExpression):
@@ -1272,6 +1315,11 @@ class LLVMLoweringPass:
             if spec.family == 'float':
                 return 'float' if spec.bits == 32 else 'double'
             return f'i{spec.bits}'
+        declaration = self.types.get(name)
+        if declaration is not None and declaration.language_item == 'MaybeUninit':
+            if declaration.language_item_type is None:
+                raise LLVMLoweringError('MaybeUninit declaration has no element type.')
+            return self._type(declaration.language_item_type)
         if name in self.types or name in self.views:
             return self._named_type(name)
         if name in {'c_void', 'c_char'}:
@@ -1357,6 +1405,23 @@ class LLVMLoweringPass:
 
         declaration = self.types.get(type_ref.name)
         if declaration is not None:
+            if declaration.language_item == 'MaybeUninit':
+                if declaration.language_item_type is None:
+                    raise LLVMLoweringError('MaybeUninit declaration has no element type.')
+                element_key = self._debug_type(declaration.language_item_type)
+                element = self.module.debug_types[element_key]
+                self.module.debug_types[key] = LLVMDebugType(
+                    key,
+                    f'MaybeUninit({element.name})',
+                    element.kind,
+                    element.size_bits,
+                    element.align_bits,
+                    encoding=element.encoding,
+                    base_key=element.base_key,
+                    count=element.count,
+                    members=element.members,
+                )
+                return key
             fields = [
                 (field.source_name or field.name, self._debug_type(field.type_ref))
                 for field in declaration.fields

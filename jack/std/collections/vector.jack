@@ -1,47 +1,128 @@
 module std.collections.vector;
 
-pub struct StaticAllocator(comptime type T, comptime usize N) {
-    T[N] storage;
-    usize next;
+import std.memory;
 
-    init(&inout self) {
-        self.next = 0;
-    }
+pub struct BoundsError { }
 
-    &inout T[] allocate(&inout self, usize count) {
-        usize start = self.next;
-        self.next = self.next + count;
-        return &inout self.storage[start..self.next];
-    }
-}
-
-pub struct Vector(comptime type T, comptime type Allocator) {
-    Allocator allocator;
-    &inout T[] items;
+pub struct Vector(comptime type T, comptime type A: Allocator) {
+    A allocator;
+    Allocation allocation;
     usize length;
     usize capacity;
 
-    init(&inout self, usize capacity) {
-        self.allocator.init();
-        self.items = self.allocator.allocate(capacity);
-        self.length = 0;
-        self.capacity = capacity;
+    init(&inout self, move A allocator, usize initial_capacity)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.allocator = move allocator;
+        Layout requested = layout_array(T, initial_capacity);
+        self.allocation = self.allocator.allocate(requested);
+        self.length = usize(0);
+        Layout granted = self.allocation.layout();
+        self.capacity = granted.size() / sizeof(T);
     }
 
-    bool push(&inout self, move T value) {
-        if (self.length < self.capacity) {
-            self.items[self.length] = move value;
-            self.length = self.length + usize(1);
-            return true;
+    void push(&inout self, move T value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        if (self.length == self.capacity) {
+            usize next_capacity = usize(1);
+            if (self.capacity != usize(0)) {
+                next_capacity = self.capacity * usize(2);
+            }
+            Layout requested = layout_array(T, next_capacity);
+            Allocation replacement = self.allocator.allocate(requested);
+            unsafe {
+                *inout b8 old_address = self.allocator.address(self.allocation);
+                *inout b8 new_address = self.allocator.address(replacement);
+                *inout MaybeUninit(T) old_slots = old_address.cast(MaybeUninit(T));
+                *inout MaybeUninit(T) new_slots = new_address.cast(MaybeUninit(T));
+                usize index = usize(0);
+                while (index < self.length) {
+                    &inout MaybeUninit(T) old_slot = &inout *old_slots.offset(index);
+                    &inout MaybeUninit(T) new_slot = &inout *new_slots.offset(index);
+                    T item = old_slot.take();
+                    new_slot.write(item);
+                    index = index + usize(1);
+                }
+                Allocation old_allocation = move self.allocation;
+                self.allocator.deallocate(old_allocation);
+            }
+            self.allocation = move replacement;
+            Layout granted = self.allocation.layout();
+            self.capacity = granted.size() / sizeof(T);
         }
-        return false;
+        unsafe {
+            *inout b8 address = self.allocator.address(self.allocation);
+            *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+            &inout MaybeUninit(T) slot = &inout *slots.offset(self.length);
+            slot.write(value);
+        }
+        self.length = self.length + usize(1);
     }
 
-    T get(&inout self, usize index) {
-        return self.items[index];
+    &in T get(&inout self, usize index) raises BoundsError {
+        if (index >= self.length) {
+            raise BoundsError { };
+        }
+        unsafe {
+            *inout b8 address = self.allocator.address(self.allocation);
+            *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+            &in MaybeUninit(T) slot = &in *slots.offset(index);
+            return slot.borrow();
+        }
     }
 
-    usize len(&inout self) {
+    &inout T get_mut(&inout self, usize index) raises BoundsError {
+        if (index >= self.length) {
+            raise BoundsError { };
+        }
+        unsafe {
+            *inout b8 address = self.allocator.address(self.allocation);
+            *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+            &inout MaybeUninit(T) slot = &inout *slots.offset(index);
+            return slot.borrow_mut();
+        }
+    }
+
+    T pop(&inout self) raises BoundsError {
+        if (self.length == usize(0)) {
+            raise BoundsError { };
+        }
+        self.length = self.length - usize(1);
+        unsafe {
+            *inout b8 address = self.allocator.address(self.allocation);
+            *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+            &inout MaybeUninit(T) slot = &inout *slots.offset(self.length);
+            return slot.take();
+        }
+    }
+
+    void clear(&inout self) {
+        unsafe {
+            *inout b8 address = self.allocator.address(self.allocation);
+            *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+            while (self.length != usize(0)) {
+                self.length = self.length - usize(1);
+                &inout MaybeUninit(T) slot = &inout *slots.offset(self.length);
+                T item = slot.take();
+            }
+        }
+    }
+
+    usize len(&in self) {
         return self.length;
+    }
+
+    usize capacity(&in self) { return self.capacity; }
+    usize remaining_capacity(&in self) { return self.capacity - self.length; }
+    bool is_empty(&in self) { return self.length == usize(0); }
+    bool is_full(&in self) { return self.length == self.capacity; }
+
+    deinit(move self) {
+        self.clear();
+        unsafe {
+            Allocation allocation = move self.allocation;
+            self.allocator.deallocate(allocation);
+        }
     }
 }

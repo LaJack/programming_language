@@ -61,12 +61,13 @@ JACK_KEYWORDS = {
     'as', 'catch', 'comptime', 'else', 'extern', 'false', 'for', 'if',
     'implements', 'import', 'in', 'inout', 'interface', 'module', 'move', 'out',
     'print', 'pub', 'raise', 'raises', 'rethrow', 'return', 'struct', 'true',
-    'try', 'use', 'view', 'while',
+    'try', 'unsafe', 'use', 'view', 'while',
 }
 BUILTIN_TYPES = {
-    'void', 'str', 'c_char', 'c_void', 'type', 'Copyable', *BUILTIN_TYPE_SPECS
+    'void', 'str', 'c_char', 'c_void', 'type', 'Copyable', 'MaybeUninit',
+    *BUILTIN_TYPE_SPECS
 }
-BUILTIN_FUNCTIONS = {'len', 'sizeof', 'alignof'}
+BUILTIN_FUNCTIONS = {'len', 'sizeof', 'alignof', 'raw'}
 
 
 def path_from_uri(uri: str) -> Path | None:

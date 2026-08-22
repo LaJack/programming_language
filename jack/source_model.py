@@ -25,3 +25,16 @@ class TypeReference:
     pointer_mode: str | None = None
     nullable: bool = False
     span: SourceSpan | None = field(default=None, compare=False, kw_only=True)
+
+
+def is_maybe_uninit_type(type_ref: TypeReference) -> bool:
+    return type_ref.name == 'MaybeUninit' and len(type_ref.arguments) == 1
+
+
+def maybe_uninit_element_type(type_ref: TypeReference) -> TypeReference:
+    if not is_maybe_uninit_type(type_ref):
+        raise ValueError('Expected MaybeUninit(T).')
+    element = type_ref.arguments[0]
+    if not isinstance(element, TypeReference):
+        raise ValueError('MaybeUninit requires one type argument.')
+    return element

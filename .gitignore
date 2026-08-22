@@ -33,3 +33,6 @@ vscode-jack/.npmrc
 # VSCode extension packaging
 *.vsix
 node_modules/
+
+# Local benchmark artifacts and machine-specific results
+benchmarks/results/

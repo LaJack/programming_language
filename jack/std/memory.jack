@@ -54,7 +54,12 @@ pub interface Allocator {
     Allocation allocate(&inout self, Layout minimum)
         raises CapacityError, AllocationError;
 
-    unsafe *inout b8 address(
+    unsafe *in b8 address(
+        &in self,
+        &in Allocation allocation
+    );
+
+    unsafe *inout b8 address_mut(
         &inout self,
         &in Allocation allocation
     );
@@ -91,7 +96,18 @@ SystemAllocator implements Allocator {
         raise AllocationError { };
     }
 
-    unsafe *inout b8 address(
+    unsafe *in b8 address(
+        &in self,
+        &in Allocation allocation
+    ) {
+        if (allocation.host_address != null) {
+            return allocation.host_address;
+        }
+        *in SystemAllocator pointer = raw(&in self);
+        return pointer.cast(b8);
+    }
+
+    unsafe *inout b8 address_mut(
         &inout self,
         &in Allocation allocation
     ) {
@@ -143,7 +159,19 @@ StaticAllocator(comptime type T, comptime usize N) implements Allocator {
         };
     }
 
-    unsafe *inout b8 address(
+    unsafe *in b8 address(
+        &in self,
+        &in Allocation allocation
+    ) {
+        if (N == usize(0)) {
+            *in StaticAllocator(T, N) pointer = raw(&in self);
+            return pointer.cast(b8);
+        }
+        *in MaybeUninit(T) pointer = raw(&in self.storage[0]);
+        return pointer.cast(b8);
+    }
+
+    unsafe *inout b8 address_mut(
         &inout self,
         &in Allocation allocation
     ) {

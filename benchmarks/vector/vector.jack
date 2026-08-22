@@ -1,0 +1,23 @@
+import std.collections.vector;
+import std.memory;
+
+void run() raises CapacityError, LayoutError, AllocationError {
+    SystemAllocator allocator;
+    Vector(i32, SystemAllocator) values(allocator, 0);
+    usize index = usize(0);
+    while (index < usize(20000000)) {
+        values.push(i32(index));
+        index = index + usize(1);
+    }
+    print(values.len());
+}
+
+try {
+    run();
+} catch CapacityError {
+    print("capacity error");
+} catch LayoutError {
+    print("layout error");
+} catch AllocationError {
+    print("allocation error");
+}

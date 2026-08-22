@@ -6,6 +6,8 @@ from pathlib import Path
 
 from jack.c_emit_pass import emit_c
 from jack.cli import main
+from jack.hir_lowering_pass import compile_to_hir
+from jack.hir_nodes import HIRTypeDeclaration
 from jack.module_loader import load_source_file
 
 
@@ -42,6 +44,23 @@ VECTOR_PROGRAM = """
 
 
 class VectorLibraryTests(unittest.TestCase):
+    def test_get_uses_a_shared_self_borrow(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'main.jack'
+            source.write_text(VECTOR_PROGRAM)
+            program = compile_to_hir(load_source_file(source), print_handler=None)
+
+        vector = next(
+            declaration
+            for declaration in program.declarations
+            if isinstance(declaration, HIRTypeDeclaration)
+            and declaration.source_name == 'Vector'
+        )
+        get = next(method for method in vector.methods if method.name == 'get')
+        get_mut = next(method for method in vector.methods if method.name == 'get_mut')
+        self.assertEqual('in', get.self_parameter.type_ref.borrow)
+        self.assertEqual('inout', get_mut.self_parameter.type_ref.borrow)
+
     def test_cli_interpreter_runs_allocator_backed_vector(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / 'main.jack'

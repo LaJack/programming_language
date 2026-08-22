@@ -27,13 +27,17 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
         if (self.length == self.capacity) {
             usize next_capacity = usize(1);
             if (self.capacity != usize(0)) {
+                usize maximum = 18446744073709551615;
+                if (self.capacity > maximum / usize(2)) {
+                    raise LayoutError { };
+                }
                 next_capacity = self.capacity * usize(2);
             }
             Layout requested = layout_array(T, next_capacity);
             Allocation replacement = self.allocator.allocate(requested);
             unsafe {
-                *inout b8 old_address = self.allocator.address(self.allocation);
-                *inout b8 new_address = self.allocator.address(replacement);
+                *inout b8 old_address = self.allocator.address_mut(self.allocation);
+                *inout b8 new_address = self.allocator.address_mut(replacement);
                 *inout MaybeUninit(T) old_slots = old_address.cast(MaybeUninit(T));
                 *inout MaybeUninit(T) new_slots = new_address.cast(MaybeUninit(T));
                 usize index = usize(0);
@@ -52,7 +56,7 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
             self.capacity = granted.size() / sizeof(T);
         }
         unsafe {
-            *inout b8 address = self.allocator.address(self.allocation);
+            *inout b8 address = self.allocator.address_mut(self.allocation);
             *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
             &inout MaybeUninit(T) slot = &inout *slots.offset(self.length);
             slot.write(value);
@@ -60,13 +64,13 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
         self.length = self.length + usize(1);
     }
 
-    &in T get(&inout self, usize index) raises BoundsError {
+    &in T get(&in self, usize index) raises BoundsError {
         if (index >= self.length) {
             raise BoundsError { };
         }
         unsafe {
-            *inout b8 address = self.allocator.address(self.allocation);
-            *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+            *in b8 address = self.allocator.address(self.allocation);
+            *in MaybeUninit(T) slots = address.cast(MaybeUninit(T));
             &in MaybeUninit(T) slot = &in *slots.offset(index);
             return slot.borrow();
         }
@@ -77,7 +81,7 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
             raise BoundsError { };
         }
         unsafe {
-            *inout b8 address = self.allocator.address(self.allocation);
+            *inout b8 address = self.allocator.address_mut(self.allocation);
             *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
             &inout MaybeUninit(T) slot = &inout *slots.offset(index);
             return slot.borrow_mut();
@@ -90,7 +94,7 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
         }
         self.length = self.length - usize(1);
         unsafe {
-            *inout b8 address = self.allocator.address(self.allocation);
+            *inout b8 address = self.allocator.address_mut(self.allocation);
             *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
             &inout MaybeUninit(T) slot = &inout *slots.offset(self.length);
             return slot.take();
@@ -99,7 +103,7 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
 
     void clear(&inout self) {
         unsafe {
-            *inout b8 address = self.allocator.address(self.allocation);
+            *inout b8 address = self.allocator.address_mut(self.allocation);
             *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
             while (self.length != usize(0)) {
                 self.length = self.length - usize(1);

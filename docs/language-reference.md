@@ -587,7 +587,8 @@ undefined behavior.
 `Allocation` is an opaque, non-copyable token. `Allocator.allocate` grants at
 least a requested `Layout`, `Allocation.layout()` reports the actual grant, and
 the allocator resolves temporary raw addresses relative to itself. Containers
-must not cache those addresses. `StaticAllocator(T, N)` owns inline
+must not cache those addresses. Read-only resolution uses `address(&in self)`;
+writable resolution uses `address_mut(&inout self)`. `StaticAllocator(T, N)` owns inline
 `MaybeUninit(T)[N]` storage and permits one live allocation; its first compatible
 request grants all `N` slots. `SystemAllocator` uses host `malloc` and `free`.
 
@@ -597,8 +598,10 @@ capacity (or one from zero), then moves elements in index order only after the
 replacement allocation succeeds. Heap growth is therefore linear; a bounded
 static allocator rejects the growth attempt with `CapacityError`. A failed
 `push` leaves the vector unchanged and consumes and destroys its moved argument
-during error propagation. `pop`, `clear`, and destruction remove elements in
-reverse index order.
+during error propagation. Capacity doubling is checked before arithmetic and
+raises `LayoutError` on overflow. `get` borrows the vector through `&in self`,
+while `get_mut` requires `&inout self`. `pop`, `clear`, and destruction remove
+elements in reverse index order.
 
 ## Built-Ins
 

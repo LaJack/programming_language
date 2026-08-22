@@ -30,8 +30,10 @@ class LLVMEmitPassTests(unittest.TestCase):
             program, debug=debug, optimization=optimization
         )
 
-    def compile_and_run(self, source: str) -> subprocess.CompletedProcess[str]:
-        llvm_source = self.emit(source)
+    def compile_and_run(
+        self, source: str, *, optimization: int = 0
+    ) -> subprocess.CompletedProcess[str]:
+        llvm_source = self.emit(source, optimization=optimization)
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             module = root / 'main.ll'
@@ -72,6 +74,150 @@ class LLVMEmitPassTests(unittest.TestCase):
 
         self.assertEqual(0, completed.returncode)
         self.assertEqual('value = 5\n', completed.stdout)
+
+    def test_optimized_monomorphized_methods_are_forced_inline(self):
+        source = '''
+            struct Box(comptime type T) {
+                T value;
+                T get(&in self) { return self.value; }
+            }
+            Box(i32) box;
+            i32 value = box.get();
+        '''
+
+        unoptimized = self.emit(source, optimization=0)
+        optimized = self.emit(source, optimization=2)
+
+        self.assertNotIn('alwaysinline', unoptimized)
+        self.assertIn('alwaysinline', optimized)
+
+    def test_effect_aware_inlining_bypasses_raising_call_envelope(self):
+        source = '''
+            struct Failure { i32 code; }
+            struct Box(comptime type T) {
+                T value;
+                T read(&in self, bool fail) raises Failure {
+                    if (fail) { raise Failure { code = 7 }; }
+                    return self.value;
+                }
+            }
+            Box(i32) box;
+            try {
+                i32 value = box.read(false);
+                print(value);
+            } catch Failure error {
+                print(error.code);
+            }
+        '''
+
+        llvm_source = self.emit(source, optimization=2)
+
+        self.assertIn('inline.success.', llvm_source)
+        self.assertNotIn('call.ok', llvm_source)
+        self.assertNotRegex(
+            llvm_source,
+            r'call %jack\.result\.\d+ @"Box\$comptime\$T\$i32\.read"',
+        )
+
+    def test_effect_aware_inlining_preserves_returns_errors_and_order(self):
+        completed = self.compile_and_run('''
+            struct Failure { i32 code; }
+            struct Choice(comptime type T: Copyable) {
+                T choose(&in self, T left, T right, bool fail) raises Failure {
+                    print(left);
+                    print(right);
+                    if (fail) { raise Failure { code = 9 }; }
+                    if (left > right) { return left; }
+                    return right;
+                }
+            }
+            Choice(i32) choice;
+            try {
+                i32 first = choice.choose(3, 4, false);
+                print(first);
+                i32 second = choice.choose(5, 6, true);
+                print(second);
+            } catch Failure error {
+                print(error.code);
+            }
+        ''', optimization=2)
+
+        self.assertEqual(0, completed.returncode)
+        self.assertEqual(
+            'left = 3\nright = 4\nfirst = 4\nleft = 5\nright = 6\nerror.code = 9\n',
+            completed.stdout,
+        )
+
+    def test_effect_aware_inlining_is_disabled_for_debug_and_o0(self):
+        source = '''
+            struct Box(comptime type T) {
+                T value;
+                T get(&in self) { return self.value; }
+            }
+            Box(i32) box;
+            i32 value = box.get();
+        '''
+
+        unoptimized = self.emit(source, optimization=0)
+        debug = self.emit(source, debug=True, optimization=2)
+
+        self.assertNotIn('inline.success.', unoptimized)
+        self.assertNotIn('inline.success.', debug)
+        self.assertRegex(unoptimized, r'call i32 @"Box\$comptime\$T\$i32\.get"')
+        self.assertRegex(debug, r'call i32 @"Box\$comptime\$T\$i32\.get"')
+
+    def test_oversized_effect_aware_candidate_falls_back_to_call(self):
+        statements = '\n'.join('value = value + 1;' for _ in range(410))
+        source = f'''
+            struct Box(comptime type T) {{
+                T unused;
+                i32 value;
+                void work(&inout self) {{
+                    i32 value = 0;
+                    {statements}
+                    self.value = value;
+                }}
+            }}
+            Box(i32) box;
+            box.work();
+        '''
+
+        llvm_source = self.emit(source, optimization=2)
+
+        self.assertNotIn('inline.success.', llvm_source)
+        self.assertRegex(
+            llvm_source, r'call void @"Box\$comptime\$T\$i32\.work"'
+        )
+
+    def test_effect_aware_inlining_nests_and_recursion_falls_back(self):
+        nested = self.emit('''
+            struct Chain(comptime type T) {
+                T value;
+                T inner(&in self) { return self.value; }
+                T outer(&in self) { return self.inner(); }
+            }
+            Chain(i32) chain;
+            i32 value = chain.outer();
+        ''', optimization=2)
+        recursive = self.emit('''
+            struct Counter(comptime type T) {
+                T value;
+                void descend(&in self, i32 count) {
+                    if (count > 0) { self.descend(count - 1); }
+                }
+            }
+            Counter(i32) counter;
+            counter.descend(2);
+        ''', optimization=2)
+
+        self.assertGreaterEqual(nested.count('inline.success.'), 2)
+        self.assertNotRegex(
+            nested, r'call i32 @"Chain\$comptime\$T\$i32\.(?:inner|outer)"'
+        )
+        self.assertRegex(
+            recursive,
+            r'call void @"Counter\$comptime\$T\$i32\.descend"',
+        )
 
     def test_struct_methods_constructors_and_cleanup_compile_and_run(self):
         completed = self.compile_and_run('''

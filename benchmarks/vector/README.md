@@ -10,7 +10,9 @@ Run it from the repository root:
 python3 benchmarks/vector/run.py
 ```
 
-The runner builds Jack with the LLVM backend at `-O2`, builds C++ with
-`clang++ -O2`, performs one warm-up, and reports five wall-clock samples and
-their median. Generated executables stay in the gitignored
+The runner builds two Jack variants at `-O2`: the explicit result-envelope
+baseline with ordinary LLVM `alwaysinline`, and the effect-aware HIR inliner.
+It also builds C++ with `clang++ -O2`. After one warm-up it reports five
+wall-clock samples, their median, and generated LLVM call, branch, and envelope
+check counts. Generated artifacts stay in the gitignored
 `benchmarks/results/vector` directory.

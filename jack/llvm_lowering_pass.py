@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 
 from .borrow_modes import borrow_mode_can_write
 from .builtin_types import BUILTIN_TYPE_SPECS
@@ -73,8 +73,28 @@ class LLVMValue:
     type_ref: TypeReference
 
 
+@dataclass(frozen=True)
+class InlineCandidate:
+    declaration: HIRFunctionDeclaration
+    name: str
+    cost: int
+
+
+@dataclass(frozen=True)
+class InlineFrame:
+    declaration: HIRFunctionDeclaration
+    name: str
+    continuation: str
+    return_slot: str | None
+
+
 class FunctionBuilder:
-    def __init__(self, lowerer: 'LLVMLoweringPass', declaration: HIRFunctionDeclaration | None):
+    def __init__(
+        self,
+        lowerer: 'LLVMLoweringPass',
+        declaration: HIRFunctionDeclaration | None,
+        function_name: str = 'main',
+    ):
         self.lowerer = lowerer
         self.declaration = declaration
         self.blocks: list[tuple[str, list[LLVMInstruction]]] = [('entry', [])]
@@ -91,6 +111,9 @@ class FunctionBuilder:
         self.current_scope = 0
         self.debug_scopes: list[tuple[int, int, SourceSpan]] = []
         self.scope_counter = 0
+        self.function_name = function_name
+        self.inline_frames: list[InlineFrame] = []
+        self.inline_cost = 0
 
     def temp(self, prefix: str = 'v') -> str:
         self.counter += 1
@@ -162,11 +185,22 @@ class FunctionBuilder:
 
 
 class LLVMLoweringPass:
-    def __init__(self, *, debug: bool = False, optimization: int = 0) -> None:
+    INLINE_DEPTH_LIMIT = 4
+    INLINE_COST_LIMIT = 400
+
+    def __init__(
+        self,
+        *,
+        debug: bool = False,
+        optimization: int = 0,
+        effect_inlining: bool = True,
+    ) -> None:
         self.module = LLVMModule(debug=debug, optimization=optimization)
+        self.effect_inlining = effect_inlining
         self.types: dict[str, HIRTypeDeclaration] = {}
         self.views: dict[str, HIRViewDeclaration] = {}
         self.functions: dict[str, HIRFunctionDeclaration] = {}
+        self.inline_candidates: dict[str, InlineCandidate] = {}
         self.global_env: dict[str, tuple[str, TypeReference]] = {}
         self.string_globals: dict[bytes, str] = {}
         self.error_tags: dict[str, int] = {}
@@ -190,6 +224,7 @@ class LLVMLoweringPass:
             for declaration in program.declarations
             if isinstance(declaration, HIRFunctionDeclaration)
         }
+        self._collect_inline_candidates(program)
         self._collect_error_tags(program)
         self._declare_runtime()
         if self.module.debug:
@@ -290,7 +325,8 @@ class LLVMLoweringPass:
         owner: str | None = None,
         debug_owner: str | None = None,
     ) -> LLVMFunction:
-        builder = FunctionBuilder(self, declaration)
+        function_name = self._function_name(declaration, owner)
+        builder = FunctionBuilder(self, declaration, function_name)
         self.builder = builder
         parameters: list[tuple[str, str]] = []
         symbols = []
@@ -316,7 +352,7 @@ class LLVMLoweringPass:
         if not builder.terminated:
             self._return_success(None)
         function = LLVMFunction(
-            self._function_name(declaration, owner),
+            function_name,
             self._function_return_type(declaration),
             tuple(parameters),
             tuple((label, tuple(lines)) for label, lines in builder.blocks),
@@ -327,6 +363,10 @@ class LLVMLoweringPass:
                 else declaration.source_name or declaration.name
             ),
             debug_scopes=tuple(builder.debug_scopes),
+            always_inline=(
+                self.module.optimization > 0
+                and self._is_monomorphized(declaration, owner)
+            ),
         )
         self.builder = None
         return function
@@ -479,11 +519,17 @@ class LLVMLoweringPass:
         if isinstance(statement, HIRReturn):
             value = None
             if statement.expr is not None:
-                if self._b.declaration is not None and self._b.declaration.return_type.borrow is not None:
+                declaration = self._current_declaration()
+                if declaration is not None and declaration.return_type.borrow is not None:
                     value = self._borrow_argument(statement.expr, env)
                 else:
                     value = self._expression(statement.expr, env)
-                    value = self._coerce(value, self._b.declaration.return_type)
+                    if declaration is None:
+                        raise LLVMLoweringError(
+                            'Value return reached LLVM lowering outside a function.',
+                            statement.span,
+                        )
+                    value = self._coerce(value, declaration.return_type)
             self._return_success(value)
             return
         if isinstance(statement, HIRRaise):
@@ -889,6 +935,9 @@ class LLVMLoweringPass:
             for parameter, argument in zip(call.target.parameters, call.arguments)
         )
         name = call.target.name
+        candidate = self._inline_candidate(call)
+        if candidate is not None:
+            return self._inline_call(call, candidate, arguments)
         args = ', '.join(f'{argument.type_name} {argument.operand}' for argument in arguments)
         return_type = self._function_call_return_type(call)
         if return_type == 'void':
@@ -899,6 +948,78 @@ class LLVMLoweringPass:
         if call.target.raises:
             return self._unwrap_call(call, result, return_type)
         return LLVMValue(self._type(call.type_ref), result, call.type_ref)
+
+    def _inline_candidate(self, call: HIRCallExpression) -> InlineCandidate | None:
+        if (
+            not self.effect_inlining
+            or self.module.debug
+            or self.module.optimization == 0
+            or call.target.extern
+        ):
+            return None
+        candidate = self.inline_candidates.get(call.target.name)
+        if candidate is None:
+            return None
+        active_names = {self._b.function_name}
+        active_names.update(frame.name for frame in self._b.inline_frames)
+        if candidate.name in active_names:
+            return None
+        if len(self._b.inline_frames) >= self.INLINE_DEPTH_LIMIT:
+            return None
+        if self._b.inline_cost + candidate.cost > self.INLINE_COST_LIMIT:
+            return None
+        return candidate
+
+    def _inline_call(
+        self,
+        call: HIRCallExpression,
+        candidate: InlineCandidate,
+        arguments: list[LLVMValue],
+    ) -> LLVMValue:
+        declaration = candidate.declaration
+        symbols = []
+        if declaration.self_parameter is not None:
+            symbols.append(declaration.self_parameter)
+        symbols.extend(declaration.parameters)
+        if len(symbols) != len(arguments):
+            raise LLVMLoweringError(
+                f'Inline call to {candidate.name} has an invalid argument count.',
+                call.span,
+            )
+
+        inline_env = dict(self.global_env)
+        for symbol, argument in zip(symbols, arguments):
+            type_name = self._parameter_type(symbol.type_ref)
+            slot = self._b.alloca(type_name, 'inline.arg')
+            argument = self._coerce(argument, symbol.type_ref)
+            self._b.emit(f'store {type_name} {argument.operand}, ptr {slot}')
+            inline_env[symbol.name] = (slot, symbol.type_ref)
+
+        return_type = self._type(declaration.return_type)
+        return_slot = None
+        if return_type != 'void':
+            return_slot = self._b.alloca(return_type, 'inline.result')
+        continuation = self._b.label('inline.success')
+        frame = InlineFrame(declaration, candidate.name, continuation, return_slot)
+        self._b.inline_frames.append(frame)
+        self._b.inline_cost += candidate.cost
+        try:
+            self._statements(declaration.body, inline_env)
+            if not self._b.terminated:
+                if return_type != 'void':
+                    raise LLVMLoweringError(
+                        f'Inlined function {candidate.name} may complete without a value.',
+                        declaration.span,
+                    )
+                self._b.branch(continuation)
+        finally:
+            self._b.inline_frames.pop()
+        self._b.start(continuation)
+        if return_type == 'void':
+            return LLVMValue('void', '', call.type_ref)
+        result = self._b.temp('inline.value')
+        self._b.emit(f'{result} = load {return_type}, ptr {return_slot}')
+        return LLVMValue(return_type, result, call.type_ref)
 
     def _unwrap_call(self, call, result: str, result_type: str) -> LLVMValue:
         ok = self._b.temp('call.ok')
@@ -1222,6 +1343,20 @@ class LLVMLoweringPass:
         self._b.terminate(f'ret {result_type} {third}')
 
     def _return_success(self, value: LLVMValue | None) -> None:
+        if self._b.inline_frames:
+            frame = self._b.inline_frames[-1]
+            if frame.return_slot is not None:
+                if value is None:
+                    raise LLVMLoweringError(
+                        f'Inlined function {frame.name} returned without a value.',
+                        frame.declaration.span,
+                    )
+                self._b.emit(
+                    f'store {self._type(frame.declaration.return_type)} '
+                    f'{value.operand}, ptr {frame.return_slot}'
+                )
+            self._b.branch(frame.continuation)
+            return
         declaration = self._b.declaration
         if declaration is None:
             self._b.terminate('ret i32 0')
@@ -1256,6 +1391,75 @@ class LLVMLoweringPass:
                 functions.extend(declaration.methods)
         names = sorted({error.name for function in functions for error in function.raises})
         self.error_tags = {name: index + 1 for index, name in enumerate(names)}
+
+    def _collect_inline_candidates(self, program: HIRProgram) -> None:
+        candidates: dict[str, InlineCandidate] = {}
+        for declaration in program.declarations:
+            if isinstance(declaration, HIRFunctionDeclaration):
+                self._add_inline_candidate(candidates, declaration, None)
+            elif isinstance(declaration, HIRTypeDeclaration):
+                for method in declaration.methods:
+                    self._add_inline_candidate(candidates, method, declaration.name)
+        self.inline_candidates = dict(sorted(candidates.items()))
+
+    def _add_inline_candidate(
+        self,
+        candidates: dict[str, InlineCandidate],
+        declaration: HIRFunctionDeclaration,
+        owner: str | None,
+    ) -> None:
+        if declaration.extern or not self._is_monomorphized(declaration, owner):
+            return
+        if self._type(declaration.return_type) != 'void' and not self._guarantees_exit(
+            declaration.body
+        ):
+            return
+        name = self._function_name(declaration, owner)
+        cost = self._hir_cost(declaration.body)
+        if cost <= self.INLINE_COST_LIMIT:
+            candidates[name] = InlineCandidate(declaration, name, cost)
+
+    @staticmethod
+    def _is_monomorphized(
+        declaration: HIRFunctionDeclaration, owner: str | None
+    ) -> bool:
+        return '$comptime$' in (owner or declaration.name)
+
+    @classmethod
+    def _hir_cost(cls, value) -> int:
+        if isinstance(value, (HIRStatement, HIRExpression)):
+            cost = 1
+        else:
+            cost = 0
+        if isinstance(value, (list, tuple)):
+            return sum(cls._hir_cost(item) for item in value)
+        if not is_dataclass(value):
+            return cost
+        return cost + sum(
+            cls._hir_cost(getattr(value, field.name)) for field in fields(value)
+        )
+
+    @classmethod
+    def _guarantees_exit(cls, statements: list[HIRStatement]) -> bool:
+        if not statements:
+            return False
+        statement = statements[-1]
+        if isinstance(statement, (HIRReturn, HIRRaise, HIRRethrow)):
+            return True
+        if isinstance(statement, HIRBlock):
+            return cls._guarantees_exit(statement.body)
+        if isinstance(statement, HIRIf):
+            return (
+                statement.else_body is not None
+                and all(cls._guarantees_exit(branch.body) for branch in statement.branches)
+                and cls._guarantees_exit(statement.else_body)
+            )
+        return False
+
+    def _current_declaration(self) -> HIRFunctionDeclaration | None:
+        if self._b.inline_frames:
+            return self._b.inline_frames[-1].declaration
+        return self._b.declaration
 
     def _function_return_type(self, declaration: HIRFunctionDeclaration) -> str:
         value_type = self._type(declaration.return_type)

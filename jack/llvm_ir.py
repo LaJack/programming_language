@@ -65,10 +65,13 @@ class LLVMFunction:
     span: SourceSpan | None = None
     debug_name: str | None = None
     debug_scopes: tuple[tuple[int, int, SourceSpan], ...] = ()
+    always_inline: bool = False
 
     def render(self, debug_info: '_LLVMDebugInfo | None' = None) -> str:
         params = ', '.join(f'{type_name} %{name}' for type_name, name in self.parameters)
         header = f'define {self.return_type} @{quoted(self.name)}({params})'
+        if self.always_inline:
+            header += ' alwaysinline'
         if debug_info is not None and self.name in debug_info.subprograms:
             header += f' !dbg !{debug_info.subprograms[self.name]}'
         lines = [header + ' {']

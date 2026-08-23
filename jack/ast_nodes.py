@@ -54,6 +54,13 @@ class StructLiteralExpression(Expression):
 
 
 @dataclass
+class EnumVariantExpression(Expression):
+    type_ref: 'TypeReference'
+    variant_name: str
+    arguments: List[Expression] | None = None
+
+
+@dataclass
 class VariableExpression(Expression):
     name: str
 
@@ -153,6 +160,20 @@ class TypeDeclaration(Statement):
 
 
 @dataclass
+class EnumVariant(AstNode):
+    name: str
+    parameters: List[VariableDeclaration] = field(default_factory=list)
+
+
+@dataclass
+class EnumDeclaration(Statement):
+    name: str
+    variants: List[EnumVariant]
+    parameters: List[VariableDeclaration] = field(default_factory=list)
+    methods: List['FunctionDeclaration'] = field(default_factory=list)
+
+
+@dataclass
 class InterfaceDeclaration(Statement):
     name: str
     methods: List['FunctionDeclaration']
@@ -211,6 +232,25 @@ class IfBranch(AstNode):
 class If(Statement):
     branches: List[IfBranch]
     else_body: List[Statement] | None = None
+
+
+@dataclass
+class MatchBinding(AstNode):
+    name: str | None
+
+
+@dataclass
+class MatchArm(AstNode):
+    variant_name: str | None
+    bindings: List[MatchBinding] = field(default_factory=list)
+    body: List[Statement] | None = None
+    expr: Expression | None = None
+
+
+@dataclass
+class Match(Statement, Expression):
+    scrutinee: Expression
+    arms: List[MatchArm]
 
 
 @dataclass

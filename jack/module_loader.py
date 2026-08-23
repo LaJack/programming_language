@@ -9,6 +9,8 @@ try:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -21,6 +23,7 @@ try:
         ImportDeclaration,
         IndexExpression,
         ModuleDeclaration,
+        Match,
         MoveExpression,
         Print,
         Raise,
@@ -47,6 +50,8 @@ except ImportError:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -59,6 +64,7 @@ except ImportError:
         ImportDeclaration,
         IndexExpression,
         ModuleDeclaration,
+        Match,
         MoveExpression,
         Print,
         Raise,
@@ -465,6 +471,21 @@ class ModuleResolver:
                         statement.else_body, context, NameRewriteScope(scope)
                     )
                 )
+        elif type(statement) is Match:
+            self._rewrite_expression_names(statement.scrutinee, context, scope, used_aliases)
+            for arm in statement.arms:
+                arm_scope = NameRewriteScope(scope)
+                for binding in arm.bindings:
+                    if binding.name is not None:
+                        arm_scope.declare(binding.name)
+                if arm.expr is not None:
+                    self._rewrite_expression_names(
+                        arm.expr, context, arm_scope, used_aliases
+                    )
+                if arm.body is not None:
+                    used_aliases.update(
+                        self._rewrite_statement_list_names(arm.body, context, arm_scope)
+                    )
         elif type(statement) is While:
             self._rewrite_expression_names(statement.condition, context, scope, used_aliases)
             used_aliases.update(
@@ -512,6 +533,18 @@ class ModuleResolver:
                     self._rewrite_expression_names(field.expr, context, scope, used_aliases)
             for method in statement.methods:
                 used_aliases.update(self._rewrite_function_names(method, context, method_owner=True))
+            if top_level:
+                statement.name = self._top_level_internal_name(statement, context)
+        elif type(statement) is EnumDeclaration:
+            for parameter in statement.parameters:
+                used_aliases.update(self._rewrite_parameter_names(parameter, context))
+            for variant in statement.variants:
+                for parameter in variant.parameters:
+                    used_aliases.update(self._rewrite_parameter_names(parameter, context))
+            for method in statement.methods:
+                used_aliases.update(
+                    self._rewrite_function_names(method, context, method_owner=True)
+                )
             if top_level:
                 statement.name = self._top_level_internal_name(statement, context)
         elif type(statement) is InterfaceDeclaration:
@@ -635,6 +668,19 @@ class ModuleResolver:
             self._rewrite_type_names(expression.type_ref, context, used_aliases)
             for field in expression.fields:
                 self._rewrite_expression_names(field.expr, context, scope, used_aliases)
+        elif type(expression) is EnumVariantExpression:
+            self._rewrite_type_names(expression.type_ref, context, used_aliases)
+            for argument in expression.arguments or []:
+                self._rewrite_expression_names(argument, context, scope, used_aliases)
+        elif type(expression) is Match:
+            self._rewrite_expression_names(expression.scrutinee, context, scope, used_aliases)
+            for arm in expression.arms:
+                arm_scope = NameRewriteScope(scope)
+                for binding in arm.bindings:
+                    if binding.name is not None:
+                        arm_scope.declare(binding.name)
+                if arm.expr is not None:
+                    self._rewrite_expression_names(arm.expr, context, arm_scope, used_aliases)
         elif type(expression) is CompositeExpression:
             self._rewrite_expression_names(expression.left, context, scope, used_aliases)
             self._rewrite_expression_names(expression.right, context, scope, used_aliases)
@@ -723,6 +769,7 @@ class ModuleResolver:
     def _is_top_level_symbol_declaration(self, statement: Statement) -> bool:
         return type(statement) in {
             TypeDeclaration,
+            EnumDeclaration,
             InterfaceDeclaration,
             FunctionDeclaration,
             VariableDeclaration,

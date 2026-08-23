@@ -103,6 +103,27 @@ class HIRTypeDeclaration(HIRDeclaration):
 
 
 @dataclass(frozen=True, kw_only=True)
+class HIREnumVariant(HIRNode):
+    name: str
+    discriminant: int
+    fields: list[HIRVariableSymbol] = field(default_factory=list)
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIREnumDeclaration(HIRDeclaration):
+    name: str
+    variants: list[HIREnumVariant]
+    methods: list[HIRFunctionDeclaration] = field(default_factory=list)
+    public: bool = False
+    module_name: str | None = None
+    source_name: str | None = None
+
+    @property
+    def parameters(self) -> list[HIRVariableSymbol]:
+        return []
+
+
+@dataclass(frozen=True, kw_only=True)
 class HIRViewDeclaration(HIRDeclaration):
     name: str
     fields: list[HIRViewFieldSymbol]
@@ -249,6 +270,14 @@ class HIRStructLiteralExpression(HIRExpression):
 
 
 @dataclass(frozen=True, kw_only=True)
+class HIREnumConstructExpression(HIRExpression):
+    enum_name: str
+    variant_name: str
+    discriminant: int
+    arguments: list[HIRExpression] = field(default_factory=list)
+
+
+@dataclass(frozen=True, kw_only=True)
 class HIRCallTarget:
     kind: HIRCallKind
     name: str
@@ -321,6 +350,28 @@ class HIRIfBranch(HIRNode):
 class HIRIf(HIRStatement):
     branches: list[HIRIfBranch]
     else_body: list[HIRStatement] | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRMatchBinding(HIRNode):
+    symbol: HIRVariableSymbol | None
+    field_index: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRMatchArm(HIRNode):
+    variant_name: str | None
+    discriminant: int | None
+    bindings: list[HIRMatchBinding] = field(default_factory=list)
+    body: list[HIRStatement] | None = None
+    expression: HIRExpression | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class HIRMatch(HIRStatement, HIRExpression):
+    scrutinee: HIRExpression
+    ownership: str
+    arms: list[HIRMatchArm]
 
 
 @dataclass(frozen=True, kw_only=True)

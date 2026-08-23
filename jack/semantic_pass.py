@@ -24,6 +24,8 @@ try:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -37,6 +39,7 @@ try:
         LiteralExpression,
         ModuleDeclaration,
         MoveExpression,
+        Match,
         ImportDeclaration,
         Print,
         Raise,
@@ -80,6 +83,8 @@ except ImportError:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -93,6 +98,7 @@ except ImportError:
         LiteralExpression,
         ModuleDeclaration,
         MoveExpression,
+        Match,
         ImportDeclaration,
         Print,
         Raise,
@@ -227,6 +233,8 @@ class SemanticPass:
         self._validate_interface_declarations(runtime_ast)
         self._validate_implementation_declarations(runtime_ast)
         self._validate_type_declarations(runtime_ast)
+        self._validate_enum_declarations(runtime_ast)
+        self._validate_finite_layouts(runtime_ast)
         self._validate_view_declarations(runtime_ast)
         self._validate_top_level_statements(runtime_ast)
         self._validate_function_bodies(runtime_ast)
@@ -237,8 +245,8 @@ class SemanticPass:
                 raise SemanticError(
                     f'Unexpected comptime statement "{type(node).__name__}" after the compile-time pass.'
                 )
-            if type(node) is TypeDeclaration:
-                self._validate_abi(node.abi, f'type "{node.name}"')
+            if type(node) in {TypeDeclaration, EnumDeclaration}:
+                self._validate_abi(getattr(node, 'abi', None), f'type "{node.name}"')
                 if node.parameters:
                     raise SemanticError(f'Generic type "{node.name}" reached semantic validation.')
                 if node.name in self.types or node.name in self.views:
@@ -333,6 +341,64 @@ class SemanticPass:
                 self.current_module_name = previous_module_name
                 self.current_imports = previous_imports
                 self.current_qualified_imports = previous_qualified_imports
+
+    def _validate_enum_declarations(self, ast: list[Statement]) -> None:
+        for node in ast:
+            if type(node) is not EnumDeclaration:
+                continue
+            if node.parameters:
+                raise SemanticError(f'Generic union "{node.name}" reached semantic validation.')
+            if not node.variants:
+                raise SemanticError(f'Union "{node.name}" must declare at least one variant.')
+            names: set[str] = set()
+            for variant in node.variants:
+                if variant.name in names:
+                    raise SemanticError(f'Union "{node.name}" has duplicate variant "{variant.name}".')
+                names.add(variant.name)
+                for parameter in variant.parameters:
+                    if parameter.comptime or parameter.type.borrow is not None:
+                        raise SemanticError('Union variant payloads must be owned runtime values.')
+                    self._validate_parameter(parameter, f'variant "{node.name}.{variant.name}"')
+            for method in node.methods:
+                if method.name in names or method.name in {'init', 'deinit'}:
+                    raise SemanticError(f'Invalid union method "{method.name}".')
+                self._validate_function_signature(method, owner=node.name)
+
+    def _validate_finite_layouts(self, ast: list[Statement]) -> None:
+        checked: set[str] = set()
+
+        def visit(type_ref: TypeReference, stack: tuple[str, ...]) -> None:
+            if (
+                type_ref.borrow is not None
+                or type_ref.pointer_mode is not None
+                or type_ref.is_slice
+            ):
+                return
+            declaration = self.types.get(type_ref.name)
+            if declaration is None:
+                return
+            if declaration.name in stack:
+                cycle = ' -> '.join((*stack, declaration.name))
+                raise SemanticError(f'Infinitely sized aggregate layout: {cycle}.')
+            if declaration.name in checked:
+                return
+            nested = (*stack, declaration.name)
+            fields = (
+                declaration.fields
+                if type(declaration) is TypeDeclaration
+                else [
+                    parameter
+                    for variant in declaration.variants
+                    for parameter in variant.parameters
+                ]
+            )
+            for field in fields:
+                visit(field.type, nested)
+            checked.add(declaration.name)
+
+        for declaration in ast:
+            if type(declaration) in {TypeDeclaration, EnumDeclaration}:
+                visit(TypeReference(declaration.name), ())
 
     def _validate_view_declarations(self, ast: list[Statement]) -> None:
         for node in ast:
@@ -543,7 +609,7 @@ class SemanticPass:
     def _validate_top_level_statements(self, ast: list[Statement]) -> None:
         for node in ast:
             if type(node) in {
-                TypeDeclaration, FunctionDeclaration, ViewDeclaration,
+                TypeDeclaration, EnumDeclaration, FunctionDeclaration, ViewDeclaration,
                 InterfaceDeclaration, ImplementationDeclaration,
             }:
                 continue
@@ -566,7 +632,7 @@ class SemanticPass:
                 self._validate_function_signature_with_context(node)
                 if not node.extern:
                     self._ensure_function_body_validated(node, self.global_scope)
-            elif type(node) is TypeDeclaration:
+            elif type(node) in {TypeDeclaration, EnumDeclaration}:
                 for method in node.methods:
                     self._ensure_method_body_validated(node, method)
             elif type(node) is ImplementationDeclaration:
@@ -835,15 +901,24 @@ class SemanticPass:
         if is_builtin_type(type_name):
             return
         declaration = self.types.get(type_name)
-        if declaration is None or declaration.extern or declaration.parameters:
-            raise SemanticError(f'Error type "{type_name}" must be a concrete struct type.')
+        if (
+            declaration is None
+            or getattr(declaration, 'extern', False)
+            or declaration.parameters
+        ):
+            raise SemanticError(f'Error type "{type_name}" must be a concrete aggregate type.')
         if type_name in seen:
             return
         seen.add(type_name)
         if any(method.name == 'deinit' for method in declaration.methods):
             raise SemanticError(f'Error type "{type_name}" cannot define deinit.')
-        for field in declaration.fields:
-            self._validate_raiseable_error_type(field.type, seen)
+        if type(declaration) is EnumDeclaration:
+            for variant in declaration.variants:
+                for parameter in variant.parameters:
+                    self._validate_raiseable_error_type(parameter.type, seen)
+        else:
+            for field in declaration.fields:
+                self._validate_raiseable_error_type(field.type, seen)
 
     def _validate_function_body(self, declaration: FunctionDeclaration, parent_scope: SemanticScope) -> None:
         scope = SemanticScope(parent_scope)
@@ -1002,6 +1077,8 @@ class SemanticPass:
                 self._validate_return(statement, scope, allow_return)
             elif type(statement) is If:
                 self._validate_if(statement, scope, allow_return)
+            elif type(statement) is Match:
+                self._validate_match(statement, scope, allow_return)
             elif type(statement) is While:
                 initial = dict(self.ownership_states)
                 self._validate_condition(statement.condition, scope, 'while condition')
@@ -1023,7 +1100,7 @@ class SemanticPass:
                     )
                 finally:
                     self.unsafe_depth -= 1
-            elif type(statement) is TypeDeclaration:
+            elif type(statement) in {TypeDeclaration, EnumDeclaration}:
                 raise SemanticError('Nested type declarations are not supported.')
             elif type(statement) is ViewDeclaration:
                 raise SemanticError('Nested view declarations are not supported.')
@@ -1490,7 +1567,14 @@ class SemanticPass:
             if expression.type == 'null':
                 return TypeReference('null')
             return TypeReference(expression.type)
+        if type(expression) is EnumVariantExpression:
+            return self._enum_variant_expression_type(expression, scope)
+        if type(expression) is Match:
+            return self._match_type(expression, scope, allow_return=True)
         if type(expression) is VariableExpression:
+            enum_value = self._fieldless_enum_value_type(expression)
+            if enum_value is not None:
+                return enum_value
             if check_reads:
                 self._require_initialized(expression.name, scope)
             value_type = self._resolve_name_type(expression.name, scope)
@@ -1650,6 +1734,127 @@ class SemanticPass:
             raise SemanticError(f'Struct literal for "{type_name}" is missing field "{missing[0]}".')
         return copy.deepcopy(expression.type_ref)
 
+    def _fieldless_enum_value_type(self, expression: VariableExpression) -> TypeReference | None:
+        if '.' not in expression.name:
+            return None
+        type_name, variant_name = expression.name.rsplit('.', 1)
+        declaration = self.types.get(type_name)
+        if type(declaration) is not EnumDeclaration:
+            return None
+        variant = next((v for v in declaration.variants if v.name == variant_name), None)
+        if variant is None or variant.parameters:
+            return None
+        return TypeReference(type_name)
+
+    def _enum_variant_expression_type(
+        self, expression: EnumVariantExpression, scope: SemanticScope
+    ) -> TypeReference:
+        type_name = self._type_name(expression.type_ref)
+        declaration = self.types.get(type_name)
+        if type(declaration) is not EnumDeclaration:
+            raise SemanticError(f'"{type_name}" is not a union type.')
+        variant = next((v for v in declaration.variants if v.name == expression.variant_name), None)
+        if variant is None:
+            raise SemanticError(f'Union "{type_name}" has no variant "{expression.variant_name}".')
+        arguments = expression.arguments
+        if arguments is None:
+            if variant.parameters:
+                raise SemanticError(f'Variant "{type_name}.{variant.name}" requires payload arguments.')
+        else:
+            self._validate_call_arguments(
+                f'{type_name}.{variant.name}', variant.parameters, arguments, scope
+            )
+        return copy.deepcopy(expression.type_ref)
+
+    def _enum_constructor_call_type(
+        self, call: FunctionCall, scope: SemanticScope
+    ) -> TypeReference | None:
+        if '.' not in call.function_name:
+            return None
+        type_name, variant_name = call.function_name.rsplit('.', 1)
+        declaration = self.types.get(type_name)
+        if type(declaration) is not EnumDeclaration:
+            return None
+        variant = next((v for v in declaration.variants if v.name == variant_name), None)
+        if variant is None:
+            return None
+        self._validate_call_arguments(call.function_name, variant.parameters, call.parameters, scope)
+        return TypeReference(type_name)
+
+    def _validate_match(
+        self, statement: Match, scope: SemanticScope, allow_return: bool
+    ) -> None:
+        self._match_type(statement, scope, allow_return)
+
+    def _match_type(
+        self, statement: Match, scope: SemanticScope, allow_return: bool
+    ) -> TypeReference:
+        scrutinee_type = self._expression_type(statement.scrutinee, scope)
+        enum_type = self._element_type(scrutinee_type)
+        declaration = self.types.get(self._type_name(enum_type))
+        if type(declaration) is not EnumDeclaration:
+            raise SemanticError('match requires a union value.')
+        if (
+            scrutinee_type.borrow is None
+            and type(statement.scrutinee) not in {MoveExpression, EnumVariantExpression, FunctionCall}
+        ):
+            raise SemanticError('Matching an owned place requires &in, &inout, or move.')
+        variants = {variant.name: variant for variant in declaration.variants}
+        initial = dict(self.ownership_states)
+        outcomes: list[dict[object, str]] = []
+        seen: set[str] = set()
+        wildcard = False
+        result_type: TypeReference | None = None
+        expression_form = bool(statement.arms and statement.arms[0].expr is not None)
+        for index, arm in enumerate(statement.arms):
+            self.ownership_states = dict(initial)
+            if arm.variant_name is None:
+                if wildcard or index != len(statement.arms) - 1:
+                    raise SemanticError('Wildcard match arm must appear once and last.')
+                wildcard = True
+                variant = None
+            else:
+                variant = variants.get(arm.variant_name)
+                if variant is None:
+                    raise SemanticError(f'Unknown variant "{arm.variant_name}" in match.')
+                if arm.variant_name in seen:
+                    raise SemanticError(f'Duplicate match arm for variant "{arm.variant_name}".')
+                seen.add(arm.variant_name)
+                if len(arm.bindings) != len(variant.parameters):
+                    raise SemanticError(f'Variant "{arm.variant_name}" pattern has wrong payload arity.')
+            arm_scope = SemanticScope(scope)
+            if variant is not None:
+                for binding, parameter in zip(arm.bindings, variant.parameters):
+                    if binding.name is None:
+                        continue
+                    binding_type = copy.deepcopy(parameter.type)
+                    if scrutinee_type.borrow is not None:
+                        binding_type.borrow = scrutinee_type.borrow
+                    info = SymbolInfo(
+                        'variable', binding_type,
+                        owned_local=scrutinee_type.borrow is None,
+                    )
+                    arm_scope.declare(binding.name, info)
+                    self.ownership_states[info.ownership_key] = 'initialized'
+            if expression_form:
+                if arm.expr is None:
+                    raise SemanticError('Cannot mix match expression and statement arms.')
+                arm_type = self._expression_value_type(arm.expr, arm_scope)
+                if result_type is None:
+                    result_type = arm_type
+                elif self._type_name(result_type) != self._type_name(arm_type):
+                    raise SemanticError('Match expression arms must have the same type.')
+            else:
+                if arm.body is None:
+                    raise SemanticError('Cannot mix match expression and statement arms.')
+                self._validate_statements(arm.body, arm_scope, allow_return)
+            outcomes.append(dict(self.ownership_states))
+        if not wildcard and seen != set(variants):
+            missing = sorted(set(variants) - seen)
+            raise SemanticError('Non-exhaustive match; missing ' + ', '.join(missing) + '.')
+        self.ownership_states = self._join_ownership_states(initial, outcomes)
+        return result_type or TypeReference('void')
+
     def _composite_type(self, expression: CompositeExpression, scope: SemanticScope) -> TypeReference:
         left_type = self._expression_value_type(expression.left, scope)
         right_type = self._expression_value_type(expression.right, scope)
@@ -1678,6 +1883,13 @@ class SemanticPass:
                 if expression.operator not in {'==', '!='}:
                     raise SemanticError('Raw pointers support only equality comparisons.')
                 return TypeReference('bool')
+            enum_decl = self.types.get(left_name)
+            if type(enum_decl) is EnumDeclaration:
+                if expression.operator not in {'==', '!='} or any(
+                    variant.parameters for variant in enum_decl.variants
+                ):
+                    raise SemanticError('Only fieldless enums support equality comparisons.')
+                return TypeReference('bool')
             if self._is_str_type(left_type) and expression.operator not in {'==', '!='}:
                 raise SemanticError(f'Operator "{expression.operator}" is not implemented for strings.')
             if is_bool_type(left_name) and expression.operator not in {'==', '!='}:
@@ -1696,6 +1908,9 @@ class SemanticPass:
         raise SemanticError(f'Unknown operator "{expression.operator}".')
 
     def _function_call_type(self, call: FunctionCall, scope: SemanticScope) -> TypeReference:
+        enum_result = self._enum_constructor_call_type(call, scope)
+        if enum_result is not None:
+            return enum_result
         if call.function_name in {'sizeof', 'alignof'}:
             raise SemanticError(f'{call.function_name} must be folded by the compile-time pass.')
         if call.function_name == 'raw':
@@ -1745,7 +1960,7 @@ class SemanticPass:
             receiver_name, method_name = call.function_name.rsplit('.', 1)
             receiver_type = self._resolve_name_type(receiver_name, scope)
             declaration = self.types.get(self._type_name(self._element_type(receiver_type)))
-            if declaration is not None and declaration.language_item == 'MaybeUninit':
+            if declaration is not None and getattr(declaration, 'language_item', None) == 'MaybeUninit':
                 return self._validate_maybe_uninit_call(
                     call, receiver_name, receiver_type, method_name, declaration, scope
                 )
@@ -2010,7 +2225,7 @@ class SemanticPass:
             receiver_type = self._resolve_name_type(receiver_name, scope)
             receiver_decl = self._type_declaration_for(receiver_type)
             if (
-                receiver_decl.language_item == 'MaybeUninit'
+                getattr(receiver_decl, 'language_item', None) == 'MaybeUninit'
                 and method_name in {'borrow', 'borrow_mut'}
                 and self.unsafe_depth > 0
             ):
@@ -2647,16 +2862,24 @@ class SemanticPass:
         declaration = self.types.get(name)
         if declaration is None:
             return True
-        if declaration.language_item == 'MaybeUninit':
+        if getattr(declaration, 'language_item', None) == 'MaybeUninit':
             return False
         if (name, 'Copyable') in self.implementations:
             return True
-        if declaration.extern or any(method.name == 'deinit' for method in declaration.methods):
+        if getattr(declaration, 'extern', False) or any(
+            method.name == 'deinit' for method in declaration.methods
+        ):
             return False
         seen = set(seen or ())
         if name in seen:
             return True
         seen.add(name)
+        if type(declaration) is EnumDeclaration:
+            return all(
+                self._is_copyable_type(parameter.type, seen)
+                for variant in declaration.variants
+                for parameter in variant.parameters
+            )
         return all(self._is_copyable_type(field.type, seen) for field in declaration.fields)
 
     def _borrow_compatible(self, expected: TypeReference, actual: TypeReference) -> bool:
@@ -2803,7 +3026,7 @@ class SemanticPass:
 
     def _is_opaque_extern_type(self, type_ref: TypeReference) -> bool:
         declaration = self.types.get(type_ref.name)
-        return declaration is not None and declaration.extern
+        return declaration is not None and getattr(declaration, 'extern', False)
 
     def _is_known_base_type(self, name: str) -> bool:
         return name in RUNTIME_SCALAR_TYPES or name == 'void' or name in self.types

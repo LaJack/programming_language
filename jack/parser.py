@@ -8,6 +8,9 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        EnumDeclaration,
+        EnumVariant,
+        EnumVariantExpression,
         DereferenceExpression,
         Expression,
         FormattedStringExpression,
@@ -25,6 +28,9 @@ try:
         LiteralExpression,
         ModuleDeclaration,
         MoveExpression,
+        Match,
+        MatchArm,
+        MatchBinding,
         ImportDeclaration,
         InvalidExpression,
         InvalidStatement,
@@ -53,6 +59,9 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        EnumDeclaration,
+        EnumVariant,
+        EnumVariantExpression,
         DereferenceExpression,
         Expression,
         FormattedStringExpression,
@@ -70,6 +79,9 @@ except ImportError:
         LiteralExpression,
         ModuleDeclaration,
         MoveExpression,
+        Match,
+        MatchArm,
+        MatchBinding,
         ImportDeclaration,
         InvalidExpression,
         InvalidStatement,
@@ -145,7 +157,7 @@ class ParseResult:
 
 class Lexer:
     SYMBOLS = set('{}();,:+-.=<>![]&*?/%')
-    TWO_CHAR_SYMBOLS = {'==', '!=', '<=', '>=', '..'}
+    TWO_CHAR_SYMBOLS = {'==', '!=', '<=', '>=', '..', '=>'}
 
     def __init__(self, source: str, source_path: str | Path | None = None) -> None:
         self.source = source
@@ -451,6 +463,7 @@ class Parser:
         'import',
         'implements',
         'interface',
+        'match',
         'module',
         'move',
         'null',
@@ -467,11 +480,12 @@ class Parser:
         'true',
         'try',
         'unsafe',
+        'union',
         'view',
         'while',
     }
     STATEMENT_KEYWORDS = {
-        'for', 'if', 'print', 'raise', 'return', 'rethrow', 'try', 'while',
+        'for', 'if', 'match', 'print', 'raise', 'return', 'rethrow', 'try', 'while',
     }
 
     def __init__(self, tokens: list[Token]) -> None:
@@ -574,6 +588,13 @@ class Parser:
                 raise self._error(self._previous(), 'struct cannot be unsafe or extern.')
             declaration = self._type_declaration()
             declaration.comptime = is_comptime
+            declaration.public = is_public
+            return declaration
+
+        if self._match_keyword('union'):
+            if is_extern or is_unsafe or is_comptime:
+                raise self._error(self._previous(), 'union cannot be comptime, unsafe, or extern.')
+            declaration = self._enum_declaration()
             declaration.public = is_public
             return declaration
 
@@ -756,6 +777,48 @@ class Parser:
         self._consume('}', 'Expected } after struct members.')
         self._match(';')
         return TypeDeclaration(name, fields, parameters, methods)
+
+    def _enum_declaration(self) -> EnumDeclaration:
+        name = self._identifier_value('Expected union name.')
+        parameters: list[VariableDeclaration] = []
+        if self._match('('):
+            if not self._check(')'):
+                while True:
+                    parameters.append(self._parameter())
+                    if not self._match(','):
+                        break
+            self._consume(')', 'Expected ) after union parameters.')
+        self._consume('{', 'Expected { before union variants.')
+        variants: list[EnumVariant] = []
+        methods: list[FunctionDeclaration] = []
+        while not self._check('}'):
+            if self._check('EOF'):
+                raise self._error(self._peek(), 'Expected } after union declaration.')
+            start = self._peek()
+            if self._check('IDENT') and (self._check_next(';') or self._check_next('(')):
+                variant_name = self._identifier_value('Expected variant name.')
+                payload: list[VariableDeclaration] = []
+                if self._match('('):
+                    if not self._check(')'):
+                        while True:
+                            payload.append(self._parameter())
+                            if not self._match(','):
+                                break
+                    self._consume(')', 'Expected ) after variant payload.')
+                self._consume(';', 'Expected ; after union variant.')
+                variants.append(self._with_span(EnumVariant(variant_name, payload), start))
+                continue
+            return_type = self._type_reference()
+            method_name = self._identifier_value('Expected union method name.')
+            self._consume('(', f'Expected ( after {method_name}.')
+            method = self._with_span(
+                self._finish_function_declaration(method_name, return_type, False, False),
+                start,
+            )
+            methods.append(self._method_declaration(name, method))
+        self._consume('}', 'Expected } after union declaration.')
+        self._match(';')
+        return EnumDeclaration(name, variants, parameters, methods)
 
     def _interface_declaration(self) -> InterfaceDeclaration:
         name = self._identifier_value('Expected interface name.')
@@ -1122,6 +1185,12 @@ class Parser:
             self._consume(';', 'Expected ; after return value.')
             return Return(value)
 
+        if self._match_keyword('match'):
+            result = self._match_construct()
+            if any(arm.expr is not None for arm in result.arms):
+                raise self._error(self._previous(), 'Value-producing match cannot be used as a statement.')
+            return result
+
         if self._match_keyword('print'):
             self._consume('(', 'Expected ( after print.')
             expr = self._expression()
@@ -1195,6 +1264,45 @@ class Parser:
         expr = self._expression()
         self._consume(')', f'Expected ) after {owner} condition.')
         return expr
+
+    def _match_construct(self) -> Match:
+        self._consume('(', 'Expected ( after match.')
+        scrutinee = self._expression()
+        self._consume(')', 'Expected ) after match value.')
+        self._consume('{', 'Expected { before match arms.')
+        arms: list[MatchArm] = []
+        expression_form: bool | None = None
+        while not self._check('}'):
+            start = self._peek()
+            variant_name = None
+            bindings: list[MatchBinding] = []
+            if self._check('IDENT') and self._peek().value == '_':
+                self._advance()
+            else:
+                self._consume('.', 'Expected .variant or _ match pattern.')
+                variant_name = self._identifier_value('Expected variant name.')
+                if self._match('('):
+                    if not self._check(')'):
+                        while True:
+                            token = self._consume('IDENT', 'Expected payload binding or _.')
+                            bindings.append(MatchBinding(None if token.value == '_' else token.value))
+                            if not self._match(','):
+                                break
+                    self._consume(')', 'Expected ) after match bindings.')
+            if self._match('=>'):
+                if expression_form is False:
+                    raise self._error(self._previous(), 'Cannot mix match expression and statement arms.')
+                expression_form = True
+                arm = MatchArm(variant_name, bindings, expr=self._expression())
+                self._consume(',', 'Expected , after match expression arm.')
+            else:
+                if expression_form is True:
+                    raise self._error(self._peek(), 'Cannot mix match expression and statement arms.')
+                expression_form = False
+                arm = MatchArm(variant_name, bindings, body=self._block())
+            arms.append(self._with_span(arm, start))
+        self._consume('}', 'Expected } after match arms.')
+        return Match(scrutinee, arms)
 
     def _for_initializer(self) -> Statement | None:
         if self._match(';'):
@@ -1339,6 +1447,12 @@ class Parser:
         return self._postfix_from(VariableExpression(self._name()))
 
     def _primary(self) -> Expression:
+        if self._match_keyword('match'):
+            result = self._match_construct()
+            if any(arm.body is not None for arm in result.arms):
+                raise self._error(self._previous(), 'Statement match cannot be used as an expression.')
+            return result
+
         if self._match_keyword('null'):
             return LiteralExpression(None, 'null')
 
@@ -1380,6 +1494,15 @@ class Parser:
             else:
                 if self._match('{'):
                     return self._struct_literal_expression(type_ref)
+                if type_ref.arguments and self._match('.'):
+                    variant_name = self._identifier_value('Expected union variant name.')
+                    if self._match('('):
+                        return EnumVariantExpression(
+                            type_ref,
+                            variant_name,
+                            self._finish_argument_list('union variant'),
+                        )
+                    return EnumVariantExpression(type_ref, variant_name)
                 self.current = start
 
             name = self._name()
@@ -1703,8 +1826,8 @@ class Parser:
 class RecoveringParser(Parser):
     RECOVERY_KEYWORDS = {
         'catch', 'comptime', 'elif', 'else', 'extern', 'for', 'if', 'import',
-        'interface', 'module', 'print', 'pub', 'raise', 'rethrow', 'return',
-        'struct', 'try', 'unsafe', 'use', 'view', 'while',
+        'interface', 'match', 'module', 'print', 'pub', 'raise', 'rethrow', 'return',
+        'struct', 'try', 'union', 'unsafe', 'use', 'view', 'while',
     }
 
     def __init__(
@@ -1824,6 +1947,58 @@ class RecoveringParser(Parser):
             self._record(self._error(self._peek(), 'Expected } after struct members.'))
         self._match(';')
         return TypeDeclaration(name, fields, parameters, methods)
+
+    def _enum_declaration(self) -> EnumDeclaration:
+        name = self._identifier_value('Expected union name.')
+        parameters: list[VariableDeclaration] = []
+        if self._match('('):
+            parameters = self._recover_parameter_list(
+                'Expected ) after union parameters.'
+            )
+        self._consume('{', 'Expected { before union variants.')
+        variants: list[EnumVariant] = []
+        methods: list[FunctionDeclaration] = []
+        while not self._check('}', 'EOF') and not self.limit_reached:
+            start_index = self.current
+            start = self._peek()
+            try:
+                if self._check('IDENT') and (
+                    self._check_next(';') or self._check_next('(')
+                ):
+                    variant_name = self._identifier_value('Expected variant name.')
+                    payload: list[VariableDeclaration] = []
+                    if self._match('('):
+                        payload = self._recover_parameter_list(
+                            'Expected ) after variant payload.'
+                        )
+                    self._consume(';', 'Expected ; after union variant.')
+                    variants.append(
+                        self._with_span(EnumVariant(variant_name, payload), start)
+                    )
+                    continue
+                return_type = self._type_reference()
+                method_name = self._identifier_value('Expected union method name.')
+                self._consume('(', f'Expected ( after {method_name}.')
+                method = self._with_span(
+                    self._finish_function_declaration(
+                        method_name, return_type, False, False
+                    ),
+                    start,
+                )
+                methods.append(self._method_declaration(name, method))
+            except ParseError as err:
+                self._record(err)
+                self._synchronize(
+                    in_block=True,
+                    start=start_index,
+                    stop_at_declaration=False,
+                )
+        if self._check('}'):
+            self._advance()
+        elif not self.limit_reached:
+            self._record(self._error(self._peek(), 'Expected } after union declaration.'))
+        self._match(';')
+        return EnumDeclaration(name, variants, parameters, methods)
 
     def _view_declaration(self) -> ViewDeclaration:
         name = self._identifier_value('Expected view name.')

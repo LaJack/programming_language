@@ -1,0 +1,20 @@
+module std.option;
+
+pub union Option(comptime type T) {
+    none;
+    some(move T value);
+
+    bool is_some(&in self) {
+        return match (self) {
+            .none => false,
+            .some(_) => true,
+        };
+    }
+
+    bool is_none(&in self) {
+        return match (self) {
+            .none => true,
+            .some(_) => false,
+        };
+    }
+}

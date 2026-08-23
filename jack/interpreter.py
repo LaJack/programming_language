@@ -29,6 +29,8 @@ try:
         HIRCompositeExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
+        HIREnumConstructExpression,
+        HIREnumDeclaration,
         HIRExpression,
         HIRExpressionStatement,
         HIRFieldAccessExpression,
@@ -39,6 +41,7 @@ try:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMatch,
         HIRMaybeUninitBorrowExpression,
         HIRMaybeUninitTakeExpression,
         HIRMaybeUninitWriteExpression,
@@ -91,6 +94,8 @@ except ImportError:
         HIRCompositeExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
+        HIREnumConstructExpression,
+        HIREnumDeclaration,
         HIRExpression,
         HIRExpressionStatement,
         HIRFieldAccessExpression,
@@ -101,6 +106,7 @@ except ImportError:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMatch,
         HIRMaybeUninitBorrowExpression,
         HIRMaybeUninitTakeExpression,
         HIRMaybeUninitWriteExpression,
@@ -147,6 +153,14 @@ class JackErrorValue:
 
     def __str__(self) -> str:
         return self.type_name
+
+
+@dataclass
+class JackEnumValue:
+    type_name: str
+    variant_name: str
+    discriminant: int
+    payload: list[object]
 
 
 class JackRaisedError(Exception):
@@ -240,6 +254,28 @@ class JackBorrow:
         if self.field_modes is not None and name in self.field_modes:
             return self.field_modes[name]
         return self.mode
+
+
+class JackEnumPayloadBorrow(JackBorrow):
+    def __init__(self, owner: JackEnumValue, index: int, mode: str) -> None:
+        self.owner = owner
+        self.index = index
+        self.mode = mode
+        self.mutable = borrow_mode_can_write(mode)
+        self.field_modes = None
+
+    @property
+    def value(self) -> object:
+        return self.owner.payload[self.index]
+
+    @value.setter
+    def value(self, value: object) -> None:
+        if not self.mutable:
+            raise EvaluationError('Cannot assign through a read-only union payload borrow.')
+        self.owner.payload[self.index] = value
+
+    def __deepcopy__(self, memo):
+        return JackEnumPayloadBorrow(self.owner, self.index, self.mode)
 
 
 class JackSymbolBorrow(JackBorrow):
@@ -586,7 +622,7 @@ class Interpreter:
         self.hir_program: HIRProgram | None = None
         self.hir_functions_by_name: dict[str, HIRFunctionDeclaration] = {}
         self.hir_methods_by_owner_and_name: dict[tuple[str, str], HIRFunctionDeclaration] = {}
-        self.hir_types_by_name: dict[str, HIRTypeDeclaration] = {}
+        self.hir_types_by_name: dict[str, HIRTypeDeclaration | HIREnumDeclaration] = {}
 
     def _prepare_hir(self, program: HIRProgram) -> None:
         self.hir_program = program
@@ -598,13 +634,13 @@ class Interpreter:
         self.hir_methods_by_owner_and_name = {
             (type_declaration.name, method.name): method
             for type_declaration in self.hir_program.declarations
-            if isinstance(type_declaration, HIRTypeDeclaration)
+            if isinstance(type_declaration, (HIRTypeDeclaration, HIREnumDeclaration))
             for method in type_declaration.methods
         }
         self.hir_types_by_name = {
             declaration.name: declaration
             for declaration in self.hir_program.declarations
-            if isinstance(declaration, HIRTypeDeclaration)
+            if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration))
         }
 
     def _hir_method_declaration_for_target(self, target: object) -> HIRFunctionDeclaration:
@@ -752,6 +788,8 @@ class Interpreter:
             return ReturnSignal(self._eval_hir_return(statement, scope))
         elif isinstance(statement, HIRIf):
             return self._execute_hir_if(statement, scope, allow_return)
+        elif isinstance(statement, HIRMatch):
+            return self._execute_hir_match(statement, scope, allow_return)
         elif isinstance(statement, HIRWhile):
             return self._execute_hir_while(statement, scope, allow_return)
         elif isinstance(statement, HIRFor):
@@ -858,6 +896,52 @@ class Interpreter:
             return self._execute_hir_block(statement.else_body, scope, allow_return)
         return None
 
+    def _execute_hir_match(
+        self, statement: HIRMatch, scope: SymbolTable, allow_return: bool
+    ) -> ReturnSignal[object] | None:
+        raw = self._eval_hir_expression(statement.scrutinee, scope)
+        value = self._read_value(raw)
+        if not isinstance(value, JackEnumValue):
+            raise EvaluationError('match requires a union value.')
+        arm = next(
+            (
+                candidate for candidate in statement.arms
+                if candidate.discriminant == value.discriminant
+            ),
+            next((candidate for candidate in statement.arms if candidate.discriminant is None), None),
+        )
+        if arm is None:
+            raise EvaluationError(f'No match arm for variant "{value.variant_name}".')
+        arm_scope = self._child_scope(scope)
+        consumed: set[int] = set()
+        try:
+            for binding in arm.bindings:
+                if binding.symbol is None:
+                    continue
+                index = binding.field_index
+                if statement.ownership == 'move':
+                    payload = value.payload[index]
+                    value.payload[index] = _MOVED_VALUE
+                    consumed.add(index)
+                    arm_scope.declare(binding.symbol.name, payload)
+                    if self._value_needs_drop(payload):
+                        arm_scope.mark_for_deinit(binding.symbol.name)
+                else:
+                    arm_scope.declare(
+                        binding.symbol.name,
+                        JackEnumPayloadBorrow(value, index, statement.ownership),
+                    )
+            if arm.expression is not None:
+                return ReturnSignal(self._eval_hir_expression(arm.expression, arm_scope))
+            return self._execute_hir_statements(arm.body or [], arm_scope, allow_return)
+        finally:
+            self._execute_deinit_scope(arm_scope)
+            if statement.ownership == 'move':
+                for index in reversed(range(len(value.payload))):
+                    if index not in consumed and value.payload[index] is not _MOVED_VALUE:
+                        self._execute_deinit_value(value.payload[index], scope)
+                        value.payload[index] = _MOVED_VALUE
+
     def _execute_hir_while(
         self, statement: HIRWhile, scope: SymbolTable, allow_return: bool
     ) -> ReturnSignal[object] | None:
@@ -939,6 +1023,18 @@ class Interpreter:
             return self._eval_hir_function_call(expression, scope)
         if isinstance(expression, HIRStructLiteralExpression):
             return self._eval_hir_struct_literal(expression, scope)
+        if isinstance(expression, HIREnumConstructExpression):
+            return JackEnumValue(
+                expression.enum_name,
+                expression.variant_name,
+                expression.discriminant,
+                [self._eval_hir_expression(argument, scope) for argument in expression.arguments],
+            )
+        if isinstance(expression, HIRMatch):
+            returned = self._execute_hir_match(expression, scope, allow_return=False)
+            if returned is None:
+                raise EvaluationError('Match expression did not produce a value.')
+            return returned.value
         if isinstance(expression, HIRIndexExpression):
             return self._eval_hir_index(expression, scope)
         if isinstance(expression, HIRSliceExpression):
@@ -1003,7 +1099,7 @@ class Interpreter:
                 return pointer
             target = self._element_type(expression.type_ref)
             declaration = self.hir_types_by_name.get(target.name)
-            if declaration is not None and declaration.language_item == 'MaybeUninit':
+            if declaration is not None and getattr(declaration, 'language_item', None) == 'MaybeUninit':
                 element = declaration.language_item_type
                 assert element is not None
                 return pointer.as_maybe_uninit(
@@ -1573,6 +1669,11 @@ class Interpreter:
     def _execute_deinit_value(self, value: object, scope: SymbolTable) -> None:
         if value is _MOVED_VALUE:
             return
+        if isinstance(value, JackEnumValue):
+            for item in reversed(value.payload):
+                if item is not _MOVED_VALUE and self._value_needs_drop(item):
+                    self._execute_deinit_value(item, scope)
+            return
         hir_deinit = self._hir_method_for_value(value, 'deinit')
         if hir_deinit is not None:
             target = HIRCallTarget(
@@ -1615,6 +1716,8 @@ class Interpreter:
             return False
         if isinstance(value, JackArray):
             return any(self._value_needs_drop(item) for item in value.values)
+        if isinstance(value, JackEnumValue):
+            return any(self._value_needs_drop(item) for item in value.payload)
         declaration = self.hir_types_by_name.get(value.__class__.__name__)
         if declaration is None:
             return False
@@ -1631,7 +1734,12 @@ class Interpreter:
         self, value: object, name: str
     ) -> HIRFunctionDeclaration | None:
         instance = self._method_receiver_value(value)
-        return self.hir_methods_by_owner_and_name.get((instance.__class__.__name__, name))
+        owner_name = (
+            instance.type_name
+            if isinstance(instance, JackEnumValue)
+            else instance.__class__.__name__
+        )
+        return self.hir_methods_by_owner_and_name.get((owner_name, name))
 
     def _has_method(self, value: object, name: str) -> bool:
         return self._hir_method_for_value(value, name) is not None
@@ -1695,6 +1803,11 @@ class Interpreter:
             )
 
         value = self._read_value(value)
+        enum_declaration = self.hir_types_by_name.get(type_name)
+        if isinstance(enum_declaration, HIREnumDeclaration):
+            if not isinstance(value, JackEnumValue) or value.type_name != type_name:
+                raise EvaluationError(f'Cannot convert {value!r} to type "{type_name}".')
+            return copy.deepcopy(value)
         target_type = self._get_type(type_ref, scope)
         if isinstance(target_type, type) and isinstance(value, target_type):
             return copy.deepcopy(value)
@@ -1707,6 +1820,10 @@ class Interpreter:
             raise EvaluationError(f'Cannot convert {value!r} to type "{type_name}".') from err
 
     def _default_value_for_type(self, type_ref: TypeReference, scope: SymbolTable) -> object:
+        if isinstance(self.hir_types_by_name.get(self._type_name(type_ref)), HIREnumDeclaration):
+            raise EvaluationError(
+                f'Cannot create a default value for union "{self._type_name(type_ref)}".'
+            )
         if self._is_borrow_type(type_ref) or self._is_slice_type(type_ref):
             raise EvaluationError(
                 f'Cannot create a default value for type "{self._type_name(type_ref)}".'
@@ -1748,9 +1865,33 @@ class Interpreter:
         declaration = self.hir_types_by_name.get(type_ref.name)
         if declaration is None:
             return 8
-        if declaration.language_item == 'MaybeUninit':
+        if getattr(declaration, 'language_item', None) == 'MaybeUninit':
             assert declaration.language_item_type is not None
             return self._interpreter_type_size(declaration.language_item_type)
+        if isinstance(declaration, HIREnumDeclaration):
+            payload_size = 1
+            payload_alignment = 1
+            for variant in declaration.variants:
+                variant_offset = 0
+                variant_alignment = 1
+                for field in variant.fields:
+                    size = self._interpreter_type_size(field.type_ref)
+                    alignment = min(max(size, 1), 8)
+                    variant_offset = (
+                        (variant_offset + alignment - 1) // alignment * alignment
+                    )
+                    variant_offset += size
+                    variant_alignment = max(variant_alignment, alignment)
+                variant_size = max(
+                    1,
+                    (variant_offset + variant_alignment - 1)
+                    // variant_alignment * variant_alignment,
+                )
+                payload_size = max(payload_size, variant_size)
+                payload_alignment = max(payload_alignment, variant_alignment)
+            alignment = max(4, payload_alignment)
+            offset = (4 + payload_alignment - 1) // payload_alignment * payload_alignment
+            return (offset + payload_size + alignment - 1) // alignment * alignment
         offset = 0
         maximum_alignment = 1
         for field_declaration in declaration.fields:

@@ -409,6 +409,44 @@ comptime fill(buffer[..]);
 u8 first = buffer[0];
 ```
 
+## Tagged Unions And Matching
+
+Unions are nominal and tagged. Variants are declared in source order and may
+be fieldless or carry owned payload parameters:
+
+```jack
+union Option(comptime type T) {
+    none;
+    some(move T value);
+}
+```
+
+Fieldless variants are values (`Option(i32).none`), while payload variants are
+constructed with calls (`Option(i32).some(42)`). Plain payload parameters copy;
+`move` payload parameters consume. Payload borrows, custom `init`/`deinit`, and
+recursive by-value layouts are rejected.
+
+Matching an owned place always declares its ownership operation:
+
+```jack
+match (&in value) { .some(item) { inspect(item); } .none { } }
+match (&inout value) { .some(item) { update(item); } .none { } }
+i32 result = match (move value) {
+    .some(item) => item,
+    .none => 0,
+};
+```
+
+Borrowed matches bind payload borrows with the same mode. Consuming matches
+transfer named payloads into branch-local owners and destroy ignored payloads
+at branch exit. Arms must be exhaustive; `_` is permitted only once as the
+final catch-all. Statement arms use blocks, expression arms use `=>` and must
+all produce exactly the same type.
+
+Fieldless enums support `==` and `!=`. Payload enums must be inspected with
+`match`. `std.option` provides generic `Option(T)` with `none`, `some`,
+`is_some`, and `is_none`.
+
 ## Control Flow
 
 Jack supports `if`, `elif`, and `else`:

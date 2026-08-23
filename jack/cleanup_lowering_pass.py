@@ -17,6 +17,8 @@ try:
         HIRCompositeExpression,
         HIRDeclaration,
         HIRDereferenceExpression,
+        HIREnumConstructExpression,
+        HIREnumDeclaration,
         HIRExpression,
         HIRExpressionStatement,
         HIRFieldAccessExpression,
@@ -28,6 +30,9 @@ try:
         HIRIfBranch,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMatch,
+        HIRMatchArm,
+        HIRMatchBinding,
         HIRMaybeUninitBorrowExpression,
         HIRMaybeUninitTakeExpression,
         HIRMaybeUninitWriteExpression,
@@ -64,6 +69,8 @@ except ImportError:
         HIRCompositeExpression,
         HIRDeclaration,
         HIRDereferenceExpression,
+        HIREnumConstructExpression,
+        HIREnumDeclaration,
         HIRExpression,
         HIRExpressionStatement,
         HIRFieldAccessExpression,
@@ -75,6 +82,9 @@ except ImportError:
         HIRIfBranch,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMatch,
+        HIRMatchArm,
+        HIRMatchBinding,
         HIRMaybeUninitBorrowExpression,
         HIRMaybeUninitTakeExpression,
         HIRMaybeUninitWriteExpression,
@@ -112,7 +122,7 @@ def lower_hir_static_cleanups(program: HIRProgram) -> HIRProgram:
 
 class HIRStaticCleanupLoweringPass:
     def __init__(self) -> None:
-        self.types: dict[str, HIRTypeDeclaration] = {}
+        self.types: dict[str, HIRTypeDeclaration | HIREnumDeclaration] = {}
         self.functions: dict[str, HIRFunctionDeclaration] = {}
         self.global_variables: dict[str, TypeReference] = {}
         self.used_names: set[str] = set()
@@ -161,6 +171,20 @@ class HIRStaticCleanupLoweringPass:
                 self._merge_errors(
                     errors, self._hir_expression_raised_errors(branch.condition)
                 )
+        elif isinstance(statement, HIRMatch):
+            self._merge_errors(
+                errors, self._hir_expression_raised_errors(statement.scrutinee)
+            )
+            for arm in statement.arms:
+                if arm.expression is not None:
+                    self._merge_errors(
+                        errors, self._hir_expression_raised_errors(arm.expression)
+                    )
+                if arm.body is not None:
+                    self._merge_errors(
+                        errors,
+                        self._hir_statement_list_raised_errors(arm.body, dict(env)),
+                    )
                 self._merge_errors(
                     errors,
                     self._hir_statement_list_raised_errors(branch.body, dict(env)),
@@ -257,6 +281,24 @@ class HIRStaticCleanupLoweringPass:
                 self._merge_errors(
                     errors, self._hir_expression_raised_errors(field.expr)
                 )
+        elif isinstance(expression, HIREnumConstructExpression):
+            for argument in expression.arguments:
+                self._merge_errors(
+                    errors, self._hir_expression_raised_errors(argument)
+                )
+        elif isinstance(expression, HIRMatch):
+            self._merge_errors(
+                errors, self._hir_expression_raised_errors(expression.scrutinee)
+            )
+            for arm in expression.arms:
+                self._merge_errors(
+                    errors, self._hir_expression_raised_errors(arm.expression)
+                )
+                if arm.body is not None:
+                    self._merge_errors(
+                        errors,
+                        self._hir_statement_list_raised_errors(arm.body, {}),
+                    )
         elif isinstance(expression, HIRBorrowExpression):
             self._merge_errors(
                 errors, self._hir_expression_raised_errors(expression.expr)
@@ -336,7 +378,7 @@ class HIRStaticCleanupLoweringPass:
             element_type.array_size = None
             return self._has_deinit(element_type, seen)
         type_decl = self.types.get(self._type_name(type_ref))
-        if not isinstance(type_decl, HIRTypeDeclaration) or type_decl.extern:
+        if not isinstance(type_decl, (HIRTypeDeclaration, HIREnumDeclaration)) or getattr(type_decl, 'extern', False):
             return False
         if any(method.name == 'deinit' for method in type_decl.methods):
             return True
@@ -344,7 +386,12 @@ class HIRStaticCleanupLoweringPass:
         if type_decl.name in seen:
             return False
         seen.add(type_decl.name)
-        return any(self._has_deinit(field.type_ref, seen) for field in type_decl.fields)
+        fields = (
+            type_decl.fields
+            if isinstance(type_decl, HIRTypeDeclaration)
+            else [field for variant in type_decl.variants for field in variant.fields]
+        )
+        return any(self._has_deinit(field.type_ref, seen) for field in fields)
 
     def _declared_raised_errors(
         self, raises: Iterable[TypeReference]
@@ -377,7 +424,7 @@ class HIRStaticCleanupLoweringPass:
         self.types = {
             declaration.name: declaration
             for declaration in program.declarations
-            if isinstance(declaration, HIRTypeDeclaration)
+            if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration))
         }
         self.functions = {
             declaration.name: declaration
@@ -469,7 +516,7 @@ class HIRStaticCleanupLoweringPass:
                 declaration,
                 body=[*flag_declarations, *body],
             )
-        if isinstance(declaration, HIRTypeDeclaration):
+        if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration)):
             methods: list[HIRFunctionDeclaration] = []
             for method in declaration.methods:
                 if method.extern:
@@ -487,7 +534,10 @@ class HIRStaticCleanupLoweringPass:
                 self.drop_flags = {}
                 previous_consuming_self = self.consuming_self_type
                 self.consuming_self_type = (
-                    declaration if method.name == 'deinit' else None
+                    declaration
+                    if isinstance(declaration, HIRTypeDeclaration)
+                    and method.name == 'deinit'
+                    else None
                 )
                 move_parameters = [
                     parameter for parameter in method.parameters
@@ -795,6 +845,29 @@ class HIRStaticCleanupLoweringPass:
                     return_type,
                 )
             return [replace(statement, branches=branches, else_body=else_body)]
+
+        if isinstance(statement, HIRMatch):
+            arms = []
+            for arm in statement.arms:
+                arm_env = dict(env)
+                active = list(active_deinit_names)
+                for binding in arm.bindings:
+                    if binding.symbol is None:
+                        continue
+                    arm_env[binding.symbol.name] = binding.symbol.type_ref
+                    if self._has_deinit(binding.symbol.type_ref):
+                        active.append(binding.symbol.name)
+                arms.append(replace(
+                    arm,
+                    body=(
+                        None
+                        if arm.body is None
+                        else self._lower_hir_block(
+                            arm.body, arm_env, active, return_type
+                        )
+                    ),
+                ))
+            return [replace(statement, arms=arms)]
 
         if isinstance(statement, HIRWhile):
             if (
@@ -1291,6 +1364,50 @@ class HIRStaticCleanupLoweringPass:
             return statements
 
         type_decl = self.types.get(self._type_name(type_ref))
+        if isinstance(type_decl, HIREnumDeclaration):
+            arms: list[HIRMatchArm] = []
+            for variant in type_decl.variants:
+                bindings: list[HIRMatchBinding] = []
+                body: list[HIRStatement] = []
+                for field_index, field in enumerate(variant.fields):
+                    binding_name = self._next_generated_name('jack_enum_drop')
+                    symbol = HIRVariableSymbol(
+                        name=binding_name,
+                        type_ref=copy.deepcopy(field.type_ref),
+                        synthetic=True,
+                        passing_mode='move',
+                        span=span,
+                    )
+                    bindings.append(HIRMatchBinding(
+                        symbol=symbol, field_index=field_index, span=span
+                    ))
+                    if self._has_deinit(field.type_ref):
+                        body.extend(self._hir_cleanup_value(
+                            self._hir_variable(binding_name, field.type_ref, span),
+                            field.type_ref,
+                            span,
+                        ))
+                arms.append(HIRMatchArm(
+                    variant_name=variant.name,
+                    discriminant=variant.discriminant,
+                    bindings=bindings,
+                    body=body,
+                    span=span,
+                ))
+            moved = HIRMoveExpression(
+                expr=expression,
+                type_ref=copy.deepcopy(type_ref),
+                read_type=copy.deepcopy(type_ref),
+                span=span,
+            )
+            return [HIRMatch(
+                scrutinee=moved,
+                ownership='move',
+                arms=arms,
+                type_ref=TypeReference('void'),
+                read_type=TypeReference('void'),
+                span=span,
+            )]
         if not isinstance(type_decl, HIRTypeDeclaration) or type_decl.extern:
             return []
         statements: list[HIRStatement] = []

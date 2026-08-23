@@ -4,25 +4,47 @@ import bootstrap.source;
 import std.collections.vector;
 import std.memory;
 
+pub union TokenKind {
+    eof;
+    identifier;
+    integer;
+    floating;
+    string;
+    symbol;
+    invalid;
+    formatted_string;
+}
+
 pub struct Token {
-    u8 kind;
+    TokenKind kind;
     SourceSpan span;
 
-    u8 kind_value(&in self) { return self.kind; }
+    u8 kind_value(&in self) {
+        return match (&in self.kind) {
+            .eof => u8(0),
+            .identifier => u8(1),
+            .integer => u8(2),
+            .floating => u8(3),
+            .string => u8(4),
+            .symbol => u8(5),
+            .invalid => u8(6),
+            .formatted_string => u8(7),
+        };
+    }
     usize start_offset(&in self) { return self.span.start_offset(); }
     usize end_offset(&in self) { return self.span.end_offset(); }
     usize line_number(&in self) { return self.span.line_number(); }
     usize column_number(&in self) { return self.span.column_number(); }
 }
 
-pub u8 token_eof() { return u8(0); }
-pub u8 token_identifier() { return u8(1); }
-pub u8 token_integer() { return u8(2); }
-pub u8 token_float() { return u8(3); }
-pub u8 token_string() { return u8(4); }
-pub u8 token_symbol() { return u8(5); }
-pub u8 token_invalid() { return u8(6); }
-pub u8 token_formatted_string() { return u8(7); }
+pub TokenKind token_eof() { return TokenKind.eof; }
+pub TokenKind token_identifier() { return TokenKind.identifier; }
+pub TokenKind token_integer() { return TokenKind.integer; }
+pub TokenKind token_float() { return TokenKind.floating; }
+pub TokenKind token_string() { return TokenKind.string; }
+pub TokenKind token_symbol() { return TokenKind.symbol; }
+pub TokenKind token_invalid() { return TokenKind.invalid; }
+pub TokenKind token_formatted_string() { return TokenKind.formatted_string; }
 
 bool is_alpha(u8 value) {
     if (value >= u8(97)) {
@@ -75,7 +97,7 @@ bool is_escape(u8 value) {
 void emit(
     comptime type A: Allocator,
     &inout Vector(Token, A) tokens,
-    u8 kind,
+    TokenKind kind,
     usize start,
     usize end,
     usize line,

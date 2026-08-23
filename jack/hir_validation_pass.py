@@ -6,9 +6,12 @@ from .builtin_types import BUILTIN_TYPE_SPECS
 from .hir_nodes import (
     HIRCallExpression,
     HIRCatchClause,
+    HIREnumConstructExpression,
+    HIREnumDeclaration,
     HIRFunctionDeclaration,
     HIRNode,
     HIRProgram,
+    HIRMatch,
     HIRRaise,
     HIRTypeDeclaration,
     HIRVariableSymbol,
@@ -29,7 +32,7 @@ class BackendHIRValidator:
         self.types = {
             declaration.name: declaration
             for declaration in program.declarations
-            if isinstance(declaration, (HIRTypeDeclaration, HIRViewDeclaration))
+            if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration, HIRViewDeclaration))
         }
         self.functions = {
             declaration.name: declaration
@@ -37,7 +40,7 @@ class BackendHIRValidator:
             if isinstance(declaration, HIRFunctionDeclaration)
         }
         for declaration in program.declarations:
-            if isinstance(declaration, HIRTypeDeclaration):
+            if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration)):
                 for method in declaration.methods:
                     self.functions[f'{declaration.name}.{method.name}'] = method
 
@@ -58,6 +61,10 @@ class BackendHIRValidator:
             )
         if isinstance(value, HIRCallExpression):
             self._call(value)
+        elif isinstance(value, HIREnumConstructExpression):
+            self._enum_construct(value)
+        elif isinstance(value, HIRMatch):
+            self._match(value)
         elif isinstance(value, HIRRaise):
             self._error_type(value.error_type, value.span)
         elif isinstance(value, HIRCatchClause):
@@ -163,6 +170,36 @@ class BackendHIRValidator:
                 ):
                     self._fail(f'Invalid cleanup call "{target.name}".', call.span)
 
+    def _enum_construct(self, expression: HIREnumConstructExpression) -> None:
+        declaration = self.types.get(expression.enum_name)
+        if not isinstance(declaration, HIREnumDeclaration):
+            self._fail(f'Union "{expression.enum_name}" has no declaration.', expression.span)
+        variant = next(
+            (item for item in declaration.variants if item.name == expression.variant_name),
+            None,
+        )
+        if (
+            variant is None
+            or variant.discriminant != expression.discriminant
+            or len(variant.fields) != len(expression.arguments)
+        ):
+            self._fail('Malformed union construction in backend HIR.', expression.span)
+
+    def _match(self, statement: HIRMatch) -> None:
+        declaration = self.types.get(statement.scrutinee.type_ref.name)
+        if not isinstance(declaration, HIREnumDeclaration):
+            self._fail('Match scrutinee is not a concrete union.', statement.span)
+        legal = {variant.discriminant for variant in declaration.variants}
+        seen = {
+            arm.discriminant for arm in statement.arms
+            if arm.discriminant is not None
+        }
+        if not seen.issubset(legal) or (
+            not any(arm.discriminant is None for arm in statement.arms)
+            and seen != legal
+        ):
+            self._fail('Match has invalid or incomplete discriminant targets.', statement.span)
+
     def _error_type(
         self, type_ref: TypeReference, span: SourceSpan | None
     ) -> None:
@@ -174,7 +211,7 @@ class BackendHIRValidator:
         ):
             self._fail('Error payload references must be concrete struct types.', span)
         declaration = self.types.get(type_ref.name)
-        if not isinstance(declaration, HIRTypeDeclaration) or declaration.extern:
+        if not isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration)) or getattr(declaration, 'extern', False):
             self._fail(
                 f'Error payload "{type_ref.name}" is not a concrete struct type.',
                 span,
@@ -183,7 +220,7 @@ class BackendHIRValidator:
 
     def _validate_error_fields(
         self,
-        declaration: HIRTypeDeclaration,
+        declaration: HIRTypeDeclaration | HIREnumDeclaration,
         seen: set[str],
         span: SourceSpan | None,
     ) -> None:
@@ -194,7 +231,12 @@ class BackendHIRValidator:
             self._fail(
                 f'Error payload "{declaration.name}" cannot define deinit.', span
             )
-        for field in declaration.fields:
+        fields = (
+            declaration.fields
+            if isinstance(declaration, HIRTypeDeclaration)
+            else [field for variant in declaration.variants for field in variant.fields]
+        )
+        for field in fields:
             field_type = field.type_ref
             if field_type.borrow is not None or field_type.is_slice or field_type.name in {
                 'str', 'c_char', 'c_void', 'void', 'type'

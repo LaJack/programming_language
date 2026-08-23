@@ -32,6 +32,8 @@ try:
         HIRCompositeExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
+        HIREnumConstructExpression,
+        HIREnumDeclaration,
         HIRExpression,
         HIRExpressionStatement,
         HIRFieldAccessExpression,
@@ -42,6 +44,7 @@ try:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMatch,
         HIRMaybeUninitBorrowExpression,
         HIRMaybeUninitTakeExpression,
         HIRMaybeUninitWriteExpression,
@@ -96,6 +99,8 @@ except ImportError:
         HIRCompositeExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
+        HIREnumConstructExpression,
+        HIREnumDeclaration,
         HIRExpression,
         HIRExpressionStatement,
         HIRFieldAccessExpression,
@@ -106,6 +111,7 @@ except ImportError:
         HIRFormattedStringExpression,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMatch,
         HIRMaybeUninitBorrowExpression,
         HIRMaybeUninitTakeExpression,
         HIRMaybeUninitWriteExpression,
@@ -341,7 +347,7 @@ class CEmitPass:
         types = [
             declaration
             for declaration in program.declarations
-            if isinstance(declaration, HIRTypeDeclaration)
+            if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration))
         ]
         views = [
             declaration
@@ -521,7 +527,7 @@ class CEmitPass:
         types = [
             declaration
             for declaration in program.declarations
-            if isinstance(declaration, HIRTypeDeclaration)
+            if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration))
         ]
         views = [
             declaration
@@ -589,10 +595,10 @@ class CEmitPass:
         type_modules = {
             declaration.name: declaration.module_name
             for declaration in program.declarations
-            if isinstance(declaration, HIRTypeDeclaration)
+            if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration))
         }
         for declaration in program.declarations:
-            if not isinstance(declaration, HIRTypeDeclaration):
+            if not isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration)):
                 continue
             if '$comptime$' not in declaration.name:
                 continue
@@ -619,7 +625,7 @@ class CEmitPass:
     def _hir_module_sections(self, statements: list[HIRStatement]):
         types = [
             statement for statement in statements
-            if isinstance(statement, HIRTypeDeclaration)
+            if isinstance(statement, (HIRTypeDeclaration, HIREnumDeclaration))
         ]
         views = [
             statement for statement in statements
@@ -1174,11 +1180,22 @@ class CEmitPass:
             raise CEmitError(f'Cannot compute error payload layout for type "{type_name}".')
 
         declaration = self.type_declarations.get(type_name)
-        if declaration is None or declaration.extern or getattr(declaration, 'parameters', []):
+        if declaration is None or getattr(declaration, 'extern', False) or getattr(declaration, 'parameters', []):
             raise CEmitError(f'Cannot compute error payload layout for type "{type_name}".')
         if type_name in seen:
             return 1, 1
         seen.add(type_name)
+        if isinstance(declaration, HIREnumDeclaration):
+            payload_layouts = [
+                self._aggregate_layout(
+                    self._layout_of_type(field.type_ref, set(seen))
+                    for field in variant.fields
+                ) if variant.fields else (1, 1)
+                for variant in declaration.variants
+            ]
+            payload_size = max(size for size, _ in payload_layouts)
+            payload_align = max(align for _, align in payload_layouts)
+            return self._aggregate_layout([(4, 4), (payload_size, payload_align)])
         if not declaration.fields:
             return 1, 1
         return self._aggregate_layout(
@@ -1263,6 +1280,8 @@ class CEmitPass:
 
     def _emit_type_declaration(self, declaration: TypeDeclaration) -> str:
         self._ensure_runtime_statement(declaration)
+        if isinstance(declaration, HIREnumDeclaration):
+            return self._emit_enum_declaration(declaration)
         if getattr(declaration, 'language_item', None) == 'MaybeUninit':
             return ''
         if declaration.extern:
@@ -1279,6 +1298,27 @@ class CEmitPass:
             self._ensure_runtime_statement(field)
             lines.append(f'    {self._emit_declaration(field.type, self._mangle(field.name), dict())};')
         lines.append(f'}} {self._mangle(declaration.name)};')
+        return '\n'.join(self._with_source_directive(lines, declaration))
+
+    def _emit_enum_declaration(self, declaration: HIREnumDeclaration) -> str:
+        name = self._mangle(declaration.name)
+        lines = [f'typedef struct {name} {{', '    uint32_t jack_tag;', '    union {']
+        if not any(variant.fields for variant in declaration.variants):
+            lines.append('        uint8_t jack_empty;')
+        for variant in declaration.variants:
+            if not variant.fields:
+                continue
+            lines.append('        struct {')
+            for field in variant.fields:
+                lines.append(
+                    '            '
+                    + self._emit_declaration(
+                        field.type_ref, self._mangle(field.name), {}
+                    )
+                    + ';'
+                )
+            lines.append(f'        }} {self._mangle(variant.name)};')
+        lines.extend(['    } jack_payload;', f'}} {name};'])
         return '\n'.join(self._with_source_directive(lines, declaration))
 
     def _emit_view_declaration(self, declaration: ViewDeclaration) -> str:
@@ -1502,6 +1542,8 @@ class CEmitPass:
             return [self._emit_hir_print(statement, env)]
         if isinstance(statement, HIRIf):
             return self._emit_hir_if(statement, env)
+        if isinstance(statement, HIRMatch):
+            return self._emit_hir_match(statement, env, expression_result=None)
         if isinstance(statement, HIRWhile):
             return self._emit_hir_while(statement, env)
         if isinstance(statement, HIRFor):
@@ -1572,7 +1614,7 @@ class CEmitPass:
             statement.initializer is None
             and statement.constructor_call is None
             and type_declaration is not None
-            and type_declaration.language_item == 'MaybeUninit'
+            and getattr(type_declaration, 'language_item', None) == 'MaybeUninit'
         ):
             env[symbol.name] = symbol.type_ref
             return [
@@ -1995,6 +2037,13 @@ class CEmitPass:
             return self._emit_hir_call(expression, env)
         if isinstance(expression, HIRStructLiteralExpression):
             return self._emit_hir_struct_literal(expression, env)
+        if isinstance(expression, HIREnumConstructExpression):
+            return self._emit_hir_enum_construct(expression, env)
+        if isinstance(expression, HIRMatch):
+            result = self._next_temporary_name('match_result')
+            lines = self._emit_hir_match(expression, dict(env), expression_result=result)
+            declaration = self._emit_declaration(expression.type_ref, result, {})
+            return '({ ' + declaration + '; ' + ' '.join(lines) + f' {result}; }})'
         if isinstance(expression, HIRIndexExpression):
             return self._emit_hir_index_expression(expression, env)
         if isinstance(expression, HIRSliceExpression):
@@ -2077,6 +2126,90 @@ class CEmitPass:
             fields = '0'
         return f'({self._emit_type(expression.type_ref)}){{{fields}}}'
 
+    def _emit_hir_enum_construct(
+        self, expression: HIREnumConstructExpression, env: dict[str, TypeReference]
+    ) -> str:
+        declaration = self.type_declarations[expression.enum_name]
+        variant = next(
+            item for item in declaration.variants
+            if item.name == expression.variant_name
+        )
+        fields = ', '.join(
+            f'.{self._mangle(field.name)} = '
+            f'{self._emit_hir_expression_as_type(argument, field.type_ref, env)}'
+            for field, argument in zip(variant.fields, expression.arguments)
+        )
+        payload = ''
+        if fields:
+            payload = (
+                f', .jack_payload.{self._mangle(variant.name)} = {{{fields}}}'
+            )
+        return (
+            f'({self._emit_type(expression.type_ref)})'
+            f'{{.jack_tag = {expression.discriminant}u{payload}}}'
+        )
+
+    def _emit_hir_match(
+        self,
+        statement: HIRMatch,
+        env: dict[str, TypeReference],
+        expression_result: str | None,
+    ) -> list[str]:
+        temp = self._next_temporary_name('match_value')
+        borrowed = statement.ownership in {'in', 'out', 'inout'}
+        temp_type = copy.deepcopy(statement.scrutinee.type_ref)
+        initializer = self._emit_hir_expression(statement.scrutinee, env)
+        lines = [f'{self._emit_declaration(temp_type, temp, env)} = {initializer};']
+        access = f'{temp}->' if borrowed else f'{temp}.'
+        lines.append(f'switch ({access}jack_tag) {{')
+        for arm in statement.arms:
+            label = 'default:' if arm.discriminant is None else f'case {arm.discriminant}u:'
+            lines.append(self._indent(label))
+            lines.append(self._indent('{', 2))
+            arm_env = dict(env)
+            if arm.variant_name is not None:
+                variant_name = self._mangle(arm.variant_name)
+                for binding in arm.bindings:
+                    if binding.symbol is None:
+                        continue
+                    field = self.type_declarations[
+                        self._type_name(self._element_type(statement.scrutinee.type_ref))
+                    ].variants[arm.discriminant].fields[binding.field_index]
+                    source = (
+                        f'{access}jack_payload.{variant_name}.'
+                        f'{self._mangle(field.name)}'
+                    )
+                    if borrowed:
+                        source = f'(&{source})'
+                    lines.append(self._indent(
+                        f'{self._emit_declaration(binding.symbol.type_ref, self._mangle(binding.symbol.name), arm_env)} = {source};',
+                        3,
+                    ))
+                    arm_env[binding.symbol.name] = binding.symbol.type_ref
+            if arm.expression is not None and expression_result is not None:
+                lines.append(self._indent(
+                    f'{expression_result} = {self._emit_hir_expression_as_type(arm.expression, statement.type_ref, arm_env)};',
+                    3,
+                ))
+                synthetic_names = [
+                    binding.symbol.name
+                    for binding in arm.bindings
+                    if binding.symbol is not None and binding.symbol.synthetic
+                ]
+                lines.extend(
+                    self._indent(line, 3)
+                    for line in self._emit_deinit_calls(synthetic_names, arm_env)
+                )
+            for child in arm.body or []:
+                lines.extend(
+                    self._indent(line, 3)
+                    for line in self._emit_hir_statement(child, arm_env)
+                )
+            lines.append(self._indent('break;', 3))
+            lines.append(self._indent('}', 2))
+        lines.append('}')
+        return lines
+
     def _emit_hir_composite_expression(
         self, expression: HIRCompositeExpression, env: dict[str, TypeReference]
     ) -> str:
@@ -2096,6 +2229,15 @@ class CEmitPass:
 
         left_name = self._type_name(left_type)
         right_name = self._type_name(right_type)
+        enum_declaration = self.type_declarations.get(left_name)
+        if (
+            isinstance(enum_declaration, HIREnumDeclaration)
+            and all(not variant.fields for variant in enum_declaration.variants)
+        ):
+            return (
+                f'(({left}).jack_tag {expression.operator} '
+                f'({right}).jack_tag)'
+            )
         if is_builtin_type(left_name) or is_builtin_type(right_name):
             if left_name != right_name:
                 raise CEmitError(f'Cannot combine values of type "{left_name}" and "{right_name}".')
@@ -2670,7 +2812,7 @@ class CEmitPass:
         if name == 'type':
             raise CEmitError('Comptime type value reached C emission.')
         declaration = self.type_declarations.get(name)
-        if declaration is not None and declaration.language_item == 'MaybeUninit':
+        if declaration is not None and getattr(declaration, 'language_item', None) == 'MaybeUninit':
             if declaration.language_item_type is None:
                 raise CEmitError('MaybeUninit declaration has no element type.')
             return self._emit_type(declaration.language_item_type)
@@ -2901,8 +3043,8 @@ class CEmitPass:
                 escaped.append(f'\\{byte:03o}')
         return ''.join(escaped)
 
-    def _indent(self, line: str) -> str:
-        return f'    {line}' if line else ''
+    def _indent(self, line: str, level: int = 1) -> str:
+        return f'{"    " * level}{line}' if line else ''
 
     def _ensure_runtime_statement(self, statement: Statement) -> None:
         if getattr(statement, 'comptime', False):

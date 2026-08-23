@@ -20,6 +20,9 @@ try:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariant,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -34,6 +37,8 @@ try:
         LiteralExpression,
         ModuleDeclaration,
         MoveExpression,
+        Match,
+        MatchArm,
         ImportDeclaration,
         Print,
         Raise,
@@ -73,6 +78,9 @@ except ImportError:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariant,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -87,6 +95,8 @@ except ImportError:
         LiteralExpression,
         ModuleDeclaration,
         MoveExpression,
+        Match,
+        MatchArm,
         ImportDeclaration,
         Print,
         Raise,
@@ -329,8 +339,8 @@ class CompileTimePass:
         self._validate_interface_contracts()
         self._validate_generic_copy_contracts(ast)
         lowered = self._apply_statements(ast, CompileTimeScope())
-        lowered_types = [node for node in lowered if type(node) is TypeDeclaration]
-        lowered_rest = [node for node in lowered if type(node) is not TypeDeclaration]
+        lowered_types = [node for node in lowered if type(node) in {TypeDeclaration, EnumDeclaration}]
+        lowered_rest = [node for node in lowered if type(node) not in {TypeDeclaration, EnumDeclaration}]
         runtime_ast = [
             *lowered_types,
             *self.generated_types,
@@ -345,7 +355,7 @@ class CompileTimePass:
         for node in nodes:
             if type(node) is FunctionDeclaration:
                 self.functions[node.name] = node
-            elif type(node) is TypeDeclaration:
+            elif type(node) in {TypeDeclaration, EnumDeclaration}:
                 self.types[node.name] = node
             elif type(node) is InterfaceDeclaration:
                 self.interfaces[node.name] = node
@@ -622,12 +632,55 @@ class CompileTimePass:
             return [] if node.parameters else [copy.deepcopy(node)]
         if type(node) is ViewDeclaration:
             return [copy.deepcopy(node)]
+        if type(node) is EnumDeclaration:
+            if node.parameters:
+                return []
+            methods = [
+                self._runtime_method_declaration(
+                    method, scope, owner_type=TypeReference(node.name), owner_source_name=node.name
+                )
+                for method in node.methods
+            ]
+            variants = [
+                EnumVariant(
+                    variant.name,
+                    [self._runtime_variable_declaration(p, scope) for p in variant.parameters],
+                    span=variant.span,
+                )
+                for variant in node.variants
+            ]
+            return [EnumDeclaration(
+                node.name,
+                variants,
+                methods=methods,
+                public=node.public,
+                module_name=node.module_name,
+                source_name=node.source_name,
+                imports=list(node.imports),
+                qualified_imports=list(node.qualified_imports),
+                span=node.span,
+            )]
         if type(node) is VariableDeclaration:
             return self._apply_variable_declaration(node, scope)
         if type(node) is Assignment:
             return self._apply_assignment(node, scope)
         if type(node) is If:
             return self._apply_if(node, scope)
+        if type(node) is Match:
+            scrutinee_prelude, scrutinee = self._apply_expression(node.scrutinee, scope)
+            arms = []
+            for arm in node.arms:
+                if arm.expr is not None:
+                    prelude, expr = self._apply_expression(arm.expr, CompileTimeScope(scope))
+                    if prelude:
+                        raise CompileTimeError('Match expression arms cannot require runtime preludes yet.')
+                    arms.append(MatchArm(arm.variant_name, copy.deepcopy(arm.bindings), expr=expr))
+                else:
+                    arms.append(MatchArm(
+                        arm.variant_name, copy.deepcopy(arm.bindings),
+                        body=self._apply_statements(arm.body or [], CompileTimeScope(scope)),
+                    ))
+            return [*scrutinee_prelude, Match(scrutinee, arms)]
         if type(node) is While:
             return self._apply_while(node, scope)
         if type(node) is For:
@@ -683,7 +736,7 @@ class CompileTimePass:
         self, declaration: VariableDeclaration, scope: CompileTimeScope
     ) -> list[Statement]:
         runtime_type = self._apply_type_reference(declaration.type, scope)
-        if declaration.extern:
+        if getattr(declaration, 'extern', False):
             if declaration.comptime:
                 raise CompileTimeError(f'Extern variable "{declaration.name}" cannot be comptime.')
             if declaration.expr is not None or declaration.constructor_args:
@@ -1070,6 +1123,23 @@ class CompileTimePass:
             return self._apply_formatted_string_expression(expression, scope)
         if type(expression) is StructLiteralExpression:
             return self._apply_struct_literal_expression(expression, scope)
+        if type(expression) is EnumVariantExpression:
+            arguments = []
+            prelude = []
+            for argument in expression.arguments or []:
+                item_prelude, item = self._apply_expression(argument, scope)
+                prelude.extend(item_prelude)
+                arguments.append(item)
+            return prelude, EnumVariantExpression(
+                self._apply_type_reference(expression.type_ref, scope),
+                expression.variant_name,
+                None if expression.arguments is None else arguments,
+            )
+        if type(expression) is Match:
+            lowered = self._apply_statement(expression, scope)
+            if len(lowered) != 1 or type(lowered[0]) is not Match:
+                raise CompileTimeError('Invalid match expression lowering.')
+            return [], lowered[0]
         if type(expression) is VariableExpression:
             value = scope.get(expression.name)
             if value is not None:
@@ -1559,7 +1629,21 @@ class CompileTimePass:
             variant_name = self._variant_name(type_ref.name, key[1])
             self.type_variant_names[key] = variant_name
             self._reject_unsupported_comptime_type_features(declaration)
-            fields = [self._runtime_variable_declaration(field, field_scope) for field in declaration.fields]
+            fields = [
+                self._runtime_variable_declaration(field, field_scope)
+                for field in getattr(declaration, 'fields', [])
+            ]
+            variants = [
+                EnumVariant(
+                    variant.name,
+                    [
+                        self._runtime_variable_declaration(parameter, field_scope)
+                        for parameter in variant.parameters
+                    ],
+                    span=variant.span,
+                )
+                for variant in getattr(declaration, 'variants', [])
+            ]
             constraints = {
                 parameter.name: {constraint.name for constraint in parameter.constraints}
                 for parameter in declaration.parameters
@@ -1568,7 +1652,7 @@ class CompileTimePass:
             previous_dispatch = self.active_interface_dispatch
             self.active_interface_dispatch = {
                 f'self.{field.name}': set(constraints[field.type.name])
-                for field in declaration.fields
+                for field in getattr(declaration, 'fields', [])
                 if field.type.name in constraints
             }
             try:
@@ -1601,17 +1685,35 @@ class CompileTimePass:
                         owner_type=TypeReference(variant_name),
                         owner_source_name=declaration.name,
                     ))
-            generated_type = TypeDeclaration(
-                variant_name,
-                fields,
+            common = dict(
                 methods=methods,
                 public=declaration.public,
                 module_name=declaration.module_name,
                 source_name=declaration.source_name,
-                imports=self._specialization_imports(declaration, fields, methods),
+                imports=self._specialization_imports(
+                    declaration,
+                    [
+                        parameter
+                        for variant in variants
+                        for parameter in variant.parameters
+                    ] if type(declaration) is EnumDeclaration else fields,
+                    methods,
+                ),
                 qualified_imports=list(declaration.qualified_imports),
                 span=declaration.span,
             )
+            if type(declaration) is EnumDeclaration:
+                generated_type = EnumDeclaration(
+                    variant_name,
+                    variants,
+                    **common,
+                )
+            else:
+                generated_type = TypeDeclaration(
+                    variant_name,
+                    fields,
+                    **common,
+                )
             self.generated_types.append(generated_type)
             self.types[variant_name] = generated_type
 
@@ -1696,10 +1798,16 @@ class CompileTimePass:
             return False
         if is_builtin_type(name) or name in {'str', 'c_char', 'c_void', 'type'}:
             return True
-        if declaration is None or declaration.extern:
+        if declaration is None or getattr(declaration, 'extern', False):
             return False
         if any(method.name == 'deinit' for method in declaration.methods):
             return False
+        if type(declaration) is EnumDeclaration:
+            return all(
+                self._type_satisfies_constraint(parameter.type, 'Copyable')
+                for variant in declaration.variants
+                for parameter in variant.parameters
+            )
         return all(self._type_satisfies_constraint(field.type, 'Copyable')
                    for field in declaration.fields)
 
@@ -2505,15 +2613,36 @@ class CompileTimePass:
         declaration = self.types.get(type_name)
         if declaration is None:
             raise CompileTimeError(f'Unknown type "{type_name}" in {self._type_name(type_ref)} layout query.')
-        if declaration.extern:
+        if getattr(declaration, 'extern', False):
             raise CompileTimeError(
                 f'Cannot query layout of opaque extern type "{type_name}" by value; use an explicit borrow type.'
             )
-        if declaration.language_item == 'MaybeUninit':
+        if getattr(declaration, 'language_item', None) == 'MaybeUninit':
             assert declaration.language_item_type is not None
             return self._layout_of_type(declaration.language_item_type, scope)
         if declaration.parameters:
             raise CompileTimeError(f'Generic type "{type_name}" requires comptime arguments.')
+        if type(declaration) is EnumDeclaration:
+            payloads = []
+            for variant in declaration.variants:
+                fields = [
+                    self._layout_of_type(
+                        self._apply_type_reference(parameter.type, scope), scope
+                    )
+                    for parameter in variant.parameters
+                ]
+                payloads.append(
+                    self._aggregate_layout(fields) if fields else TypeLayout(1, 1)
+                )
+            payload_size = max(layout.size for layout in payloads)
+            payload_align = max(layout.align for layout in payloads)
+            tag = self._builtin_layout('u32')
+            payload_offset = self._align_layout_value(tag.size, payload_align)
+            alignment = max(tag.align, payload_align)
+            return TypeLayout(
+                self._align_layout_value(payload_offset + payload_size, alignment),
+                alignment,
+            )
         if not declaration.fields:
             return TypeLayout(1, 1)
 
@@ -2522,6 +2651,10 @@ class CompileTimePass:
             for field in declaration.fields
         ]
         return self._aggregate_layout(field_layouts)
+
+    @staticmethod
+    def _align_layout_value(value: int, alignment: int) -> int:
+        return ((value + alignment - 1) // alignment) * alignment
 
     def _validate_layout_indirection_target(
         self, type_ref: TypeReference, scope: CompileTimeScope
@@ -3087,7 +3220,11 @@ class CompileTimePass:
                     self._validate_returns(function_name, return_type, catch.body)
 
     def _reject_unsupported_comptime_type_features(self, declaration: TypeDeclaration) -> None:
-        comptime_fields = [field.name for field in declaration.fields if field.comptime]
+        comptime_fields = [
+            field.name
+            for field in getattr(declaration, 'fields', [])
+            if field.comptime
+        ]
         if comptime_fields:
             names = ', '.join(comptime_fields)
             raise CompileTimeFeatureNotImplemented(
@@ -3169,11 +3306,19 @@ class CompileTimePass:
     def _is_struct_type(self, type_ref: TypeReference) -> bool:
         type_name = self._type_name(type_ref)
         declaration = self.types.get(type_name)
-        return declaration is not None and not declaration.parameters and not declaration.extern
+        return (
+            type(declaration) is TypeDeclaration
+            and not declaration.parameters
+            and not declaration.extern
+        )
 
     def _is_opaque_comptime_type(self, type_ref: TypeReference) -> bool:
         declaration = self.types.get(type_ref.name)
-        return declaration is not None and declaration.extern and type_ref.borrow is not None
+        return (
+            type(declaration) is TypeDeclaration
+            and declaration.extern
+            and type_ref.borrow is not None
+        )
 
 
 class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):

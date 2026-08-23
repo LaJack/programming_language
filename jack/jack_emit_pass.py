@@ -7,6 +7,8 @@ try:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -19,6 +21,7 @@ try:
         LiteralExpression,
         ModuleDeclaration,
         MoveExpression,
+        Match,
         ImportDeclaration,
         Print,
         Raise,
@@ -44,6 +47,8 @@ except ImportError:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -56,6 +61,7 @@ except ImportError:
         LiteralExpression,
         ModuleDeclaration,
         MoveExpression,
+        Match,
         ImportDeclaration,
         Print,
         Raise,
@@ -99,6 +105,8 @@ class JackEmitPass:
             return self._line(level, self._import_declaration(statement))
         if type(statement) is TypeDeclaration:
             return self._type_declaration(statement, level)
+        if type(statement) is EnumDeclaration:
+            return self._enum_declaration(statement, level)
         if type(statement) is InterfaceDeclaration:
             return self._interface_declaration(statement, level)
         if type(statement) is ImplementationDeclaration:
@@ -127,6 +135,8 @@ class JackEmitPass:
             return self._line(level, f'print({statement.name});')
         if type(statement) is If:
             return self._if_statement(statement, level)
+        if type(statement) is Match:
+            return self._match_statement(statement, level)
         if type(statement) is While:
             return self._while_statement(statement, level)
         if type(statement) is For:
@@ -176,6 +186,22 @@ class JackEmitPass:
         lines = [self._line(level, f'{prefix}interface {declaration.name} {{')]
         for method in declaration.methods:
             lines.append(self._function_signature(method, level + 1, method=True) + ';')
+        lines.append(self._line(level, '}'))
+        return '\n'.join(lines)
+
+    def _enum_declaration(self, declaration: EnumDeclaration, level: int) -> str:
+        parameters = ''
+        if declaration.parameters:
+            parameters = '(' + ', '.join(self._parameter(p) for p in declaration.parameters) + ')'
+        lines = [self._line(level, f'{self._declaration_prefix(declaration)}union {declaration.name}{parameters} {{')]
+        for variant in declaration.variants:
+            payload = ''
+            if variant.parameters:
+                payload = '(' + ', '.join(self._parameter(p) for p in variant.parameters) + ')'
+            lines.append(self._line(level + 1, f'{variant.name}{payload};'))
+        for method in declaration.methods:
+            lines.append('')
+            lines.append(self._function_declaration(method, level + 1, method=True))
         lines.append(self._line(level, '}'))
         return '\n'.join(lines)
 
@@ -322,6 +348,24 @@ class JackEmitPass:
         lines.append(self._line(level, '}'))
         return '\n'.join(lines)
 
+    def _match_statement(self, statement: Match, level: int) -> str:
+        lines = [self._line(level, f'match ({self._expression(statement.scrutinee)}) {{')]
+        for arm in statement.arms:
+            pattern = self._match_pattern(arm)
+            lines.append(self._line(level + 1, f'{pattern} {{'))
+            lines.extend(self._block_lines(arm.body or [], level + 2))
+            lines.append(self._line(level + 1, '}'))
+        lines.append(self._line(level, '}'))
+        return '\n'.join(lines)
+
+    def _match_pattern(self, arm) -> str:
+        if arm.variant_name is None:
+            return '_'
+        bindings = ''
+        if arm.bindings:
+            bindings = '(' + ', '.join(b.name or '_' for b in arm.bindings) + ')'
+        return f'.{arm.variant_name}{bindings}'
+
     def _for_statement(self, statement: For, level: int) -> str:
         initializer = '' if statement.initializer is None else self._for_part(statement.initializer)
         condition = '' if statement.condition is None else self._expression(statement.condition)
@@ -421,6 +465,16 @@ class JackEmitPass:
             source = self._formatted_string(expression)
         elif type(expression) is StructLiteralExpression:
             source = self._struct_literal(expression)
+        elif type(expression) is EnumVariantExpression:
+            source = f'{self._type_reference(expression.type_ref)}.{expression.variant_name}'
+            if expression.arguments is not None:
+                source += '(' + ', '.join(self._expression(a) for a in expression.arguments) + ')'
+        elif type(expression) is Match:
+            arms = ' '.join(
+                f'{self._match_pattern(arm)} => {self._expression(arm.expr)},'
+                for arm in expression.arms
+            )
+            source = f'match ({self._expression(expression.scrutinee)}) {{ {arms} }}'
         elif type(expression) is BorrowExpression:
             source = f'&{expression.mode} {self._expression(expression.expr, precedence)}'
         elif type(expression) is MoveExpression:

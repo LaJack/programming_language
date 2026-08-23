@@ -13,6 +13,8 @@ from .ast_nodes import (
     BorrowExpression,
     CatchClause,
     CompositeExpression,
+    EnumDeclaration,
+    EnumVariantExpression,
     Expression,
     For,
     FormattedStringExpression,
@@ -24,6 +26,7 @@ from .ast_nodes import (
     ImportDeclaration,
     IndexExpression,
     LiteralExpression,
+    Match,
     ModuleDeclaration,
     MoveExpression,
     Print,
@@ -59,9 +62,9 @@ SKIPPED_DIRECTORIES = {
 }
 JACK_KEYWORDS = {
     'as', 'catch', 'comptime', 'else', 'extern', 'false', 'for', 'if',
-    'implements', 'import', 'in', 'inout', 'interface', 'module', 'move', 'out',
+    'implements', 'import', 'in', 'inout', 'interface', 'match', 'module', 'move', 'out',
     'print', 'pub', 'raise', 'raises', 'rethrow', 'return', 'struct', 'true',
-    'try', 'unsafe', 'use', 'view', 'while',
+    'try', 'union', 'unsafe', 'use', 'view', 'while',
 }
 BUILTIN_TYPES = {
     'void', 'str', 'c_char', 'c_void', 'type', 'Copyable', 'MaybeUninit',
@@ -386,7 +389,7 @@ class _GraphIndexBuilder:
         self.overlays = overlays
         self.model = SemanticModel()
         self.top_by_internal: dict[str, str] = {}
-        self.type_declarations: dict[str, TypeDeclaration | ViewDeclaration] = {}
+        self.type_declarations: dict[str, TypeDeclaration | EnumDeclaration | ViewDeclaration] = {}
         self.functions: dict[str, FunctionDeclaration] = {}
         self.tokens: dict[Path, list[Token]] = {}
         self.diagnostics: list[AnalysisDiagnostic] = []
@@ -402,7 +405,7 @@ class _GraphIndexBuilder:
             self.tokens[module.path] = Lexer(source, source_path=module.path).tokenize()
             for statement in module.ast:
                 if type(statement) in {
-                    TypeDeclaration, ViewDeclaration, InterfaceDeclaration,
+                    TypeDeclaration, EnumDeclaration, ViewDeclaration, InterfaceDeclaration,
                     FunctionDeclaration,
                     VariableDeclaration,
                 }:
@@ -437,13 +440,13 @@ class _GraphIndexBuilder:
             parameter_labels=_parameter_labels(node),
         )
         self._add_symbol(symbol)
-        if isinstance(node, TypeDeclaration):
+        if isinstance(node, (TypeDeclaration, EnumDeclaration)):
             self.type_parameters.update(
                 parameter.name for parameter in node.parameters
                 if parameter.type.name == 'type'
             )
         self.top_by_internal[getattr(node, 'name')] = symbol_id
-        if isinstance(node, (TypeDeclaration, ViewDeclaration)):
+        if isinstance(node, (TypeDeclaration, EnumDeclaration, ViewDeclaration)):
             self.type_declarations[getattr(node, 'name')] = node
             self._declare_members(symbol, node)
         elif isinstance(node, InterfaceDeclaration):
@@ -452,9 +455,9 @@ class _GraphIndexBuilder:
             self.functions[node.name] = node
 
     def _declare_members(
-        self, owner: SemanticSymbol, node: TypeDeclaration | ViewDeclaration
+        self, owner: SemanticSymbol, node: TypeDeclaration | EnumDeclaration | ViewDeclaration
     ) -> None:
-        fields = node.fields
+        fields = node.fields if isinstance(node, (TypeDeclaration, ViewDeclaration)) else []
         for field in fields:
             name = field.name
             kind = 'field'
@@ -469,7 +472,24 @@ class _GraphIndexBuilder:
             )
             self._add_symbol(symbol)
             self.model.members.setdefault(owner.id, []).append(symbol_id)
-        if isinstance(node, TypeDeclaration):
+        if isinstance(node, (TypeDeclaration, EnumDeclaration)):
+            if isinstance(node, EnumDeclaration):
+                for variant in node.variants:
+                    selection = self._declaration_selection(variant, variant.name)
+                    symbol_id = f'{owner.id}::variant::{variant.name}'
+                    symbol = SemanticSymbol(
+                        symbol_id, variant.name, 'variant', owner.name,
+                        f'variant {owner.name}.{variant.name}', variant.span, selection,
+                        owner.module_name, owner.public, False, True, owner.id,
+                        selection.start_offset, resolved_type=owner.resolved_type,
+                        parameter_labels=tuple(
+                            f'{"move " if parameter.passing_mode == "move" else ""}'
+                            f'{_type_label(parameter.type)} {parameter.name}'
+                            for parameter in variant.parameters
+                        ),
+                    )
+                    self._add_symbol(symbol)
+                    self.model.members.setdefault(owner.id, []).append(symbol_id)
             for method in node.methods:
                 name = method.name
                 symbol_id = f'{owner.id}::method::{name}'
@@ -519,7 +539,7 @@ class _GraphIndexBuilder:
             return
         if isinstance(node, ImportDeclaration):
             return
-        if isinstance(node, TypeDeclaration):
+        if isinstance(node, (TypeDeclaration, EnumDeclaration)):
             owner_id = self.top_by_internal.get(node.name)
             type_scope = self._child_scope(node.span, scope)
             type_env = dict(env)
@@ -531,10 +551,14 @@ class _GraphIndexBuilder:
                     parameter, module_name, type_scope, 'parameter'
                 )
                 type_env[parameter.name] = symbol.id
-            for field in node.fields:
+            for field in getattr(node, 'fields', []):
                 self._type_reference(field.type, type_env)
                 if field.expr is not None:
                     self._expression(field.expr, type_env)
+            if isinstance(node, EnumDeclaration):
+                for variant in node.variants:
+                    for parameter in variant.parameters:
+                        self._type_reference(parameter.type, type_env)
             for method in node.methods:
                 self._function(method, module_name, type_env, owner_id)
             return
@@ -619,6 +643,48 @@ class _GraphIndexBuilder:
             return
         if isinstance(node, Raise):
             self._expression(node.expr, env)
+            return
+        if isinstance(node, Match):
+            scrutinee_type = self._expression(node.scrutinee, env)
+            owner = (
+                self.type_declarations.get(scrutinee_type.name)
+                if scrutinee_type is not None else None
+            )
+            variants = (
+                {variant.name: variant for variant in owner.variants}
+                if isinstance(owner, EnumDeclaration) else {}
+            )
+            owner_id = (
+                self._type_symbol_id(owner.name)
+                if isinstance(owner, EnumDeclaration) else None
+            )
+            for arm in node.arms:
+                arm_scope = self._child_scope(arm.span or node.span, scope)
+                arm_env = dict(env)
+                variant = variants.get(arm.variant_name or '')
+                if owner_id is not None and arm.variant_name is not None:
+                    member = self._member(owner_id, arm.variant_name, 'variant')
+                    if member is not None:
+                        self._occurrence_for_symbol(arm.span, member)
+                if variant is not None:
+                    for binding, parameter in zip(arm.bindings, variant.parameters):
+                        if binding.name is None:
+                            continue
+                        local = VariableDeclaration(
+                            binding.name,
+                            copy.deepcopy(parameter.type),
+                            span=binding.span,
+                        )
+                        symbol = self._declare_local(
+                            local, module_name, arm_scope, 'variable'
+                        )
+                        arm_env[binding.name] = symbol.id
+                if arm.expr is not None:
+                    self._expression(arm.expr, arm_env)
+                for child in arm.body or []:
+                    self._statement(
+                        child, module_name, arm_env, arm_scope, owner_type
+                    )
             return
         if isinstance(node, If):
             for branch in node.branches:
@@ -756,6 +822,23 @@ class _GraphIndexBuilder:
             return self._name_occurrences(node.name, node.span, env)
         if isinstance(node, FunctionCall):
             return self._call(node, env)
+        if isinstance(node, EnumVariantExpression):
+            self._type_reference(node.type_ref, env)
+            owner_id = self._type_symbol_id(node.type_ref.name)
+            if owner_id is not None:
+                member = self._member(owner_id, node.variant_name, 'variant')
+                if member is not None:
+                    self._occurrence_for_symbol(node.span, member, prefer_last=True)
+            for argument in node.arguments or []:
+                self._expression(argument, env)
+            return node.type_ref
+        if isinstance(node, Match):
+            result = None
+            self._expression(node.scrutinee, env)
+            for arm in node.arms:
+                if arm.expr is not None:
+                    result = self._expression(arm.expr, env) or result
+            return result or TypeReference('void')
         if isinstance(node, CompositeExpression):
             left = self._expression(node.left, env)
             self._expression(node.right, env)
@@ -811,6 +894,15 @@ class _GraphIndexBuilder:
         if name in BUILTIN_TYPES:
             return TypeReference(name)
         parts = name.split('.')
+        if len(parts) > 1:
+            enum_name = '.'.join(parts[:-1])
+            owner_id = self._type_symbol_id(enum_name)
+            owner = self.type_declarations.get(enum_name)
+            if owner_id is not None and isinstance(owner, EnumDeclaration):
+                member = self._member(owner_id, parts[-1], 'variant')
+                if member is not None:
+                    self._occurrence_for_symbol(node.span, member, prefer_last=True)
+                    return TypeReference(owner.name)
         direct = self.top_by_internal.get(parts[0])
         symbol = self.model.symbols.get(direct or '')
         if symbol is not None and symbol.kind == 'function':
@@ -1051,7 +1143,7 @@ def _source_span(path: Path, source: str) -> SourceSpan:
 
 
 def _declaration_kind(node: Statement) -> str:
-    if isinstance(node, TypeDeclaration):
+    if isinstance(node, (TypeDeclaration, EnumDeclaration)):
         return 'type'
     if isinstance(node, ViewDeclaration):
         return 'view'
@@ -1067,7 +1159,7 @@ def _declaration_type_label(node: Statement) -> str | None:
         return _type_label(node.return_type)
     if isinstance(node, VariableDeclaration):
         return _type_label(node.type)
-    if isinstance(node, (TypeDeclaration, ViewDeclaration, InterfaceDeclaration)):
+    if isinstance(node, (TypeDeclaration, EnumDeclaration, ViewDeclaration, InterfaceDeclaration)):
         return node.source_name or node.name
     return None
 
@@ -1075,6 +1167,8 @@ def _declaration_type_label(node: Statement) -> str | None:
 def _declaration_signature(node: Statement, name: str) -> str:
     if isinstance(node, TypeDeclaration):
         return f'{'pub ' if node.public else ''}struct {name}'
+    if isinstance(node, EnumDeclaration):
+        return f'{'pub ' if node.public else ''}union {name}'
     if isinstance(node, ViewDeclaration):
         return f'{'pub ' if node.public else ''}view {name}'
     if isinstance(node, InterfaceDeclaration):
@@ -1110,7 +1204,7 @@ def _parameter_labels(
             *([] if omit_self or node.self_parameter is None else [node.self_parameter]),
             *node.parameters,
         ]
-    elif isinstance(node, TypeDeclaration):
+    elif isinstance(node, (TypeDeclaration, EnumDeclaration)):
         parameters = node.parameters
     else:
         return ()

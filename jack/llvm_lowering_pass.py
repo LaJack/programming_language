@@ -15,6 +15,8 @@ from .hir_nodes import (
     HIRCompositeExpression,
     HIRDereferenceExpression,
     HIRDeclaration,
+    HIREnumConstructExpression,
+    HIREnumDeclaration,
     HIRExpression,
     HIRExpressionStatement,
     HIRFieldAccessExpression,
@@ -25,6 +27,7 @@ from .hir_nodes import (
     HIRIf,
     HIRIndexExpression,
     HIRLiteralExpression,
+    HIRMatch,
     HIRMaybeUninitBorrowExpression,
     HIRMaybeUninitTakeExpression,
     HIRMaybeUninitWriteExpression,
@@ -197,7 +200,7 @@ class LLVMLoweringPass:
     ) -> None:
         self.module = LLVMModule(debug=debug, optimization=optimization)
         self.effect_inlining = effect_inlining
-        self.types: dict[str, HIRTypeDeclaration] = {}
+        self.types: dict[str, HIRTypeDeclaration | HIREnumDeclaration] = {}
         self.views: dict[str, HIRViewDeclaration] = {}
         self.functions: dict[str, HIRFunctionDeclaration] = {}
         self.inline_candidates: dict[str, InlineCandidate] = {}
@@ -212,7 +215,8 @@ class LLVMLoweringPass:
         self.types = {
             declaration.name: declaration
             for declaration in program.declarations
-            if isinstance(declaration, HIRTypeDeclaration) and not declaration.extern
+            if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration))
+            and not getattr(declaration, 'extern', False)
         }
         self.views = {
             declaration.name: declaration
@@ -238,7 +242,7 @@ class LLVMLoweringPass:
         for declaration in program.declarations:
             if isinstance(declaration, HIRFunctionDeclaration) and not declaration.extern:
                 self.module.functions.append(self._function(declaration))
-            elif isinstance(declaration, HIRTypeDeclaration):
+            elif isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration)):
                 for method in declaration.methods:
                     self.module.functions.append(
                         self._function(
@@ -266,9 +270,23 @@ class LLVMLoweringPass:
 
     def _declare_types(self) -> None:
         for declaration in self.types.values():
-            if declaration.language_item == 'MaybeUninit':
+            if getattr(declaration, 'language_item', None) == 'MaybeUninit':
                 continue
-            fields = ', '.join(self._type(field.type_ref) for field in declaration.fields)
+            if isinstance(declaration, HIREnumDeclaration):
+                for variant in declaration.variants:
+                    payload = ', '.join(self._type(field.type_ref) for field in variant.fields) or 'i8'
+                    self.module.type_definitions.append(
+                        f'{self._enum_variant_type(declaration.name, variant.name)} = type {{ {payload} }}'
+                    )
+                payload_size, payload_align = self._enum_payload_layout(declaration)
+                scalar = {1: 'i8', 2: 'i16', 4: 'i32', 8: 'i64'}[payload_align]
+                scalar_size = payload_align
+                fields = (
+                    f'i32, {{ {scalar}, '
+                    f'[{max(payload_size - scalar_size, 0)} x i8] }}'
+                )
+            else:
+                fields = ', '.join(self._type(field.type_ref) for field in declaration.fields)
             if not fields:
                 fields = 'i8'
             self.module.type_definitions.append(
@@ -281,6 +299,53 @@ class LLVMLoweringPass:
             self.module.type_definitions.append(
                 f'{self._named_type(declaration.name)} = type {{ {fields} }}'
             )
+
+    def _enum_variant_type(self, enum_name: str, variant_name: str) -> str:
+        return self._named_type(f'{enum_name}$variant${variant_name}')
+
+    def _enum_payload_layout(self, declaration: HIREnumDeclaration) -> tuple[int, int]:
+        largest = 1
+        maximum_alignment = 1
+        for variant in declaration.variants:
+            offset = 0
+            alignment = 1
+            for field in variant.fields:
+                size, field_alignment = self._abi_size_align(field.type_ref)
+                offset = self._align_to(offset, field_alignment)
+                offset += size
+                alignment = max(alignment, field_alignment)
+            largest = max(largest, self._align_to(offset, alignment))
+            maximum_alignment = max(maximum_alignment, alignment)
+        return self._align_to(largest, maximum_alignment), maximum_alignment
+
+    def _abi_size_align(self, type_ref: TypeReference) -> tuple[int, int]:
+        if type_ref.borrow is not None or type_ref.pointer_mode is not None:
+            return 8, 8
+        if type_ref.is_slice or type_ref.name == 'str':
+            return 16, 8
+        if type_ref.array_size is not None:
+            size, alignment = self._abi_size_align(self._element_type(type_ref))
+            stride = self._align_to(size, alignment)
+            return stride * int(type_ref.array_size), alignment
+        if type_ref.name in BUILTIN_TYPE_SPECS:
+            size = max(1, (BUILTIN_TYPE_SPECS[type_ref.name].bits + 7) // 8)
+            return size, min(size, 8)
+        declaration = self.types.get(type_ref.name)
+        if isinstance(declaration, HIREnumDeclaration):
+            payload_size, payload_align = self._enum_payload_layout(declaration)
+            alignment = max(4, payload_align)
+            offset = self._align_to(4, payload_align)
+            return self._align_to(offset + payload_size, alignment), alignment
+        if isinstance(declaration, HIRTypeDeclaration):
+            offset = 0
+            alignment = 1
+            for field in declaration.fields:
+                size, field_alignment = self._abi_size_align(field.type_ref)
+                offset = self._align_to(offset, field_alignment)
+                offset += size
+                alignment = max(alignment, field_alignment)
+            return max(1, self._align_to(offset, alignment)), alignment
+        return 8, 8
 
     def _declare_error_payload(self) -> None:
         names = sorted(self.error_tags)
@@ -310,7 +375,7 @@ class LLVMLoweringPass:
         for declaration in program.declarations:
             if isinstance(declaration, HIRFunctionDeclaration):
                 declarations.append((declaration, None))
-            elif isinstance(declaration, HIRTypeDeclaration):
+            elif isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration)):
                 declarations.extend((method, declaration.name) for method in declaration.methods)
         for function, owner in declarations:
             return_type = self._function_return_type(function)
@@ -465,7 +530,40 @@ class LLVMLoweringPass:
                 self._emit_global_deinit_value(item, element_type)
             return
         declaration = self.types.get(type_ref.name)
-        if declaration is None or declaration.extern:
+        if declaration is None or getattr(declaration, 'extern', False):
+            return
+        if isinstance(declaration, HIREnumDeclaration):
+            tag_ptr = self._b.temp('global.enum.tag.ptr')
+            self._b.emit(
+                f'{tag_ptr} = getelementptr inbounds {self._type(type_ref)}, '
+                f'ptr {pointer}, i32 0, i32 0'
+            )
+            tag = self._b.temp('global.enum.tag')
+            self._b.emit(f'{tag} = load i32, ptr {tag_ptr}')
+            end = self._b.label('global.enum.drop.end')
+            labels = [self._b.label('global.enum.drop') for _ in declaration.variants]
+            cases = ' '.join(
+                f'i32 {variant.discriminant}, label %{labels[index]}'
+                for index, variant in enumerate(declaration.variants)
+            )
+            self._b.terminate(f'switch i32 {tag}, label %{end} [ {cases} ]')
+            for variant_index, variant in enumerate(declaration.variants):
+                self._b.start(labels[variant_index])
+                payload = self._b.temp('global.enum.payload')
+                self._b.emit(
+                    f'{payload} = getelementptr inbounds {self._type(type_ref)}, '
+                    f'ptr {pointer}, i32 0, i32 1'
+                )
+                variant_type = self._enum_variant_type(declaration.name, variant.name)
+                for field_index, field in reversed(list(enumerate(variant.fields))):
+                    field_pointer = self._b.temp('global.enum.field.ptr')
+                    self._b.emit(
+                        f'{field_pointer} = getelementptr inbounds {variant_type}, '
+                        f'ptr {payload}, i32 0, i32 {field_index}'
+                    )
+                    self._emit_global_deinit_value(field_pointer, field.type_ref)
+                self._b.branch(end)
+            self._b.start(end)
             return
         deinit = next(
             (method for method in declaration.methods if method.name == 'deinit'),
@@ -514,7 +612,7 @@ class LLVMLoweringPass:
             type_declaration = self.types.get(statement.symbol.type_ref.name)
             if not (
                 type_declaration is not None
-                and type_declaration.language_item == 'MaybeUninit'
+                and getattr(type_declaration, 'language_item', None) == 'MaybeUninit'
             ):
                 self._b.emit(f'store {type_name} zeroinitializer, ptr {slot}')
             if not statement.symbol.synthetic:
@@ -579,6 +677,9 @@ class LLVMLoweringPass:
         if isinstance(statement, HIRIf):
             self._if(statement, env)
             return
+        if isinstance(statement, HIRMatch):
+            self._match(statement, env, None)
+            return
         if isinstance(statement, HIRWhile):
             self._while(statement, env)
             return
@@ -613,6 +714,80 @@ class LLVMLoweringPass:
         if statement.else_body is not None:
             self._scoped_statements(statement.else_body, dict(env), statement.span)
         self._b.branch(merge)
+        self._b.start(merge)
+
+    def _match(self, statement: HIRMatch, env, result_slot: str | None) -> None:
+        scrutinee = self._expression(statement.scrutinee, env)
+        enum_type = self._type(self._element_type(statement.scrutinee.type_ref))
+        value_slot = self._b.alloca(enum_type, 'match.value')
+        if statement.ownership in {'in', 'out', 'inout'}:
+            source_ptr = scrutinee.operand
+        else:
+            self._b.emit(f'store {enum_type} {scrutinee.operand}, ptr {value_slot}')
+            source_ptr = value_slot
+        tag_ptr = self._b.temp('match.tag.ptr')
+        self._b.emit(
+            f'{tag_ptr} = getelementptr inbounds {enum_type}, ptr {source_ptr}, i32 0, i32 0'
+        )
+        tag = self._b.temp('match.tag')
+        self._b.emit(f'{tag} = load i32, ptr {tag_ptr}')
+        merge = self._b.label('match.end')
+        labels = [self._b.label('match.arm') for _ in statement.arms]
+        wildcard = next(
+            (labels[index] for index, arm in enumerate(statement.arms) if arm.discriminant is None),
+            merge,
+        )
+        cases = ' '.join(
+            f'i32 {arm.discriminant}, label %{labels[index]}'
+            for index, arm in enumerate(statement.arms)
+            if arm.discriminant is not None
+        )
+        self._b.terminate(f'switch i32 {tag}, label %{wildcard} [ {cases} ]')
+        declaration = self.types[self._element_type(statement.scrutinee.type_ref).name]
+        assert isinstance(declaration, HIREnumDeclaration)
+        payload_ptr = self._b.temp('match.payload.ptr')
+        for arm_index, arm in enumerate(statement.arms):
+            self._b.start(labels[arm_index])
+            arm_env = dict(env)
+            if arm.discriminant is not None:
+                variant = declaration.variants[arm.discriminant]
+                self._b.emit(
+                    f'{payload_ptr}.{arm_index} = getelementptr inbounds {enum_type}, ptr {source_ptr}, i32 0, i32 1'
+                )
+                for binding in arm.bindings:
+                    if binding.symbol is None:
+                        continue
+                    field = variant.fields[binding.field_index]
+                    field_ptr = self._b.temp('match.field.ptr')
+                    variant_type = self._enum_variant_type(declaration.name, variant.name)
+                    self._b.emit(
+                        f'{field_ptr} = getelementptr inbounds {variant_type}, '
+                        f'ptr {payload_ptr}.{arm_index}, i32 0, i32 {binding.field_index}'
+                    )
+                    slot = self._b.alloca(self._type(binding.symbol.type_ref), 'match.binding')
+                    if statement.ownership in {'in', 'out', 'inout'}:
+                        self._b.emit(f'store ptr {field_ptr}, ptr {slot}')
+                    else:
+                        loaded = self._b.temp('match.field')
+                        field_type = self._type(field.type_ref)
+                        self._b.emit(f'{loaded} = load {field_type}, ptr {field_ptr}')
+                        self._b.emit(f'store {field_type} {loaded}, ptr {slot}')
+                    arm_env[binding.symbol.name] = (slot, binding.symbol.type_ref)
+            if arm.expression is not None and result_slot is not None:
+                result = self._coerce(
+                    self._expression(arm.expression, arm_env), statement.type_ref
+                )
+                self._b.emit(
+                    f'store {self._type(statement.type_ref)} {result.operand}, ptr {result_slot}'
+                )
+                for binding in reversed(arm.bindings):
+                    if binding.symbol is None or not binding.symbol.synthetic:
+                        continue
+                    slot, binding_type = arm_env[binding.symbol.name]
+                    self._emit_global_deinit_value(slot, binding_type)
+            if arm.body is not None:
+                self._scoped_statements(arm.body, arm_env, arm.span or statement.span)
+            self._b.branch(merge)
         self._b.start(merge)
 
     def _while(self, statement: HIRWhile, env) -> None:
@@ -816,6 +991,15 @@ class LLVMLoweringPass:
             return self._call(expression, env)
         if isinstance(expression, HIRStructLiteralExpression):
             return self._struct_literal(expression, env)
+        if isinstance(expression, HIREnumConstructExpression):
+            return self._enum_construct(expression, env)
+        if isinstance(expression, HIRMatch):
+            result_type = self._type(expression.type_ref)
+            result_slot = self._b.alloca(result_type, 'match.result')
+            self._match(expression, env, result_slot)
+            result = self._b.temp('match.result')
+            self._b.emit(f'{result} = load {result_type}, ptr {result_slot}')
+            return LLVMValue(result_type, result, expression.type_ref)
         raise LLVMLoweringError(
             f'Unsupported HIR expression {type(expression).__name__}.', expression.span
         )
@@ -920,6 +1104,16 @@ class LLVMLoweringPass:
         left_name = expression.left.type_ref.name
         if left_name == 'str':
             return self._string_compare(left, right, operator, expression.type_ref)
+        enum_declaration = self.types.get(left_name)
+        if isinstance(enum_declaration, HIREnumDeclaration):
+            left_tag = self._b.temp('enum.tag')
+            right_tag = self._b.temp('enum.tag')
+            self._b.emit(f'{left_tag} = extractvalue {left.type_name} {left.operand}, 0')
+            self._b.emit(f'{right_tag} = extractvalue {right.type_name} {right.operand}, 0')
+            value = self._b.temp('enum.compare')
+            predicate = 'eq' if operator == '==' else 'ne'
+            self._b.emit(f'{value} = icmp {predicate} i32 {left_tag}, {right_tag}')
+            return LLVMValue(result_type, value, expression.type_ref)
         float_op = left_name in {'f32', 'f64'}
         if operator in {'+', '-', '*', '/', '%'}:
             ops = ({'+': 'fadd', '-': 'fsub', '*': 'fmul', '/': 'fdiv', '%': 'frem'} if float_op
@@ -1148,6 +1342,37 @@ class LLVMLoweringPass:
             self._b.emit(f'{next_value} = insertvalue {type_name} {current}, {value.type_name} {value.operand}, {index}')
             current = next_value
         return LLVMValue(type_name, current, expression.type_ref)
+
+    def _enum_construct(self, expression: HIREnumConstructExpression, env) -> LLVMValue:
+        declaration = self.types[expression.enum_name]
+        assert isinstance(declaration, HIREnumDeclaration)
+        variant = declaration.variants[expression.discriminant]
+        enum_type = self._type(expression.type_ref)
+        slot = self._b.alloca(enum_type, 'enum')
+        self._b.emit(f'store {enum_type} zeroinitializer, ptr {slot}')
+        tag_ptr = self._b.temp('enum.tag.ptr')
+        self._b.emit(
+            f'{tag_ptr} = getelementptr inbounds {enum_type}, ptr {slot}, i32 0, i32 0'
+        )
+        self._b.emit(f'store i32 {expression.discriminant}, ptr {tag_ptr}')
+        payload_ptr = self._b.temp('enum.payload.ptr')
+        self._b.emit(
+            f'{payload_ptr} = getelementptr inbounds {enum_type}, ptr {slot}, i32 0, i32 1'
+        )
+        variant_type = self._enum_variant_type(declaration.name, variant.name)
+        payload = 'zeroinitializer'
+        for index, (field, argument) in enumerate(zip(variant.fields, expression.arguments)):
+            value = self._coerce(self._expression(argument, env), field.type_ref)
+            updated = self._b.temp('enum.payload')
+            self._b.emit(
+                f'{updated} = insertvalue {variant_type} {payload}, '
+                f'{value.type_name} {value.operand}, {index}'
+            )
+            payload = updated
+        self._b.emit(f'store {variant_type} {payload}, ptr {payload_ptr}')
+        result = self._b.temp('enum')
+        self._b.emit(f'{result} = load {enum_type}, ptr {slot}')
+        return LLVMValue(enum_type, result, expression.type_ref)
 
     def _view_borrow(self, expression, env, view_name: str | None = None) -> LLVMValue:
         view_name = view_name or expression.type_ref.name
@@ -1414,7 +1639,7 @@ class LLVMLoweringPass:
     def _collect_error_tags(self, program: HIRProgram) -> None:
         functions = list(self.functions.values())
         for declaration in program.declarations:
-            if isinstance(declaration, HIRTypeDeclaration):
+            if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration)):
                 functions.extend(declaration.methods)
         names = sorted({error.name for function in functions for error in function.raises})
         self.error_tags = {name: index + 1 for index, name in enumerate(names)}
@@ -1424,7 +1649,7 @@ class LLVMLoweringPass:
         for declaration in program.declarations:
             if isinstance(declaration, HIRFunctionDeclaration):
                 self._add_inline_candidate(candidates, declaration, None)
-            elif isinstance(declaration, HIRTypeDeclaration):
+            elif isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration)):
                 for method in declaration.methods:
                     self._add_inline_candidate(candidates, method, declaration.name)
         self.inline_candidates = dict(sorted(candidates.items()))
@@ -1547,7 +1772,7 @@ class LLVMLoweringPass:
                 return 'float' if spec.bits == 32 else 'double'
             return f'i{spec.bits}'
         declaration = self.types.get(name)
-        if declaration is not None and declaration.language_item == 'MaybeUninit':
+        if declaration is not None and getattr(declaration, 'language_item', None) == 'MaybeUninit':
             if declaration.language_item_type is None:
                 raise LLVMLoweringError('MaybeUninit declaration has no element type.')
             return self._type(declaration.language_item_type)
@@ -1636,7 +1861,7 @@ class LLVMLoweringPass:
 
         declaration = self.types.get(type_ref.name)
         if declaration is not None:
-            if declaration.language_item == 'MaybeUninit':
+            if getattr(declaration, 'language_item', None) == 'MaybeUninit':
                 if declaration.language_item_type is None:
                     raise LLVMLoweringError('MaybeUninit declaration has no element type.')
                 element_key = self._debug_type(declaration.language_item_type)
@@ -1651,6 +1876,18 @@ class LLVMLoweringPass:
                     base_key=element.base_key,
                     count=element.count,
                     members=element.members,
+                )
+                return key
+            if isinstance(declaration, HIREnumDeclaration):
+                tag_key = self._debug_type(TypeReference('u32'))
+                size, alignment = self._abi_size_align(type_ref)
+                self.module.debug_types[key] = LLVMDebugType(
+                    key,
+                    declaration.source_name or declaration.name,
+                    'struct',
+                    size * 8,
+                    alignment * 8,
+                    members=(LLVMDebugMember('tag', tag_key, 0),),
                 )
                 return key
             fields = [

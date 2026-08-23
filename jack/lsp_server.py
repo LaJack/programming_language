@@ -11,6 +11,7 @@ from typing import BinaryIO, TextIO
 
 from .ast_nodes import (
     For,
+    EnumDeclaration,
     FunctionDeclaration,
     ImplementationDeclaration,
     InterfaceDeclaration,
@@ -224,6 +225,27 @@ def _collect_statement_entries(
         for method in statement.methods:
             entries.append(_function_entry(method, tokens, method_kind=True, owner_name=statement.name))
             _collect_function_scope(method, tokens, entries, owner_name=statement.name)
+        return
+
+    if isinstance(statement, EnumDeclaration):
+        entries.append(_entry(
+            statement.name, 10, statement, tokens,
+            f'union {statement.name}', 'type'
+        ))
+        for variant in statement.variants:
+            entries.append(_entry(
+                variant.name, 22, variant, tokens,
+                f'variant {statement.name}.{variant.name}', 'field'
+            ))
+        for method in statement.methods:
+            entries.append(
+                _function_entry(
+                    method, tokens, method_kind=True, owner_name=statement.name
+                )
+            )
+            _collect_function_scope(
+                method, tokens, entries, owner_name=statement.name
+            )
         return
 
     if isinstance(statement, InterfaceDeclaration):
@@ -495,6 +517,16 @@ def _statement_symbols(statement: Statement) -> list[JsonValue]:
         ]
         children.extend(_function_symbol(method, method_kind=True) for method in statement.methods)
         return [_document_symbol(statement.name, 23, statement, children=children)]
+    if isinstance(statement, EnumDeclaration):
+        children = [
+            _document_symbol(variant.name, 22, variant)
+            for variant in statement.variants
+        ]
+        children.extend(
+            _function_symbol(method, method_kind=True)
+            for method in statement.methods
+        )
+        return [_document_symbol(statement.name, 10, statement, children=children)]
     if isinstance(statement, ViewDeclaration):
         children = [
             _document_symbol(field.name, 8, field, f'{field.mode} {_type_label(field.type)}')

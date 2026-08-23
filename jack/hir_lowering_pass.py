@@ -15,6 +15,8 @@ try:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -24,6 +26,7 @@ try:
         ImportDeclaration,
         IndexExpression,
         LiteralExpression,
+        Match,
         ModuleDeclaration,
         MoveExpression,
         Print,
@@ -53,6 +56,9 @@ try:
         HIRCompositeExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
+        HIREnumConstructExpression,
+        HIREnumDeclaration,
+        HIREnumVariant,
         HIRExpression,
         HIRExpressionStatement,
         HIRFieldAccessExpression,
@@ -65,6 +71,9 @@ try:
         HIRImportDeclaration,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMatch,
+        HIRMatchArm,
+        HIRMatchBinding,
         HIRMaybeUninitBorrowExpression,
         HIRMaybeUninitTakeExpression,
         HIRMaybeUninitWriteExpression,
@@ -103,6 +112,8 @@ except ImportError:
         CatchClause,
         CompositeExpression,
         DereferenceExpression,
+        EnumDeclaration,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -112,6 +123,7 @@ except ImportError:
         ImportDeclaration,
         IndexExpression,
         LiteralExpression,
+        Match,
         ModuleDeclaration,
         MoveExpression,
         Print,
@@ -141,6 +153,9 @@ except ImportError:
         HIRCompositeExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
+        HIREnumConstructExpression,
+        HIREnumDeclaration,
+        HIREnumVariant,
         HIRExpression,
         HIRExpressionStatement,
         HIRFieldAccessExpression,
@@ -153,6 +168,9 @@ except ImportError:
         HIRImportDeclaration,
         HIRIndexExpression,
         HIRLiteralExpression,
+        HIRMatch,
+        HIRMatchArm,
+        HIRMatchBinding,
         HIRMaybeUninitBorrowExpression,
         HIRMaybeUninitTakeExpression,
         HIRMaybeUninitWriteExpression,
@@ -213,6 +231,7 @@ class HIRLoweringPass(SemanticPass):
         self.copy_helper_names: dict[str, str] = {}
         self.copy_helper_results: dict[str, str] = {}
         self.entry_function: FunctionDeclaration | None = None
+        self.match_temporary_counter = 0
 
     def lower(self, ast: list[Statement]) -> HIRProgram:
         self.validate(ast)
@@ -464,6 +483,7 @@ class HIRLoweringPass(SemanticPass):
             ModuleDeclaration,
             ImportDeclaration,
             TypeDeclaration,
+            EnumDeclaration,
             ViewDeclaration,
             FunctionDeclaration,
             VariableDeclaration,
@@ -481,6 +501,8 @@ class HIRLoweringPass(SemanticPass):
             )
         if type(statement) is TypeDeclaration:
             return self._type_declaration(statement)
+        if type(statement) is EnumDeclaration:
+            return self._enum_declaration(statement)
         if type(statement) is ViewDeclaration:
             return self._view_declaration(statement)
         if type(statement) is FunctionDeclaration:
@@ -516,6 +538,28 @@ class HIRLoweringPass(SemanticPass):
             language_item=declaration.language_item,
             language_item_type=self._copy_type(declaration.language_item_type)
             if declaration.language_item_type is not None else None,
+            span=declaration.span,
+        )
+
+    def _enum_declaration(self, declaration: EnumDeclaration) -> HIREnumDeclaration:
+        return HIREnumDeclaration(
+            name=declaration.name,
+            variants=[
+                HIREnumVariant(
+                    name=variant.name,
+                    discriminant=index,
+                    fields=[self._symbol(parameter) for parameter in variant.parameters],
+                    span=variant.span,
+                )
+                for index, variant in enumerate(declaration.variants)
+            ],
+            methods=[
+                self._method_declaration(declaration, method)
+                for method in declaration.methods
+            ],
+            public=declaration.public,
+            module_name=declaration.module_name,
+            source_name=declaration.source_name,
             span=declaration.span,
         )
 
@@ -712,6 +756,8 @@ class HIRLoweringPass(SemanticPass):
             )
         if type(statement) is If:
             return self._if_statement(statement, scope)
+        if type(statement) is Match:
+            return self._match(statement, scope)
         if type(statement) is While:
             return HIRWhile(
                 condition=self._expression(statement.condition, scope),
@@ -755,6 +801,7 @@ class HIRLoweringPass(SemanticPass):
                     public=declaration.public,
                     source_name=declaration.source_name or declaration.name,
                     can_return_borrow=False,
+                    owned_local=declaration.type.borrow is None,
                 ),
             )
         constructor_call = None
@@ -812,6 +859,73 @@ class HIRLoweringPass(SemanticPass):
                 if statement.else_body is None
                 else self._block(statement.else_body, SemanticScope(scope))
             ),
+            span=statement.span,
+        )
+
+    def _match(self, statement: Match, scope: SemanticScope) -> HIRMatch:
+        scrutinee = self._expression(statement.scrutinee, scope)
+        enum_name = self._type_name(self._element_type(scrutinee.type_ref))
+        declaration = self.types[enum_name]
+        ownership = (
+            statement.scrutinee.mode
+            if type(statement.scrutinee) is BorrowExpression
+            else 'move'
+        )
+        arms: list[HIRMatchArm] = []
+        variants = {variant.name: (index, variant) for index, variant in enumerate(declaration.variants)}
+        for arm in statement.arms:
+            arm_scope = SemanticScope(scope)
+            bindings: list[HIRMatchBinding] = []
+            discriminant = None
+            if arm.variant_name is not None:
+                discriminant, variant = variants[arm.variant_name]
+                for field_index, (binding, parameter) in enumerate(zip(arm.bindings, variant.parameters)):
+                    symbol = None
+                    binding_name = binding.name
+                    synthetic = False
+                    if binding_name is None and ownership == 'move':
+                        self.match_temporary_counter += 1
+                        binding_name = f'$jack$match$ignored${self.match_temporary_counter}'
+                        synthetic = True
+                    if binding_name is not None:
+                        binding_type = self._copy_type(parameter.type)
+                        if ownership in {'in', 'out', 'inout'}:
+                            binding_type.borrow = ownership
+                        symbol = HIRVariableSymbol(
+                            name=binding_name,
+                            type_ref=binding_type,
+                            synthetic=synthetic,
+                            passing_mode=parameter.passing_mode,
+                            span=binding.span,
+                        )
+                        arm_scope.declare(
+                            binding_name,
+                            SymbolInfo(
+                                'variable', binding_type,
+                                owned_local=ownership == 'move',
+                                passing_mode=parameter.passing_mode,
+                            ),
+                        )
+                    bindings.append(HIRMatchBinding(
+                        symbol=symbol,
+                        field_index=field_index,
+                        span=binding.span,
+                    ))
+            arms.append(HIRMatchArm(
+                variant_name=arm.variant_name,
+                discriminant=discriminant,
+                bindings=bindings,
+                body=None if arm.body is None else self._block(arm.body, arm_scope),
+                expression=None if arm.expr is None else self._expression(arm.expr, arm_scope),
+                span=arm.span,
+            ))
+        result_type = self._match_type(statement, scope, allow_return=True)
+        return HIRMatch(
+            scrutinee=scrutinee,
+            ownership=ownership,
+            arms=arms,
+            type_ref=self._copy_type(result_type),
+            read_type=self._read_type(result_type),
             span=statement.span,
         )
 
@@ -890,6 +1004,26 @@ class HIRLoweringPass(SemanticPass):
                 ),
             )
         if type(expression) is VariableExpression:
+            enum_type = self._fieldless_enum_value_type(expression)
+            if enum_type is not None:
+                enum_name, variant_name = expression.name.rsplit('.', 1)
+                declaration = self.types[enum_name]
+                discriminant = next(
+                    index for index, variant in enumerate(declaration.variants)
+                    if variant.name == variant_name
+                )
+                return self._record_expression(
+                    expression,
+                    HIREnumConstructExpression(
+                        enum_name=enum_name,
+                        variant_name=variant_name,
+                        discriminant=discriminant,
+                        arguments=[],
+                        type_ref=self._copy_type(enum_type),
+                        read_type=self._read_type(enum_type),
+                        span=expression.span,
+                    ),
+                )
             return self._name_expression(
                 expression.name,
                 scope,
@@ -897,6 +1031,9 @@ class HIRLoweringPass(SemanticPass):
                 source=expression,
             )
         if type(expression) is FunctionCall:
+            enum_construct = self._enum_constructor(expression, scope)
+            if enum_construct is not None:
+                return self._record_expression(expression, enum_construct)
             if expression.function_name == 'raw':
                 argument = expression.parameters[0]
                 assert type(argument) is BorrowExpression
@@ -956,7 +1093,7 @@ class HIRLoweringPass(SemanticPass):
                 declaration = self.types.get(
                     self._type_name(self._element_type(receiver.type_ref))
                 )
-                if declaration is not None and declaration.language_item == 'MaybeUninit':
+                if declaration is not None and getattr(declaration, 'language_item', None) == 'MaybeUninit':
                     assert declaration.language_item_type is not None
                     element = self._copy_type(declaration.language_item_type)
                     if method_name == 'write':
@@ -1017,6 +1154,19 @@ class HIRLoweringPass(SemanticPass):
                     span=expression.span,
                 ),
             )
+        if type(expression) is EnumVariantExpression:
+            return self._record_expression(
+                expression,
+                self._enum_variant_construct(
+                    expression.type_ref,
+                    expression.variant_name,
+                    expression.arguments or [],
+                    scope,
+                    expression.span,
+                ),
+            )
+        if type(expression) is Match:
+            return self._record_expression(expression, self._match(expression, scope))
         if type(expression) is CompositeExpression:
             left = self._expression(expression.left, scope)
             right = self._expression(expression.right, scope)
@@ -1099,6 +1249,58 @@ class HIRLoweringPass(SemanticPass):
         raise HIRLoweringError(
             f'Expression "{type(expression).__name__}" cannot be lowered to HIR.',
             getattr(expression, 'span', None),
+        )
+
+    def _enum_constructor(
+        self, call: FunctionCall, scope: SemanticScope
+    ) -> HIREnumConstructExpression | None:
+        if '.' not in call.function_name:
+            return None
+        enum_name, variant_name = call.function_name.rsplit('.', 1)
+        declaration = self.types.get(enum_name)
+        if type(declaration) is not EnumDeclaration:
+            return None
+        return self._enum_variant_construct(
+            TypeReference(enum_name), variant_name, call.parameters, scope, call.span
+        )
+
+    def _enum_variant_construct(
+        self,
+        type_ref: TypeReference,
+        variant_name: str,
+        arguments: list[Expression],
+        scope: SemanticScope,
+        span: SourceSpan | None,
+    ) -> HIREnumConstructExpression:
+        enum_name = self._type_name(type_ref)
+        declaration = self.types[enum_name]
+        discriminant, variant = next(
+            (index, candidate)
+            for index, candidate in enumerate(declaration.variants)
+            if candidate.name == variant_name
+        )
+        lowered: list[HIRExpression] = []
+        for argument, parameter in zip(arguments, variant.parameters):
+            value = self._expression(argument, scope)
+            if parameter.passing_mode == 'move':
+                value = HIRMoveExpression(
+                    expr=value,
+                    type_ref=self._copy_type(value.type_ref),
+                    read_type=self._copy_type(value.read_type or value.type_ref),
+                    span=argument.span,
+                )
+            else:
+                value = self._maybe_custom_copy(value, parameter.type, argument)
+            lowered.append(value)
+        result_type = self._copy_type(type_ref)
+        return HIREnumConstructExpression(
+            enum_name=enum_name,
+            variant_name=variant_name,
+            discriminant=discriminant,
+            arguments=lowered,
+            type_ref=result_type,
+            read_type=self._read_type(result_type),
+            span=span,
         )
 
     def _struct_literal_fields(

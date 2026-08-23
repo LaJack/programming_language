@@ -49,7 +49,7 @@ DumpResult dump_tokens(&in Vector(Token, SystemAllocator) tokens)
         &in Token token = tokens.get(index);
         write_token(token);
         if (result.invalid == false) {
-            if (token.kind_value() == token_invalid()) {
+            if (token.kind_value() == u8(6)) {
                 result.invalid = true;
                 result.line = token.line_number();
                 result.column = token.column_number();

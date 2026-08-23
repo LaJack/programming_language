@@ -82,6 +82,14 @@ SystemAllocator implements Allocator {
     Allocation allocate(&inout self, Layout minimum)
         raises CapacityError, AllocationError
     {
+        if (minimum.size() == usize(0)) {
+            return Allocation {
+                host_address = null,
+                granted_layout = minimum,
+                allocator_identity = self.identity,
+                live = true
+            };
+        }
         unsafe {
             ?*inout c_void storage = malloc(minimum.size());
             if (storage != null) {

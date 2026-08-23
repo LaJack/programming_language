@@ -423,6 +423,7 @@ class HIRStaticCleanupLoweringPass:
             body=[statement for statement in top_level if not isinstance(statement, HIRDeclaration)],
             top_level=top_level,
             entry_module=program.entry_module,
+            entry_function_name=program.entry_function_name,
             module_dependencies={
                 module: list(dependencies)
                 for module, dependencies in program.module_dependencies.items()

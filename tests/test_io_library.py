@@ -27,40 +27,23 @@ def io_program(path: Path) -> str:
     return f"""
         import std.io;
 
-        str path = {jack_string_literal(str(path))};
-        File file(path);
-
-        u8[4] buffer;
-        usize bytes_read = file.read(buffer[..]);
-        i32 close_status = file.close();
-
-        print(bytes_read);
-        print(buffer[0]);
-        print(buffer[1]);
-        print(buffer[2]);
-        print(buffer[3]);
-        print(close_status);
+        void run() raises IoError {{
+            File file = open_read({jack_string_literal(str(path))});
+            u8[4] buffer;
+            usize bytes_read = file.read(buffer[..]);
+            close(file);
+            print(bytes_read);
+            print(buffer[0]);
+            print(buffer[1]);
+            print(buffer[2]);
+            print(buffer[3]);
+        }}
+        try {{ run(); }} catch IoError {{ print("io error"); }}
     """
 
 
 def comptime_io_program(path: Path) -> str:
-    return f"""
-        import std.io;
-
-        comptime str path = {jack_string_literal(str(path))};
-        comptime File file(path);
-
-        comptime u8[4] buffer;
-        comptime usize bytes_read = file.read(buffer[..]);
-        comptime i32 close_status = file.close();
-
-        print(bytes_read);
-        print(buffer[0]);
-        print(buffer[1]);
-        print(buffer[2]);
-        print(buffer[3]);
-        print(close_status);
-    """
+    return io_program(path)
 
 
 class IoLibraryTests(unittest.TestCase):
@@ -82,8 +65,7 @@ class IoLibraryTests(unittest.TestCase):
             'buffer[0] = 74\n'
             'buffer[1] = 97\n'
             'buffer[2] = 99\n'
-            'buffer[3] = 107\n'
-            'close_status = 0\n',
+            'buffer[3] = 107\n',
             output.getvalue(),
         )
 
@@ -105,8 +87,7 @@ class IoLibraryTests(unittest.TestCase):
             'buffer[0] = 74\n'
             'buffer[1] = 97\n'
             'buffer[2] = 99\n'
-            'buffer[3] = 107\n'
-            'close_status = 0\n',
+            'buffer[3] = 107\n',
             output.getvalue(),
         )
 
@@ -128,8 +109,7 @@ class IoLibraryTests(unittest.TestCase):
             'buffer[0] = 74\n'
             'buffer[1] = 97\n'
             'buffer[2] = 99\n'
-            'buffer[3] = 107\n'
-            'close_status = 0\n',
+            'buffer[3] = 107\n',
             output.getvalue(),
         )
 
@@ -153,9 +133,10 @@ class IoLibraryTests(unittest.TestCase):
             source.write_text('''
                 import std.io;
 
-                str path = "";
-                File file(path);
-                print(file.handle);
+                void inspect() raises IoError {
+                    File file = open_read("");
+                    print(file.handle);
+                }
             ''')
 
             with self.assertRaisesRegex(SemanticError, 'Field "handle" is private'):
@@ -179,14 +160,14 @@ class IoLibraryTests(unittest.TestCase):
         self.assertNotIn('int32_t fclose(FILE *stream);', c_source)
         self.assertIn('typedef struct std_io_File {', c_source)
         self.assertIn('    FILE *handle;', c_source)
-        self.assertIn('void std_io_File_init(std_io_File *self, jack_str path);', c_source)
-        self.assertIn('size_t std_io_File_read(std_io_File *self, jack_slice_u8 dst);', c_source)
-        self.assertIn('int32_t std_io_File_close(std_io_File *self);', c_source)
-        self.assertIn('self->handle = jack_std_io_open_read(path);', c_source)
+        self.assertIn('std_io_File std_io_open_read(jack_str path);', c_source)
+        self.assertIn('size_t std_io_File_read(std_io_File *self, jack_slice_u8 destination);', c_source)
+        self.assertIn('void std_io_close(std_io_File file);', c_source)
+        self.assertIn('jack_io_open(path, mode)', c_source)
         self.assertNotIn('char *path_buffer = (char *)malloc(path_len + 1);', c_source)
         self.assertNotIn('FILE *file = fopen(path_buffer, "rb");', c_source)
-        self.assertIn('return fread(&(dst).data[0], 1, ((size_t)((dst).len)), self->handle);', c_source)
-        self.assertIn('std_io_File_init(&file, path);', c_source)
+        self.assertIn('jack_io_read(self->handle, data, ((size_t)((destination).len)), &count)', c_source)
+        self.assertIn('file = std_io_open_read(', c_source)
         self.assertIn('bytes_read = std_io_File_read(&file, (jack_slice_u8){ buffer, 4 });', c_source)
 
 

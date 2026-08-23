@@ -1,15 +1,20 @@
 import std.io;
 
-comptime str path = "examples/io.txt";
-comptime File file(path);
+void run() raises IoError {
+    File file = open_read("examples/io.txt");
+    u8[8] buffer;
+    usize bytes_read = file.read(buffer[..]);
+    close(file);
 
-comptime u8[8] buffer;
-comptime usize bytes_read = file.read(buffer[..]);
-comptime i32 close_status = file.close();
+    print(bytes_read);
+    print(buffer[0]);
+    print(buffer[1]);
+    print(buffer[2]);
+    print(buffer[3]);
+}
 
-print(bytes_read);
-print(buffer[0]);
-print(buffer[1]);
-print(buffer[2]);
-print(buffer[3]);
-print(close_status);
+try {
+    run();
+} catch IoError {
+    print("io error");
+}

@@ -251,7 +251,7 @@ class LLVMLoweringPass:
         return self.module
 
     def _declare_runtime(self) -> None:
-        self.module.type_definitions.append('%jack.str = type { ptr, i32 }')
+        self.module.type_definitions.append('%jack.str = type { ptr, i64 }')
         self.module.declarations.extend([
             'declare i32 @printf(ptr, ...)',
             'declare void @abort() noreturn',
@@ -259,6 +259,9 @@ class LLVMLoweringPass:
             'declare i16 @llvm.bswap.i16(i16)',
             'declare i32 @llvm.bswap.i32(i32)',
             'declare i64 @llvm.bswap.i64(i64)',
+            'declare i32 @jack_process_init_args(i32, ptr)',
+            'declare { ptr, i32 } @jack_process_arguments()',
+            'declare void @jack_process_dispose_args()',
         ])
 
     def _declare_types(self) -> None:
@@ -384,6 +387,18 @@ class LLVMLoweringPass:
         )
         builder.current_span = main_span
         self.builder = builder
+        typed = program.entry_function_name is not None
+        if typed:
+            argument_status = builder.temp('arg.status')
+            builder.emit(f'{argument_status} = call i32 @jack_process_init_args(i32 %argc, ptr %argv)')
+            arguments_valid = builder.temp('args.valid')
+            builder.emit(f'{arguments_valid} = icmp eq i32 {argument_status}, 0')
+            start_label = builder.label('args.ready')
+            invalid_label = builder.label('args.invalid')
+            builder.terminate(f'br i1 {arguments_valid}, label %{start_label}, label %{invalid_label}')
+            builder.start(invalid_label)
+            builder.terminate(f'ret i32 {argument_status}')
+            builder.start(start_label)
         for statement in program.top_level:
             previous_span = builder.current_span
             builder.current_span = statement.span or previous_span
@@ -398,6 +413,14 @@ class LLVMLoweringPass:
             elif not isinstance(statement, HIRDeclaration):
                 self._statement(statement, builder.env)
             builder.current_span = previous_span
+        entry_status = None
+        if typed and not builder.terminated:
+            arguments = builder.temp('arguments')
+            builder.emit(f'{arguments} = call {{ ptr, i32 }} @jack_process_arguments()')
+            entry_status = builder.temp('entry.status')
+            builder.emit(
+                f'{entry_status} = call i32 @{quoted(program.entry_function_name)}({{ ptr, i32 }} {arguments})'
+            )
         if not builder.terminated:
             for declaration in reversed(program.declarations):
                 if not isinstance(declaration, HIRGlobalVariable) or declaration.symbol.extern:
@@ -408,9 +431,13 @@ class LLVMLoweringPass:
                     declaration.symbol.type_ref,
                 )
         if not builder.terminated:
-            builder.terminate('ret i32 0')
+            if typed:
+                builder.emit('call void @jack_process_dispose_args()')
+                builder.terminate(f'ret i32 {entry_status}')
+            else:
+                builder.terminate('ret i32 0')
         function = LLVMFunction(
-            'main', 'i32', (),
+            'main', 'i32', (('i32', 'argc'), ('ptr', 'argv')) if typed else (),
             tuple((label, tuple(lines)) for label, lines in builder.blocks),
             span=main_span,
             debug_name='main',
@@ -875,7 +902,7 @@ class LLVMLoweringPass:
             name = self._string(data)
             operand = (
                 f'{{ ptr getelementptr inbounds ([{len(data) + 1} x i8], ptr {name}, i32 0, i32 0), '
-                f'i32 {len(data)} }}'
+                f'i64 {len(data)} }}'
             )
         elif expression.literal_type == 'bool':
             operand = 'true' if expression.value else 'false'
@@ -1223,7 +1250,7 @@ class LLVMLoweringPass:
         value = self._expression(inner, env)
         length = self._b.temp('len')
         self._b.emit(f'{length} = extractvalue {value.type_name} {value.operand}, 1')
-        return LLVMValue('i32', length, call.type_ref)
+        return LLVMValue(self._type(call.type_ref), length, call.type_ref)
 
     def _print(self, statement: HIRPrint, env) -> None:
         if isinstance(statement.expr, HIRFormattedStringExpression):
@@ -1255,7 +1282,9 @@ class LLVMLoweringPass:
             length = self._b.temp('str.len')
             self._b.emit(f'{data} = extractvalue %jack.str {value.operand}, 0')
             self._b.emit(f'{length} = extractvalue %jack.str {value.operand}, 1')
-            return '%.*s', [LLVMValue('i32', length, TypeReference('i32')), LLVMValue('ptr', data, TypeReference('str'))]
+            precision = self._b.temp('str.precision')
+            self._b.emit(f'{precision} = trunc i64 {length} to i32')
+            return '%.*s', [LLVMValue('i32', precision, TypeReference('i32')), LLVMValue('ptr', data, TypeReference('str'))]
         spec = BUILTIN_TYPE_SPECS[name]
         if name == 'bool':
             true_ptr = self._cstring_pointer('true')
@@ -1285,11 +1314,9 @@ class LLVMLoweringPass:
         left_data, left_len = self._str_parts(left)
         right_data, right_len = self._str_parts(right)
         lengths = self._b.temp('str.lengths')
-        self._b.emit(f'{lengths} = icmp eq i32 {left_len}, {right_len}')
-        length64 = self._b.temp('str.length')
-        self._b.emit(f'{length64} = zext i32 {left_len} to i64')
+        self._b.emit(f'{lengths} = icmp eq i64 {left_len}, {right_len}')
         compared = self._b.temp('str.compare')
-        self._b.emit(f'{compared} = call i32 @memcmp(ptr {left_data}, ptr {right_data}, i64 {length64})')
+        self._b.emit(f'{compared} = call i32 @memcmp(ptr {left_data}, ptr {right_data}, i64 {left_len})')
         equal_data = self._b.temp('str.equal')
         self._b.emit(f'{equal_data} = icmp eq i32 {compared}, 0')
         equal = self._b.temp('str.equal')
@@ -1542,7 +1569,7 @@ class LLVMLoweringPass:
             element = self._element_type(type_ref)
             element_key = self._debug_type(element)
             pointer_key = self._debug_pointer_type(element_key)
-            length_key = self._debug_type(TypeReference('i32'))
+            length_key = self._debug_type(TypeReference('usize'))
             members = (
                 LLVMDebugMember('data', pointer_key, 0),
                 LLVMDebugMember('length', length_key, 64),

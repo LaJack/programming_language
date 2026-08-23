@@ -12,7 +12,7 @@
 
 typedef struct jack_str {
     const char *data;
-    int32_t len;
+    size_t len;
 } jack_str;
 
 #define JACK_ERROR_OK 0
@@ -105,6 +105,14 @@ static inline bool jack_str_equal(jack_str left, jack_str right) {
     return left.len == right.len
         && memcmp(left.data, right.data, (size_t)left.len) == 0;
 }
+
+jack_str jack_string_view(const uint8_t *data, size_t length);
+jack_in_slice_u8 jack_bytes_view(const uint8_t *data, size_t length);
+jack_slice_u8 jack_bytes_view_mut(uint8_t *data, size_t length);
+uint8_t jack_str_byte(jack_str value, size_t index);
+int32_t jack_process_init_args(int argc, char **argv);
+jack_in_slice_str jack_process_arguments(void);
+void jack_process_dispose_args(void);
 
 #define JACK_BSWAP16(value) (\
     ((((uint16_t)(value)) & UINT16_C(0x00ff)) << 8) | \

@@ -27,6 +27,7 @@ try:
         FunctionDeclaration,
         If,
         IfBranch,
+        ImportBinding,
         ImplementationDeclaration,
         InterfaceDeclaration,
         IndexExpression,
@@ -79,6 +80,7 @@ except ImportError:
         FunctionDeclaration,
         If,
         IfBranch,
+        ImportBinding,
         ImplementationDeclaration,
         InterfaceDeclaration,
         IndexExpression,
@@ -1606,7 +1608,7 @@ class CompileTimePass:
                 public=declaration.public,
                 module_name=declaration.module_name,
                 source_name=declaration.source_name,
-                imports=list(declaration.imports),
+                imports=self._specialization_imports(declaration, fields, methods),
                 qualified_imports=list(declaration.qualified_imports),
                 span=declaration.span,
             )
@@ -1614,6 +1616,39 @@ class CompileTimePass:
             self.types[variant_name] = generated_type
 
         return TypeReference(variant_name, span=type_ref.span)
+
+    def _specialization_imports(
+        self,
+        declaration: TypeDeclaration,
+        fields: list[VariableDeclaration],
+        methods: list[FunctionDeclaration],
+    ) -> list[ImportBinding]:
+        imports = copy.deepcopy(declaration.imports)
+        existing = {(binding.module_name, binding.symbols and tuple(binding.symbols)) for binding in imports}
+
+        def add(type_ref: TypeReference | None) -> None:
+            if type_ref is None:
+                return
+            candidate = self.types.get(type_ref.name)
+            if candidate is not None and candidate.module_name not in {None, declaration.module_name}:
+                symbol = candidate.source_name or candidate.name
+                key = (candidate.module_name, (symbol,))
+                if key not in existing:
+                    imports.append(ImportBinding(candidate.module_name, symbols=[symbol]))
+                    existing.add(key)
+            for argument in type_ref.arguments:
+                add(argument)
+
+        for field in fields:
+            add(field.type)
+        for method in methods:
+            add(method.return_type)
+            add(method.self_parameter.type if method.self_parameter is not None else None)
+            for parameter in method.parameters:
+                add(parameter.type)
+            for error_type in method.raises:
+                add(error_type)
+        return imports
 
     def _validate_constraints(
         self,
@@ -1806,8 +1841,10 @@ class CompileTimePass:
             return LiteralExpression(len(value.value.elements), 'i32')
         if type(value.value) is ComptimeBorrowValue:
             return LiteralExpression(value.value.window_length(), 'i32')
+        if type(value.value) is str:
+            return LiteralExpression(len(value.value.encode('utf-8')), 'usize')
         raise CompileTimeError(
-            f'len expects a comptime array or slice, got "{value.type}".'
+            f'len expects a comptime array, slice, or str, got "{value.type}".'
         )
 
     def _eval_comptime_extern_function_call(

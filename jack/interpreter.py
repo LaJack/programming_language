@@ -612,7 +612,9 @@ class Interpreter:
     def eval_runtime_ast(self, ast: List[Statement]) -> None:
         self.eval_hir_program(lower_to_hir(ast))
 
-    def eval_hir_program(self, program: HIRProgram) -> None:
+    def eval_hir_program(
+        self, program: HIRProgram, arguments: tuple[str, ...] | list[str] = ()
+    ) -> int:
         self._prepare_hir(program)
         self.view_declarations = {
             declaration.name: declaration
@@ -624,6 +626,7 @@ class Interpreter:
             if isinstance(declaration, HIRTypeDeclaration):
                 self._execute_hir_type_declaration(declaration, self.global_scope)
 
+        status = 0
         try:
             try:
                 for statement in program.top_level:
@@ -639,10 +642,35 @@ class Interpreter:
                             self.global_scope,
                             allow_return=False,
                         )
+                if program.entry_function_name is not None:
+                    declaration = self.hir_functions_by_name[program.entry_function_name]
+                    values = JackArray(TypeReference('str'), list(arguments))
+                    status = self._eval_hir_entry_function(
+                        declaration,
+                        JackSlice(values, 0, len(values.values), mode='in'),
+                    )
             finally:
                 self._execute_deinit_scope(self.global_scope)
         except JackRaisedError as err:
             raise EvaluationError(f'Unhandled error "{err.value}".') from err
+        return int(status)
+
+    def _eval_hir_entry_function(
+        self, declaration: HIRFunctionDeclaration, arguments: JackSlice
+    ) -> object:
+        function_scope = SymbolTable(self.global_scope)
+        function_scope.declare(declaration.parameters[0].name, arguments)
+        try:
+            returned = self._execute_hir_statements(
+                declaration.body, function_scope, allow_return=True
+            )
+            if returned is None:
+                raise EvaluationError('Typed main returned without an i32 status.')
+            return self._coerce_value(
+                returned.value, declaration.return_type, self.global_scope
+            )
+        finally:
+            self._execute_deinit_scope(function_scope)
 
     def _execute_hir_type_declaration(
         self, type_decl: HIRTypeDeclaration, scope: SymbolTable
@@ -1057,9 +1085,15 @@ class Interpreter:
             length = value.length
         elif isinstance(value, JackArray):
             length = len(value.values)
+        elif type(value) is str:
+            length = len(value.encode('utf-8'))
         else:
-            raise EvaluationError(f'len expects an array or slice, got "{type(value).__name__}".')
-        return self.global_scope.get('i32')(length)
+            raise EvaluationError(
+                f'len expects an array, slice, or str, got '
+                f'"{type(value).__name__}".'
+            )
+        result_type = hir_call.target.return_type.name
+        return self.global_scope.get(result_type)(length)
 
     def _eval_hir_builtin_conversion(
         self, target_type: BuiltinType, hir_call: HIRCallExpression, scope: SymbolTable

@@ -33,7 +33,22 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
                 }
                 next_capacity = self.capacity * usize(2);
             }
-            Layout requested = layout_array(T, next_capacity);
+            self.reserve(next_capacity);
+        }
+        unsafe {
+            *inout b8 address = self.allocator.address_mut(self.allocation);
+            *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+            &inout MaybeUninit(T) slot = &inout *slots.offset(self.length);
+            slot.write(value);
+        }
+        self.length = self.length + usize(1);
+    }
+
+    void reserve(&inout self, usize minimum_capacity)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        if (minimum_capacity > self.capacity) {
+            Layout requested = layout_array(T, minimum_capacity);
             Allocation replacement = self.allocator.allocate(requested);
             unsafe {
                 *inout b8 old_address = self.allocator.address_mut(self.allocation);
@@ -55,13 +70,18 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
             Layout granted = self.allocation.layout();
             self.capacity = granted.size() / sizeof(T);
         }
-        unsafe {
-            *inout b8 address = self.allocator.address_mut(self.allocation);
-            *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
-            &inout MaybeUninit(T) slot = &inout *slots.offset(self.length);
-            slot.write(value);
-        }
-        self.length = self.length + usize(1);
+    }
+
+    unsafe *in T data(&in self) {
+        *in b8 address = self.allocator.address(self.allocation);
+        *in MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+        return slots.cast(T);
+    }
+
+    unsafe *inout T data_mut(&inout self) {
+        *inout b8 address = self.allocator.address_mut(self.allocation);
+        *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+        return slots.cast(T);
     }
 
     &in T get(&in self, usize index) raises BoundsError {

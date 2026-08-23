@@ -93,7 +93,7 @@ u8[16] buffer;
 Constructed variables use direct construction syntax:
 
 ```jack
-File file("examples/io.txt");
+Widget widget(value);
 ```
 
 This declares and initializes `file`; it does not create a temporary object and
@@ -510,9 +510,14 @@ Formatted strings use `f"..."` with `{expression}` placeholders:
 print(f"read {count} byte(s)");
 ```
 
-The current `str` implementation is intentionally small. C ABI functions should
-not assume that `str` is a C `char *`; use Jack wrappers such as `std.io` or
-explicit byte buffers where needed.
+`str` is a non-owning immutable UTF-8 view and its length is measured in bytes
+as `usize`. `std.string` provides allocator-aware `ByteBuffer`, `StringBuilder`,
+and non-copyable owned `String` types. C ABI functions must not assume that
+`str` is a NUL-terminated `char *`.
+
+Executable entry modules may declare `i32 main(&in str[] arguments)`. Such a
+module cannot also contain runtime top-level statements, and `main` cannot be
+extern, comptime, or raising. Legacy top-level programs remain supported.
 
 ## Externs
 

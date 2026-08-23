@@ -23,6 +23,7 @@ class HIRProgram(HIRNode):
     body: list[HIRStatement] = field(default_factory=list)
     top_level: list[HIRStatement] = field(default_factory=list)
     entry_module: str | None = None
+    entry_function_name: str | None = None
     module_dependencies: dict[str | None, list[str]] = field(default_factory=dict)
 
 

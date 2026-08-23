@@ -912,6 +912,13 @@ class _GraphIndexBuilder:
             return
         if expected.name in self.type_parameters or actual.name in self.type_parameters:
             return
+        if (
+            expected.pointer_mode is not None
+            and expected.nullable
+            and isinstance(expression, LiteralExpression)
+            and expression.value is None
+        ):
+            return
         if expected.name == actual.name and (
             expected.borrow is None or expected.borrow == actual.borrow
         ):

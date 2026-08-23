@@ -1817,8 +1817,13 @@ class SemanticPass:
         if len(call.parameters) != 1:
             raise SemanticError(f'len expects 1 argument, got {len(call.parameters)}.')
         value_type = self._expression_type(call.parameters[0], scope, check_reads=False)
+        if self._is_str_type(value_type) and not self._is_slice_type(value_type):
+            return TypeReference('usize')
         if not (self._is_array_type(value_type) or self._is_slice_type(value_type)):
-            raise SemanticError(f'len expects an array or slice, got "{self._type_name(value_type)}".')
+            raise SemanticError(
+                f'len expects an array, slice, or str, got '
+                f'"{self._type_name(value_type)}".'
+            )
         return TypeReference('i32')
 
     def _validate_builtin_conversion(self, call: FunctionCall, scope: SemanticScope) -> TypeReference:
@@ -1992,6 +1997,14 @@ class SemanticPass:
     def _validate_borrow_return(
         self, expression: Expression, return_type: TypeReference, scope: SemanticScope
     ) -> None:
+        if (
+            type(expression) is FunctionCall
+            and expression.function_name.endswith(
+                ('jack_bytes_view', 'jack_bytes_view_mut')
+            )
+            and self.unsafe_depth > 0
+        ):
+            return
         if type(expression) is FunctionCall and '.' in expression.function_name:
             receiver_name, method_name = expression.function_name.rsplit('.', 1)
             receiver_type = self._resolve_name_type(receiver_name, scope)

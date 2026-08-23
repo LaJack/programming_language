@@ -1,0 +1,427 @@
+module std.string;
+
+import std.collections.vector;
+import std.memory;
+
+pub struct Utf8Error {
+    usize offset;
+    usize position(&in self) { return self.offset; }
+}
+pub struct ParseIntError {
+    usize offset;
+    usize position(&in self) { return self.offset; }
+}
+pub struct SearchResult {
+    bool found;
+    usize index;
+    bool is_found(&in self) { return self.found; }
+    usize position(&in self) { return self.index; }
+}
+
+unsafe extern "c" str jack_string_view(*in u8 data, usize length);
+unsafe extern "c" &in u8[] jack_bytes_view(*in u8 data, usize length);
+unsafe extern "c" &inout u8[] jack_bytes_view_mut(*inout u8 data, usize length);
+extern "c" u8 jack_str_byte(str value, usize index);
+
+pub struct ByteBuffer(comptime type A: Allocator) {
+    Vector(u8, A) values;
+
+    init(&inout self, move A allocator)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        Vector(u8, A) values(allocator, usize(0));
+        self.values = move values;
+    }
+
+    usize len(&in self) { return self.values.len(); }
+    usize capacity(&in self) { return self.values.capacity(); }
+    bool is_empty(&in self) { return self.values.is_empty(); }
+
+    void reserve(&inout self, usize minimum)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.values.reserve(minimum);
+    }
+
+    void push(&inout self, u8 value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.values.push(value);
+    }
+
+    void append(&inout self, &in u8[] source)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        usize index = usize(0);
+        while (index < usize(len(source))) {
+            u8 value = source[index];
+            self.values.push(value);
+            index = index + usize(1);
+        }
+    }
+
+    void append_str(&inout self, str source)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        usize index = usize(0);
+        while (index < len(source)) {
+            self.values.push(jack_str_byte(source, index));
+            index = index + usize(1);
+        }
+    }
+
+    u8 get_unchecked(&in self, usize index) {
+        unsafe {
+            *in u8 data = self.values.data();
+            return *data.offset(index);
+        }
+    }
+
+    void clear(&inout self) { self.values.clear(); }
+
+    &in u8[] bytes(&in self) {
+        unsafe {
+            *in u8 data = self.values.data();
+            return jack_bytes_view(data, self.values.len());
+        }
+    }
+
+    &inout u8[] bytes_mut(&inout self) {
+        unsafe {
+            *inout u8 data = self.values.data_mut();
+            return jack_bytes_view_mut(data, self.values.len());
+        }
+    }
+}
+
+pub struct StringBuilder(comptime type A: Allocator) {
+    ByteBuffer(A) buffer;
+
+    init(&inout self, move A allocator)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        ByteBuffer(A) buffer(allocator);
+        self.buffer = move buffer;
+    }
+
+    usize len(&in self) { return self.buffer.len(); }
+
+    void append(&inout self, str value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.buffer.append_str(value);
+    }
+
+    void append_bytes(&inout self, &in u8[] value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.buffer.append(value);
+    }
+
+    void append_u64(&inout self, u64 value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        append_unsigned(A, self.buffer, value);
+    }
+
+    void append_i64(&inout self, i64 value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        append_signed(A, self.buffer, value);
+    }
+
+    void append_usize(&inout self, usize value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        append_unsigned(A, self.buffer, u64(value));
+    }
+}
+
+pub struct String(comptime type A: Allocator) {
+    ByteBuffer(A) buffer;
+
+    init(&inout self, move A allocator, str initial)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        ByteBuffer(A) buffer(allocator);
+        buffer.append_str(initial);
+        self.buffer = move buffer;
+    }
+
+    usize len(&in self) { return self.buffer.len(); }
+    usize capacity(&in self) { return self.buffer.capacity(); }
+    bool is_empty(&in self) { return self.buffer.is_empty(); }
+    void clear(&inout self) { self.buffer.clear(); }
+
+    str as_str(&in self) {
+        unsafe {
+            *in u8 data = self.buffer.values.data();
+            return jack_string_view(data, self.buffer.len());
+        }
+    }
+
+    &in u8[] bytes(&in self) {
+        unsafe {
+            *in u8 data = self.buffer.values.data();
+            return jack_bytes_view(data, self.buffer.len());
+        }
+    }
+
+    void reserve(&inout self, usize minimum)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.buffer.reserve(minimum);
+    }
+
+    void append(&inout self, str value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.buffer.append_str(value);
+    }
+
+    void append_u64(&inout self, u64 value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        append_unsigned(A, self.buffer, value);
+    }
+
+    void append_i64(&inout self, i64 value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        append_signed(A, self.buffer, value);
+    }
+
+    void append_usize(&inout self, usize value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        append_unsigned(A, self.buffer, u64(value));
+    }
+
+    bool equals(&in self, str other) { return self.as_str() == other; }
+
+    bool starts_with(&in self, str prefix) {
+        if (len(prefix) > self.len()) { return false; }
+        usize index = usize(0);
+        while (index < len(prefix)) {
+            if (self.buffer.get_unchecked(index) != jack_str_byte(prefix, index)) {
+                return false;
+            }
+            index = index + usize(1);
+        }
+        return true;
+    }
+
+    bool ends_with(&in self, str suffix) {
+        if (len(suffix) > self.len()) { return false; }
+        usize start = self.len() - len(suffix);
+        usize index = usize(0);
+        while (index < len(suffix)) {
+            if (self.buffer.get_unchecked(start + index) != jack_str_byte(suffix, index)) {
+                return false;
+            }
+            index = index + usize(1);
+        }
+        return true;
+    }
+
+    SearchResult find(&in self, str needle) {
+        if (len(needle) == usize(0)) {
+            return SearchResult { found = true, index = usize(0) };
+        }
+        if (len(needle) > self.len()) {
+            return SearchResult { found = false, index = usize(0) };
+        }
+        usize start = usize(0);
+        while (start + len(needle) <= self.len()) {
+            usize offset = usize(0);
+            bool equal = true;
+            while (offset < len(needle)) {
+                if (self.buffer.get_unchecked(start + offset) != jack_str_byte(needle, offset)) {
+                    equal = false;
+                    offset = len(needle);
+                } else {
+                    offset = offset + usize(1);
+                }
+            }
+            if (equal) { return SearchResult { found = true, index = start }; }
+            start = start + usize(1);
+        }
+        return SearchResult { found = false, index = usize(0) };
+    }
+}
+
+void append_unsigned(
+    comptime type A: Allocator,
+    &inout ByteBuffer(A) destination,
+    u64 value
+) raises CapacityError, LayoutError, AllocationError {
+    u8[20] digits;
+    usize count = usize(0);
+    if (value == u64(0)) {
+        destination.push(u8(48));
+        return;
+    }
+    while (value > u64(0)) {
+        digits[count] = u8(value % u64(10)) + u8(48);
+        count = count + usize(1);
+        value = value / u64(10);
+    }
+    while (count > usize(0)) {
+        count = count - usize(1);
+        destination.push(digits[count]);
+    }
+}
+
+void append_signed(
+    comptime type A: Allocator,
+    &inout ByteBuffer(A) destination,
+    i64 value
+) raises CapacityError, LayoutError, AllocationError {
+    if (value < i64(0)) {
+        destination.push(u8(45));
+        u64 magnitude = u64(i64(0) - (value + i64(1))) + u64(1);
+        append_unsigned(A, destination, magnitude);
+    } else {
+        append_unsigned(A, destination, u64(value));
+    }
+}
+
+pub u64 parse_u64(str value) raises ParseIntError {
+    if (len(value) == usize(0)) { raise ParseIntError { offset = usize(0) }; }
+    u64 result = u64(0);
+    usize index = usize(0);
+    while (index < len(value)) {
+        u8 byte = jack_str_byte(value, index);
+        if (is_ascii_digit(byte) == false) {
+            raise ParseIntError { offset = index };
+        }
+        u64 digit = u64(byte - u8(48));
+        u64 next = result * u64(10) + digit;
+        if (next < digit) { raise ParseIntError { offset = index }; }
+        if ((next - digit) / u64(10) != result) {
+            raise ParseIntError { offset = index };
+        }
+        result = next;
+        index = index + usize(1);
+    }
+    return result;
+}
+
+pub usize parse_usize(str value) raises ParseIntError {
+    u64 parsed = parse_u64(value);
+    usize narrowed = usize(parsed);
+    if (u64(narrowed) != parsed) {
+        raise ParseIntError { offset = len(value) - usize(1) };
+    }
+    return narrowed;
+}
+
+pub i64 parse_i64(str value) raises ParseIntError {
+    if (len(value) == usize(0)) { raise ParseIntError { offset = usize(0) }; }
+    bool negative = jack_str_byte(value, usize(0)) == u8(45);
+    usize index = usize(0);
+    if (negative) { index = usize(1); }
+    if (index == len(value)) { raise ParseIntError { offset = index }; }
+    u64 result = u64(0);
+    u64 limit = u64(1);
+    usize bit = usize(0);
+    while (bit < usize(63)) {
+        limit = limit * u64(2);
+        bit = bit + usize(1);
+    }
+    if (negative == false) { limit = limit - u64(1); }
+    while (index < len(value)) {
+        u8 byte = jack_str_byte(value, index);
+        if (is_ascii_digit(byte) == false) {
+            raise ParseIntError { offset = index };
+        }
+        u64 digit = u64(byte - u8(48));
+        if (result > (limit - digit) / u64(10)) {
+            raise ParseIntError { offset = index };
+        }
+        result = result * u64(10) + digit;
+        index = index + usize(1);
+    }
+    if (negative) {
+        return i64(0) - (i64(result - u64(1)) + i64(1));
+    }
+    return i64(result);
+}
+
+usize utf8_error_offset(
+    comptime type A: Allocator,
+    &in ByteBuffer(A) bytes
+) {
+    usize index = usize(0);
+    while (index < bytes.len()) {
+        u8 first = bytes.get_unchecked(index);
+        usize width = usize(0);
+        if (first <= u8(127)) {
+            width = usize(1);
+        } elif (first >= u8(194)) {
+            if (first <= u8(223)) { width = usize(2); }
+        }
+        if (first >= u8(224)) {
+            if (first <= u8(239)) { width = usize(3); }
+        }
+        if (first >= u8(240)) {
+            if (first <= u8(244)) { width = usize(4); }
+        }
+        if (width == usize(0)) { return index + usize(0); }
+        if (index + width > bytes.len()) { return index + usize(0); }
+        usize continuation = usize(1);
+        while (continuation < width) {
+            u8 value = bytes.get_unchecked(index + continuation);
+            if (value < u8(128)) { return index + continuation + usize(0); }
+            if (value > u8(191)) { return index + continuation + usize(0); }
+            continuation = continuation + usize(1);
+        }
+        if (width == usize(3)) {
+            u8 second = bytes.get_unchecked(index + usize(1));
+            if (first == u8(224)) {
+                if (second < u8(160)) { return index + usize(0); }
+            }
+            if (first == u8(237)) {
+                if (second > u8(159)) { return index + usize(0); }
+            }
+        }
+        if (width == usize(4)) {
+            u8 second = bytes.get_unchecked(index + usize(1));
+            if (first == u8(240)) {
+                if (second < u8(144)) { return index + usize(0); }
+            }
+            if (first == u8(244)) {
+                if (second > u8(143)) { return index + usize(0); }
+            }
+        }
+        index = index + width;
+    }
+    return bytes.len();
+}
+
+pub String(A) finish_string(
+    comptime type A: Allocator,
+    move StringBuilder(A) builder
+)
+    raises Utf8Error
+{
+    usize invalid = utf8_error_offset(A, builder.buffer);
+    if (invalid != builder.buffer.len()) {
+        raise Utf8Error { offset = invalid };
+    }
+    ByteBuffer(A) buffer = move builder.buffer;
+    return String(A) { buffer = move buffer };
+}
+
+pub bool is_ascii_alpha(u8 value) {
+    if (value >= u8(65)) {
+        if (value <= u8(90)) { return true; }
+    }
+    if (value >= u8(97)) { return value <= u8(122); }
+    return false;
+}
+
+pub bool is_ascii_digit(u8 value) {
+    if (value < u8(48)) { return false; }
+    return value <= u8(57);
+}

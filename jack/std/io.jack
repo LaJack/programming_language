@@ -1,22 +1,268 @@
 module std.io;
 
+import std.memory;
+import std.string;
+
 extern "c" type FILE;
-extern "c" &inout FILE jack_std_io_open_read(str path);
-extern "c" usize fread(&inout c_void data, usize size, usize count, &inout FILE stream);
-extern "c" i32 fclose(&inout FILE stream);
+
+pub struct IoError {
+    i32 code;
+    i32 error_code(&in self) { return self.code; }
+}
+pub struct UnexpectedEofError { }
+pub struct Metadata {
+    usize size;
+    bool is_file;
+    bool is_directory;
+
+    usize byte_size(&in self) { return self.size; }
+    bool regular_file(&in self) { return self.is_file; }
+    bool directory(&in self) { return self.is_directory; }
+}
+
+unsafe extern "c" ?*inout FILE jack_io_open(str path, u8 mode);
+unsafe extern "c" i32 jack_io_last_error();
+unsafe extern "c" i32 jack_io_read(
+    *inout FILE file, *inout u8 data, usize length, &out usize count
+);
+unsafe extern "c" i32 jack_io_write(
+    *inout FILE file, *in u8 data, usize length, &out usize count
+);
+unsafe extern "c" i32 jack_io_write_str(
+    *inout FILE file, str value, &out usize count
+);
+unsafe extern "c" i32 jack_io_flush(*inout FILE file);
+unsafe extern "c" i32 jack_io_close(*inout FILE file);
+unsafe extern "c" void jack_io_close_discard(*inout FILE file);
+unsafe extern "c" i32 jack_io_seek(
+    *inout FILE file, i64 offset, i32 origin, &out usize position
+);
+unsafe extern "c" i32 jack_io_tell(*inout FILE file, &out usize position);
+unsafe extern "c" i32 jack_io_metadata(
+    str path, &out usize size, &out bool is_file, &out bool is_directory
+);
+unsafe extern "c" *inout FILE jack_io_stdin();
+unsafe extern "c" *inout FILE jack_io_stdout();
+unsafe extern "c" *inout FILE jack_io_stderr();
 
 pub struct File {
-    &inout FILE handle;
+    *inout FILE handle;
+    bool open;
 
-    init(&inout self, str path) {
-        self.handle = jack_std_io_open_read(path);
+    usize read(&inout self, &out u8[] destination) raises IoError {
+        if (len(destination) == 0) { return usize(0); }
+        usize count;
+        unsafe {
+            *inout u8 data = raw(&out destination[0]);
+            i32 status = jack_io_read(
+                self.handle, data, usize(len(destination)), count
+            );
+            if (status != 0) { raise IoError { code = status }; }
+        }
+        return count;
     }
 
-    usize read(&inout self, &inout u8[] dst) {
-        return fread(dst[0], 1, usize(len(dst)), self.handle);
+    void read_exact(&inout self, &out u8[] destination)
+        raises IoError, UnexpectedEofError
+    {
+        usize offset = usize(0);
+        while (offset < usize(len(destination))) {
+            usize count = self.read(destination[i32(offset)..]);
+            if (count == usize(0)) { raise UnexpectedEofError { }; }
+            offset = offset + count;
+        }
     }
 
-    i32 close(&inout self) {
-        return fclose(self.handle);
+    usize write(&inout self, &in u8[] source) raises IoError {
+        if (len(source) == 0) { return usize(0); }
+        usize count;
+        unsafe {
+            *in u8 data = raw(&in source[0]);
+            i32 status = jack_io_write(
+                self.handle, data, usize(len(source)), count
+            );
+            if (status != 0) { raise IoError { code = status }; }
+        }
+        return count;
+    }
+
+    void write_all(&inout self, &in u8[] source) raises IoError {
+        usize offset = usize(0);
+        while (offset < usize(len(source))) {
+            usize count = self.write(source[i32(offset)..]);
+            if (count == usize(0)) { raise IoError { code = 5 }; }
+            offset = offset + count;
+        }
+    }
+
+    void write_str(&inout self, str value) raises IoError {
+        usize count;
+        unsafe {
+            i32 status = jack_io_write_str(self.handle, value, count);
+            if (status != 0) { raise IoError { code = status }; }
+        }
+        if (count != len(value)) { raise IoError { code = 5 }; }
+    }
+
+    void flush(&inout self) raises IoError {
+        unsafe {
+            i32 status = jack_io_flush(self.handle);
+            if (status != 0) { raise IoError { code = status }; }
+        }
+    }
+
+    usize tell(&inout self) raises IoError {
+        usize position;
+        unsafe {
+            i32 status = jack_io_tell(self.handle, position);
+            if (status != 0) { raise IoError { code = status }; }
+        }
+        return position;
+    }
+
+    usize seek_start(&inout self, usize position) raises IoError {
+        usize result;
+        unsafe {
+            i32 status = jack_io_seek(self.handle, i64(position), 0, result);
+            if (status != 0) { raise IoError { code = status }; }
+        }
+        return result;
+    }
+
+    usize seek_current(&inout self, i64 offset) raises IoError {
+        usize result;
+        unsafe {
+            i32 status = jack_io_seek(self.handle, offset, 1, result);
+            if (status != 0) { raise IoError { code = status }; }
+        }
+        return result;
+    }
+
+    usize seek_end(&inout self, i64 offset) raises IoError {
+        usize result;
+        unsafe {
+            i32 status = jack_io_seek(self.handle, offset, 2, result);
+            if (status != 0) { raise IoError { code = status }; }
+        }
+        return result;
+    }
+
+    deinit(move self) {
+        if (self.open) {
+            unsafe { jack_io_close_discard(self.handle); }
+        }
+    }
+}
+
+File open_mode(str path, u8 mode) raises IoError {
+    ?*inout FILE handle = null;
+    unsafe {
+        handle = jack_io_open(path, mode);
+    }
+    if (handle != null) { return File { handle = handle, open = true }; }
+    unsafe { raise IoError { code = jack_io_last_error() }; }
+}
+
+pub File open_read(str path) raises IoError { return open_mode(path, u8(0)); }
+pub File create(str path) raises IoError { return open_mode(path, u8(1)); }
+pub File open_append(str path) raises IoError { return open_mode(path, u8(2)); }
+pub File open_read_write(str path) raises IoError { return open_mode(path, u8(3)); }
+
+pub void close(move File file) raises IoError {
+    unsafe {
+        i32 status = jack_io_close(file.handle);
+        file.open = false;
+        if (status != 0) { raise IoError { code = status }; }
+    }
+}
+
+pub Metadata metadata(str path) raises IoError {
+    usize size;
+    bool is_file;
+    bool is_directory;
+    unsafe {
+        i32 status = jack_io_metadata(path, size, is_file, is_directory);
+        if (status != 0) { raise IoError { code = status }; }
+    }
+    return Metadata {
+        size = size, is_file = is_file, is_directory = is_directory
+    };
+}
+
+pub ByteBuffer(A) read_to_end(
+    comptime type A: Allocator, &inout File file, move A allocator
+) raises IoError, CapacityError, LayoutError, AllocationError {
+    ByteBuffer(A) output(allocator);
+    u8[4096] chunk;
+    bool reading = true;
+    while (reading) {
+        usize count = file.read(chunk[..]);
+        if (count == usize(0)) {
+            reading = false;
+        } else {
+            output.append(chunk[0..i32(count)]);
+        }
+    }
+    return output;
+}
+
+pub String(A) read_to_string(
+    comptime type A: Allocator, &inout File file, move A allocator
+) raises IoError, Utf8Error, CapacityError, LayoutError, AllocationError {
+    StringBuilder(A) builder(allocator);
+    u8[4096] chunk;
+    bool reading = true;
+    while (reading) {
+        usize count = file.read(chunk[..]);
+        if (count == usize(0)) {
+            reading = false;
+        } else {
+            builder.append_bytes(chunk[0..i32(count)]);
+        }
+    }
+    return finish_string(A, builder);
+}
+
+pub usize read_stdin(&out u8[] destination) raises IoError {
+    if (len(destination) == 0) { return usize(0); }
+    usize count;
+    unsafe {
+        *inout u8 data = raw(&out destination[0]);
+        i32 status = jack_io_read(
+            jack_io_stdin(), data, usize(len(destination)), count
+        );
+        if (status != 0) { raise IoError { code = status }; }
+    }
+    return count;
+}
+
+void write_standard(*inout FILE stream, str value) raises IoError {
+    usize count;
+    unsafe {
+        i32 status = jack_io_write_str(stream, value, count);
+        if (status != 0) { raise IoError { code = status }; }
+    }
+    if (count != len(value)) { raise IoError { code = 5 }; }
+}
+
+pub void write_stdout(str value) raises IoError {
+    unsafe { write_standard(jack_io_stdout(), value); }
+}
+
+pub void write_stderr(str value) raises IoError {
+    unsafe { write_standard(jack_io_stderr(), value); }
+}
+
+pub void flush_stdout() raises IoError {
+    unsafe {
+        i32 status = jack_io_flush(jack_io_stdout());
+        if (status != 0) { raise IoError { code = status }; }
+    }
+}
+
+pub void flush_stderr() raises IoError {
+    unsafe {
+        i32 status = jack_io_flush(jack_io_stderr());
+        if (status != 0) { raise IoError { code = status }; }
     }
 }

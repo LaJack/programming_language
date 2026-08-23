@@ -1,7 +1,9 @@
 import sys
+import os
 
 from .builtin_types import JackPrimitiveValue
 from .interpreter import (
+    EvaluationError,
     ExternHandler,
     JackAllocationRecord,
     JackArray,
@@ -12,6 +14,7 @@ from .interpreter import (
     _UNINITIALIZED_VALUE,
 )
 from .source_model import TypeReference
+from .memory_model import MaybeUninit as MemoryMaybeUninit
 
 
 _next_allocation_identity = 1
@@ -23,12 +26,193 @@ def default_runtime_externs(stdout: object | None = None) -> dict[str, ExternHan
         'stdout': stream,
         'fopen': fopen,
         'jack_std_io_open_read': jack_std_io_open_read,
+        'jack_string_view': jack_string_view,
+        'jack_bytes_view': jack_bytes_view,
+        'jack_bytes_view_mut': jack_bytes_view_mut,
+        'jack_str_byte': jack_str_byte,
+        'jack_io_open': jack_io_open,
+        'jack_io_last_error': jack_io_last_error,
+        'jack_io_read': jack_io_read,
+        'jack_io_write': jack_io_write,
+        'jack_io_write_str': jack_io_write_str,
+        'jack_io_flush': jack_io_flush,
+        'jack_io_close': jack_io_close,
+        'jack_io_close_discard': jack_io_close_discard,
+        'jack_io_seek': jack_io_seek,
+        'jack_io_tell': jack_io_tell,
+        'jack_io_metadata': jack_io_metadata,
+        'jack_io_stdin': lambda: _file_pointer(sys.stdin),
+        'jack_io_stdout': lambda: _file_pointer(stream),
+        'jack_io_stderr': lambda: _file_pointer(sys.stderr),
         'fread': fread,
         'fclose': fclose,
         'fwrite': fwrite,
         'malloc': malloc,
         'free': free,
     }
+
+
+def jack_string_view(data: object, length: object) -> str:
+    return _borrowed_bytes(data, _as_int(length)).decode('utf-8')
+
+
+def jack_bytes_view(data: object, length: object) -> JackSlice:
+    return _pointer_slice(data, _as_int(length), mutable=False)
+
+
+def jack_bytes_view_mut(data: object, length: object) -> JackSlice:
+    return _pointer_slice(data, _as_int(length), mutable=True)
+
+
+def jack_str_byte(value: object, index: object) -> int:
+    return _as_str(value).encode('utf-8')[_as_int(index)]
+
+
+_last_io_error = 5
+
+
+def jack_io_open(path: object, mode: object) -> JackRawPointer | None:
+    global _last_io_error
+    modes = ('rb', 'wb', 'ab', 'r+b')
+    try:
+        file_obj = open(_as_str(path), modes[_as_int(mode)])
+    except OSError as error:
+        _last_io_error = error.errno or 5
+        return None
+    return _file_pointer(file_obj)
+
+
+def jack_io_last_error() -> int:
+    return _last_io_error
+
+
+def jack_io_read(file: object, data: object, length: object, count: object) -> int:
+    try:
+        payload = _unwrap_file_pointer(file).read(_as_int(length))
+        if isinstance(payload, str):
+            payload = payload.encode('utf-8')
+        _write_borrowed_bytes(data, payload)
+        _set_out(count, len(payload))
+        return 0
+    except OSError as error:
+        return error.errno or 5
+
+
+def jack_io_write(file: object, data: object, length: object, count: object) -> int:
+    payload = _borrowed_bytes(data, _as_int(length))
+    try:
+        stream = _unwrap_file_pointer(file)
+        if hasattr(stream, 'buffer'):
+            written = stream.buffer.write(payload)
+        else:
+            written = stream.write(payload)
+        _set_out(count, len(payload) if written is None else written)
+        return 0
+    except OSError as error:
+        return error.errno or 5
+
+
+def jack_io_write_str(file: object, value: object, count: object) -> int:
+    payload = _as_str(value).encode('utf-8')
+    try:
+        stream = _unwrap_file_pointer(file)
+        if hasattr(stream, 'buffer'):
+            written = stream.buffer.write(payload)
+        else:
+            written = stream.write(payload.decode('utf-8'))
+        _set_out(count, len(payload) if written is None else written)
+        return 0
+    except OSError as error:
+        return error.errno or 5
+
+
+def jack_io_flush(file: object) -> int:
+    try:
+        _unwrap_file_pointer(file).flush()
+        return 0
+    except OSError as error:
+        return error.errno or 5
+
+
+def jack_io_close(file: object) -> int:
+    try:
+        _unwrap_file_pointer(file).close()
+        return 0
+    except OSError as error:
+        return error.errno or 5
+
+
+def jack_io_close_discard(file: object) -> None:
+    try:
+        _unwrap_file_pointer(file).close()
+    except OSError:
+        pass
+
+
+def jack_io_seek(
+    file: object, offset: object, origin: object, position: object
+) -> int:
+    try:
+        value = _unwrap_file_pointer(file).seek(_as_int(offset), _as_int(origin))
+        _set_out(position, value)
+        return 0
+    except OSError as error:
+        return error.errno or 5
+
+
+def jack_io_tell(file: object, position: object) -> int:
+    try:
+        _set_out(position, _unwrap_file_pointer(file).tell())
+        return 0
+    except OSError as error:
+        return error.errno or 5
+
+
+def jack_io_metadata(
+    path: object, size: object, is_file: object, is_directory: object
+) -> int:
+    try:
+        info = os.stat(_as_str(path))
+    except OSError as error:
+        return error.errno or 5
+    _set_out(size, info.st_size)
+    _set_out(is_file, os.path.isfile(_as_str(path)))
+    _set_out(is_directory, os.path.isdir(_as_str(path)))
+    return 0
+
+
+def _file_pointer(file_obj: object) -> JackRawPointer:
+    return JackRawPointer(JackBorrow(file_obj, mutable=True), mutable=True)
+
+
+def _unwrap_file_pointer(value: object) -> object:
+    if isinstance(value, JackRawPointer):
+        return value.target.value
+    return _unwrap_borrow(value)
+
+
+def _set_out(target: object, value: object) -> None:
+    if not isinstance(target, (JackBorrow, JackArrayElementBorrow)):
+        raise TypeError('out parameter is not writable.')
+    current = None
+    try:
+        current = target.value
+    except EvaluationError:
+        pass
+    if isinstance(current, JackPrimitiveValue):
+        value = JackPrimitiveValue(current.type_name, value)
+    target.value = value
+
+
+def _pointer_slice(data: object, length: int, *, mutable: bool) -> JackSlice:
+    if not isinstance(data, JackRawPointer):
+        raise TypeError('byte view requires a raw pointer.')
+    target = data.target
+    if not isinstance(target, JackArrayElementBorrow):
+        raise TypeError('byte view requires an array-backed raw pointer.')
+    if length < 0 or target.index + length > len(target.array.values):
+        raise ValueError('byte view exceeds its backing allocation.')
+    return JackSlice(target.array, target.index, length, mutable=mutable)
 
 
 def malloc(size: object) -> JackRawPointer | None:
@@ -130,6 +314,11 @@ def _unwrap_borrow(value: object) -> object:
 
 
 def _borrowed_bytes(value: object, byte_count: int) -> bytes:
+    if isinstance(value, JackRawPointer):
+        target = value.target
+        if isinstance(target, JackArrayElementBorrow):
+            return _array_bytes(target.array, target.index, byte_count)
+        return _scalar_byte(target.value, byte_count)
     if isinstance(value, JackArrayElementBorrow):
         return _array_bytes(value.array, value.index, byte_count)
     if isinstance(value, JackSlice):
@@ -184,6 +373,8 @@ def _scalar_byte(value: object, byte_count: int) -> bytes:
 
 
 def _byte_value(value: object) -> int:
+    if isinstance(value, MemoryMaybeUninit):
+        value = value.get()
     if isinstance(value, JackPrimitiveValue):
         value = value.value
     byte = int(value)
@@ -193,6 +384,11 @@ def _byte_value(value: object) -> int:
 
 
 def _write_borrowed_bytes(value: object, payload: bytes) -> None:
+    if isinstance(value, JackRawPointer):
+        target = value.target
+        if isinstance(target, JackArrayElementBorrow):
+            _write_array_bytes(target.array, target.index, payload)
+            return
     if isinstance(value, JackArrayElementBorrow):
         _write_array_bytes(value.array, value.index, payload)
         return

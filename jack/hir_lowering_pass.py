@@ -212,6 +212,7 @@ class HIRLoweringPass(SemanticPass):
         super().__init__()
         self.copy_helper_names: dict[str, str] = {}
         self.copy_helper_results: dict[str, str] = {}
+        self.entry_function: FunctionDeclaration | None = None
 
     def lower(self, ast: list[Statement]) -> HIRProgram:
         self.validate(ast)
@@ -220,6 +221,7 @@ class HIRLoweringPass(SemanticPass):
         body: list[HIRStatement] = []
         top_level: list[HIRStatement] = []
         entry_module = self._entry_module(ast)
+        self.entry_function = self._validate_entry_function(ast, entry_module)
         module_dependencies = self._module_dependencies(ast, entry_module)
         for statement in [*ast, *helpers]:
             if type(statement).__name__ in {'InterfaceDeclaration', 'ImplementationDeclaration'}:
@@ -242,8 +244,65 @@ class HIRLoweringPass(SemanticPass):
             body=body,
             top_level=top_level,
             entry_module=entry_module,
+            entry_function_name=(
+                '$jack$user$main' if self.entry_function is not None else None
+            ),
             module_dependencies=module_dependencies,
         )
+
+    def _validate_entry_function(
+        self, ast: list[Statement], entry_module: str | None
+    ) -> FunctionDeclaration | None:
+        # Direct AST/HIR APIs have no project entry module and keep ordinary
+        # functions named main for compatibility. The module loader assigns a
+        # concrete owner when compiling an executable entry file.
+        if entry_module is None:
+            return None
+        candidates = [
+            statement for statement in ast
+            if isinstance(statement, FunctionDeclaration)
+            and statement.module_name == entry_module
+            and (statement.source_name or statement.name) == 'main'
+        ]
+        if not candidates:
+            return None
+        declaration = candidates[0]
+        invalid = (
+            declaration.extern
+            or declaration.raises
+            or declaration.return_type.name != 'i32'
+            or declaration.return_type.borrow is not None
+            or declaration.return_type.array_size is not None
+            or len(declaration.parameters) != 1
+        )
+        if not invalid:
+            parameter = declaration.parameters[0]
+            invalid = not (
+                parameter.type.name == 'str'
+                and parameter.type.is_slice
+                and parameter.type.borrow == 'in'
+                and parameter.passing_mode == 'copy'
+                and not parameter.comptime
+            )
+        if invalid:
+            raise HIRLoweringError(
+                'Program entry point must have signature "i32 main(&in str[] arguments)" and cannot be extern or raise.',
+                declaration.span,
+            )
+        runtime_statement = next(
+            (
+                statement for statement in ast
+                if statement.module_name == entry_module
+                and not self._is_top_level_declaration(statement)
+            ),
+            None,
+        )
+        if runtime_statement is not None:
+            raise HIRLoweringError(
+                'A typed main cannot coexist with runtime top-level statements.',
+                runtime_statement.span,
+            )
+        return declaration
 
     def _install_copy_helpers(
         self, ast: list[Statement]
@@ -497,7 +556,10 @@ class HIRLoweringPass(SemanticPass):
             body = [] if declaration.extern else self._block(declaration.body, scope)
 
         return HIRFunctionDeclaration(
-            name=declaration.name,
+            name=(
+                '$jack$user$main'
+                if declaration is self.entry_function else declaration.name
+            ),
             parameters=[self._symbol(parameter) for parameter in declaration.parameters],
             body=body,
             return_type=self._copy_type(declaration.return_type),
@@ -1230,11 +1292,16 @@ class HIRLoweringPass(SemanticPass):
         if '.' in call.function_name:
             return self._method_call_target(call, scope)
         if call.function_name == 'len':
+            argument_type = self._expression_type(call.parameters[0], scope)
             return (
                 HIRCallTarget(
                     kind='len',
                     name='len',
-                    return_type=TypeReference('i32'),
+                    return_type=TypeReference(
+                        'usize'
+                        if argument_type.name == 'str' and not argument_type.is_slice
+                        else 'i32'
+                    ),
                 ),
                 None,
                 None,

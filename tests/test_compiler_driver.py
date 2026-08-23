@@ -7,6 +7,7 @@ from jack.compiler_driver import (
     BackendArtifacts,
     BackendEmissionOptions,
     BackendNotFoundError,
+    CBackend,
     CompilationOptions,
     CompilerDriver,
     ToolchainError,
@@ -46,6 +47,28 @@ class ArtifactBackend:
 
 
 class CompilerDriverTests(unittest.TestCase):
+    def test_c_backend_bundles_cross_module_generic_specializations(self):
+        source_text = '''
+import std.collections.vector;
+import std.memory;
+pub struct Token { u8 kind; }
+void fill() raises CapacityError, LayoutError, AllocationError {
+    SystemAllocator allocator;
+    Vector(Token, SystemAllocator) tokens(allocator, usize(0));
+    tokens.push(Token { kind = u8(7) });
+}
+'''
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / 'program.jack'
+            source.write_text(source_text)
+            driver = CompilerDriver(print_handler=None)
+            options = CompilationOptions(backend='c')
+            program = driver.backend_hir(source, options)
+            artifacts = CBackend().emit(program)
+
+        self.assertEqual(('jack_std_io.c', 'main.c'), artifacts.link_inputs)
+        self.assertNotIn('std_collections_vector.c', artifacts.files)
+
     def test_driver_lowers_once_and_materializes_backend_artifacts(self):
         commands = []
 

@@ -423,7 +423,7 @@ class CEmitPass:
                 first_definition = False
 
         lines.append('')
-        lines.extend(self._emit_hir_main(program.top_level, globals_))
+        lines.extend(self._emit_hir_main(program, globals_))
         return '\n'.join(self._compact_blank_lines(lines)) + '\n'
 
     def _emit_hir_global_variable_declaration(
@@ -447,17 +447,27 @@ class CEmitPass:
 
     def _emit_hir_main(
         self,
-        top_level: list[HIRStatement],
+        program: HIRProgram,
         globals_: list[HIRGlobalVariable],
     ) -> list[str]:
-        lines = ['int main(void) {']
+        typed = program.entry_function_name is not None
+        lines = ['int main(int argc, char **argv) {' if typed else 'int main(void) {']
         env = dict(self.global_variable_types)
         body: list[str] = []
-        for statement in top_level:
+        if typed:
+            body.extend([
+                'int jack_arg_status = jack_process_init_args(argc, argv);',
+                'if (jack_arg_status != 0) return jack_arg_status;',
+            ])
+        for statement in program.top_level:
             if isinstance(statement, HIRGlobalVariable):
                 body.extend(self._emit_hir_top_level_variable(statement, env))
             elif not isinstance(statement, HIRDeclaration):
                 body.extend(self._emit_hir_statement(statement, env))
+        if typed:
+            body.append(
+                f'int jack_status = {self._mangle(program.entry_function_name)}(jack_process_arguments());'
+            )
         body.extend(
             self._emit_deinit_calls(
                 [
@@ -469,7 +479,11 @@ class CEmitPass:
                 env,
             )
         )
-        body.append('return 0;')
+        if typed:
+            body.append('jack_process_dispose_args();')
+            body.append('return jack_status;')
+        else:
+            body.append('return 0;')
         lines.extend(self._indent(line) for line in body)
         lines.append('}')
         return lines
@@ -479,6 +493,11 @@ class CEmitPass:
         program: HIRProgram,
         entry_module: str | None = None,
     ) -> dict[str, str]:
+        if self._requires_bundled_specializations(program):
+            return {'main.c': CEmitPass(
+                debug=self.debug,
+                optimization=self.optimization,
+            ).emit_hir(program)}
         self.hir_program = program
         entry_module = program.entry_module if entry_module is None else entry_module
         module_order: list[str | None] = []
@@ -557,12 +576,45 @@ class CEmitPass:
             )
 
         files['main.c'] = self._emit_hir_entry_source(
+            program,
             statements_by_module.get(entry_module, []),
             imported_modules,
             module_headers,
             statements_by_module,
         )
         return files
+
+    @staticmethod
+    def _requires_bundled_specializations(program: HIRProgram) -> bool:
+        type_modules = {
+            declaration.name: declaration.module_name
+            for declaration in program.declarations
+            if isinstance(declaration, HIRTypeDeclaration)
+        }
+        for declaration in program.declarations:
+            if not isinstance(declaration, HIRTypeDeclaration):
+                continue
+            if '$comptime$' not in declaration.name:
+                continue
+            for node in CEmitPass._walk_hir_static(declaration):
+                if not isinstance(node, TypeReference):
+                    continue
+                owner = type_modules.get(node.name)
+                if owner is not None and owner != declaration.module_name:
+                    return True
+        return False
+
+    @staticmethod
+    def _walk_hir_static(value):
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return
+        yield value
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                yield from CEmitPass._walk_hir_static(item)
+        elif hasattr(value, '__dict__'):
+            for item in vars(value).values():
+                yield from CEmitPass._walk_hir_static(item)
 
     def _hir_module_sections(self, statements: list[HIRStatement]):
         types = [
@@ -768,6 +820,7 @@ class CEmitPass:
 
     def _emit_hir_entry_source(
         self,
+        program: HIRProgram,
         statements: list[HIRStatement],
         imported_modules: list[str],
         module_headers: dict[str, str],
@@ -841,6 +894,7 @@ class CEmitPass:
         lines.append('')
         lines.extend(
             self._emit_hir_split_main(
+                program,
                 runtime,
                 globals_,
                 imported_modules,
@@ -851,14 +905,21 @@ class CEmitPass:
 
     def _emit_hir_split_main(
         self,
+        program: HIRProgram,
         runtime: list[HIRStatement],
         globals_: list[HIRGlobalVariable],
         imported_modules: list[str],
         statements_by_module: dict[str | None, list[HIRStatement]],
     ) -> list[str]:
-        lines = ['int main(void) {']
+        typed = program.entry_function_name is not None
+        lines = ['int main(int argc, char **argv) {' if typed else 'int main(void) {']
         env = dict(self.global_variable_types)
         body: list[str] = []
+        if typed:
+            body.extend([
+                'int jack_arg_status = jack_process_init_args(argc, argv);',
+                'if (jack_arg_status != 0) return jack_arg_status;',
+            ])
         for module in imported_modules:
             if self._hir_module_needs_init(statements_by_module[module]):
                 body.append(f'{self._module_init_function_name(module)}();')
@@ -867,6 +928,10 @@ class CEmitPass:
                 body.extend(self._emit_hir_top_level_variable(statement, env))
             else:
                 body.extend(self._emit_hir_statement(statement, env))
+        if typed:
+            body.append(
+                f'int jack_status = {self._mangle(program.entry_function_name)}(jack_process_arguments());'
+            )
         body.extend(
             self._emit_deinit_calls(
                 self._hir_deinit_global_names(globals_),
@@ -876,7 +941,11 @@ class CEmitPass:
         for module in reversed(imported_modules):
             if self._hir_module_needs_deinit(statements_by_module[module]):
                 body.append(f'{self._module_deinit_function_name(module)}();')
-        body.append('return 0;')
+        if typed:
+            body.append('jack_process_dispose_args();')
+            body.append('return jack_status;')
+        else:
+            body.append('return 0;')
         lines.extend(self._indent(line) for line in body)
         lines.append('}')
         return lines
@@ -1287,7 +1356,10 @@ class CEmitPass:
         return any(
             function.extern
             and function.abi == 'c'
-            and function.name == 'jack_std_io_open_read'
+            and (
+                function.name == 'jack_std_io_open_read'
+                or function.name.startswith('jack_io_')
+            )
             for function in functions
         )
 
@@ -2286,7 +2358,12 @@ class CEmitPass:
             return f'((int32_t)({self._emit_array_size(argument_type.array_size)}))'
         if self._is_slice_type(argument_type):
             return self._field_access(self._emit_hir_expression(argument, env), 'len')
-        raise CEmitError(f'len expects an array or slice, got "{self._type_name(argument_type)}".')
+        if self._type_name(argument_type) == 'str':
+            return self._field_access(self._emit_hir_expression(argument, env), 'len')
+        raise CEmitError(
+            f'len expects an array, slice, or str, got '
+            f'"{self._type_name(argument_type)}".'
+        )
 
 
 
@@ -2607,6 +2684,12 @@ class CEmitPass:
         return '{0}'
 
     def _return_zero_value(self, type_ref: TypeReference) -> str:
+        if self._is_slice_type(type_ref):
+            name = self._slice_type_name(
+                self._element_type(type_ref),
+                mutable=borrow_mode_can_write(type_ref.borrow),
+            )
+            return f'({name}){{0}}'
         if (
             self._is_borrow_type(type_ref)
             and not self._is_slice_type(type_ref)

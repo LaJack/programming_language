@@ -95,18 +95,19 @@ Runtime `extern` declarations are emitted as C prototypes and must be supplied t
 
 The C ABI surface is intentionally narrow: `usize` maps to C `size_t`, opaque C types such as `FILE` must be used behind explicit borrows, and C helper types such as `c_char` and `c_void` can only appear as borrowed types such as `&in c_char` or `&in c_void`. Jack `str` is still a Jack ABI value, not a C `char *`, so libc-style examples should use byte buffers plus explicit lengths for now.
 
-The interpreter CLI includes small runtime and comptime host bindings for `stdout`, `fwrite`, `fopen`, `fread`, `fclose`, and the `std.io` string-path bridge, so libc-backed byte-buffer examples can run without compiling C.
-
-Comptime IO can currently touch files on the compiling machine without an explicit permission prompt. This is intentionally simple for now; stronger safeguards will be added once the model matures.
-
-The first Jack IO module is `std.io`, shipped with the Python package under `jack/std`. It wraps the libc symbols in a Jack `File` struct and exposes method-based reading over caller-owned buffers. File paths use Jack `str`; the backend bridge converts them to C strings when needed.
+The interpreter and native runtimes provide the private host bridges used by
+`std.io`. `File` is an owned, non-copyable resource; opening, reading, writing,
+seeking, flushing, metadata lookup, and explicit close report typed errors.
+EOF is a successful zero-byte read.
 
 ```c
 import std.io;
 
-File file("examples/io.txt");
-usize bytes_read = file.read(buffer[..]);
-file.close();
+void read() raises IoError {
+    File file = open_read("examples/io.txt");
+    usize bytes_read = file.read(buffer[..]);
+    close(file);
+}
 ```
 
 Run the example from the repository root with:
@@ -188,17 +189,14 @@ u8 first = buffer[0];
 i32 count = len(buffer);
 ```
 
-Comptime structs may contain opaque host values such as borrowed C handles. Those opaque values can be used during the compile-time pass, but they cannot be translated into runtime values. Plain data derived from them can still cross the phase boundary:
+Programs may use runtime top-level statements or a typed entrypoint. Typed
+entrypoints receive UTF-8 process arguments (including argument zero):
 
 ```c
-import std.io;
-
-comptime File file("examples/io.txt");
-comptime u8[8] buffer;
-comptime usize count = file.read(buffer[..]);
-
-usize runtime_count = count; // ok: plain data crosses phases
-// File runtime_file = file; // rejected: contains a comptime host handle
+i32 main(&in str[] arguments) {
+    print(len(arguments));
+    return 0;
+}
 ```
 
 

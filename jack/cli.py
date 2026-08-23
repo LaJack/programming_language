@@ -25,9 +25,10 @@ from .semantic_pass import SemanticError
 
 def run_interpreter(
     path: Path,
+    arguments: list[str] | None = None,
     import_overrides: dict[str, str] | None = None,
     module_roots: list[Path] | None = None,
-) -> None:
+) -> int:
     comptime_externs = default_comptime_externs()
     program = CompilerDriver(
         print_handler=print,
@@ -39,10 +40,10 @@ def run_interpreter(
             import_overrides=import_overrides or {},
         ),
     )
-    Interpreter(
+    return Interpreter(
         externs=default_runtime_externs(),
         comptime_externs=comptime_externs,
-    ).eval_hir_program(program)
+    ).eval_hir_program(program, [str(path), *(arguments or ())])
 
 
 def run_c_emitter(
@@ -106,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar='FILE',
         type=Path,
         help='entry source file',
+    )
+    parser.add_argument(
+        'arguments',
+        nargs='*',
+        metavar='ARG',
+        help='arguments passed to typed main in interpreter mode',
     )
     parser.add_argument(
         '--module-root',
@@ -236,12 +243,15 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError('--debug cannot be used with -i/--interpret')
         if args.emit_c and args.save_temps is not None:
             raise ValueError('--save-temps cannot be used with -c/--emit-c')
+        if args.arguments and not args.interpret:
+            raise ValueError('program arguments are only accepted with -i/--interpret')
         import_overrides = parse_stub_overrides(args.stub)
         module_roots = args.module_root or None
         source_path = _diagnostic_source_path(args)
         if args.interpret:
-            run_interpreter(
+            return run_interpreter(
                 args.source,
+                arguments=args.arguments,
                 import_overrides=import_overrides,
                 module_roots=module_roots,
             )

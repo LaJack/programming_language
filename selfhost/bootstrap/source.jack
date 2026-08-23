@@ -5,4 +5,23 @@ pub struct SourceSpan {
     usize end;
     usize line;
     usize column;
+
+    usize start_offset(&in self) { return self.start; }
+    usize end_offset(&in self) { return self.end; }
+    usize line_number(&in self) { return self.line; }
+    usize column_number(&in self) { return self.column; }
+}
+
+pub SourceSpan source_span(
+    usize start,
+    usize end,
+    usize line,
+    usize column
+) {
+    return SourceSpan {
+        start = start,
+        end = end,
+        line = line,
+        column = column
+    };
 }

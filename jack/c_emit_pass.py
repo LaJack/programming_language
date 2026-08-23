@@ -1635,9 +1635,18 @@ class CEmitPass:
             return [*prefix, 'return;']
         if self._is_void_type(self.current_return_type):
             raise CEmitError('Cannot return a value from a void function.')
+        value = self._emit_hir_expression_as_type(
+            statement.expr, self.current_return_type, env
+        )
+        if prefix:
+            temporary = self._next_temporary_name('return_value')
+            return [
+                f'__auto_type {temporary} = {value};',
+                *prefix,
+                f'return {temporary};',
+            ]
         return [
-            *prefix,
-            f'return {self._emit_hir_expression_as_type(statement.expr, self.current_return_type, env)};',
+            f'return {value};',
         ]
 
     def _emit_hir_raise_statement(

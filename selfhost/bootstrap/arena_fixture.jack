@@ -1,0 +1,20 @@
+module bootstrap.arena_fixture;
+
+import bootstrap.source;
+import std.collections.arena;
+import std.memory;
+
+pub Arena(SourceSpan, A) store_source_spans(
+    comptime type A: Allocator,
+    &in SourceSpan[] spans,
+    move A allocator
+) raises CapacityError, LayoutError, AllocationError {
+    Arena(SourceSpan, A) stored(allocator, usize(len(spans)));
+    usize index = usize(0);
+    while (index < usize(len(spans))) {
+        SourceSpan span = spans[index];
+        stored.insert(span);
+        index = index + usize(1);
+    }
+    return stored;
+}

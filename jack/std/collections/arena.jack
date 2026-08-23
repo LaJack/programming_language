@@ -1,0 +1,59 @@
+module std.collections.arena;
+
+import std.collections.vector;
+import std.memory;
+
+pub struct ArenaHandleError { }
+
+pub struct ArenaHandle(comptime type T) {
+    usize index;
+
+    bool equals(&in self, &in ArenaHandle(T) other) {
+        return self.index == other.index;
+    }
+}
+
+pub struct Arena(
+    comptime type T,
+    comptime type A: Allocator
+) {
+    Vector(T, A) values;
+
+    init(&inout self, move A allocator, usize initial_capacity)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        Vector(T, A) values(allocator, initial_capacity);
+        self.values = move values;
+    }
+
+    ArenaHandle(T) insert(&inout self, move T value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        usize index = self.values.len();
+        self.values.push(value);
+        return ArenaHandle(T) { index = index };
+    }
+
+    &in T get(&in self, ArenaHandle(T) handle)
+        raises ArenaHandleError
+    {
+        try {
+            return self.values.get(handle.index);
+        } catch BoundsError {
+            raise ArenaHandleError { };
+        }
+    }
+
+    &inout T get_mut(&inout self, ArenaHandle(T) handle)
+        raises ArenaHandleError
+    {
+        try {
+            return self.values.get_mut(handle.index);
+        } catch BoundsError {
+            raise ArenaHandleError { };
+        }
+    }
+
+    usize len(&in self) { return self.values.len(); }
+    bool is_empty(&in self) { return self.values.is_empty(); }
+}

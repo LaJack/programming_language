@@ -833,7 +833,30 @@ class ErrorEffectsTests(unittest.TestCase):
         '''), print_handler=None)
 
         self.assertIn('if (jack_try(&error_frame_1) == 0) {', c_source)
-        self.assertIn('jack_end_try(&error_frame_1);\n        return 7;', c_source)
+        self.assertIn('__auto_type return_value_1 = 7;', c_source)
+        self.assertIn(
+            'jack_end_try(&error_frame_1);\n        return return_value_1;', c_source
+        )
+
+    def test_c_emit_evaluates_raising_return_before_leaving_try(self):
+        c_source = emit_c(parse(access_error_source() + '''
+            i32 fail_value() raises AccessError {
+                raise AccessError { code = 9 };
+            }
+            i32 caller() {
+                try {
+                    return fail_value();
+                } catch AccessError err {
+                    return err.code;
+                }
+            }
+        '''), print_handler=None)
+
+        evaluation = c_source.index('__auto_type return_value_')
+        frame_exit = c_source.index('jack_end_try(&error_frame_1);', evaluation)
+        returned = c_source.index('return return_value_', frame_exit)
+        self.assertLess(evaluation, frame_exit)
+        self.assertLess(frame_exit, returned)
 
     def test_c_emit_emits_try_catch_dispatch(self):
         c_source = emit_c(parse(access_error_source() + fail_source() + '''

@@ -608,6 +608,19 @@ raises `LayoutError` on overflow. `get` borrows the vector through `&in self`,
 while `get_mut` requires `&inout self`. `pop`, `clear`, and destruction remove
 elements in reverse index order.
 
+`Arena(T, A: Allocator)` is a monotonic typed arena built on `Vector`. Insertion
+returns an opaque, copyable `ArenaHandle(T)` containing a stable insertion
+index. Growth may relocate values, but handles remain valid because they are
+resolved through the arena on every access. `get` and `get_mut` report
+`ArenaHandleError` for out-of-range handles. Values cannot be removed or the
+arena cleared; destruction releases all values in reverse insertion order.
+
+A handle is valid only with the arena instance that created it and while that
+arena remains alive. This first implementation does not encode an arena
+identity, so using an in-range handle with another arena of the same element
+type is a logic error that cannot be detected. Lexical borrows returned by
+`get` and `get_mut` prevent insertion while they remain live.
+
 ## Built-Ins
 
 Built-in functions and forms include:

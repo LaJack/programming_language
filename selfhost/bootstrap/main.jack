@@ -1,0 +1,157 @@
+module bootstrap.main;
+
+import bootstrap.lexer;
+import std.collections.vector;
+import std.io;
+import std.memory;
+import std.string;
+
+struct DumpResult {
+    bool invalid;
+    usize line;
+    usize column;
+}
+
+void append_separator(&inout StringBuilder(SystemAllocator) output)
+    raises CapacityError, LayoutError, AllocationError
+{
+    output.append("\t");
+}
+
+void write_token(&in Token token)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError
+{
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    output.append_u64(u64(token.kind_value()));
+    append_separator(output);
+    output.append_usize(token.start_offset());
+    append_separator(output);
+    output.append_usize(token.end_offset());
+    append_separator(output);
+    output.append_usize(token.line_number());
+    append_separator(output);
+    output.append_usize(token.column_number());
+    output.append("\n");
+    String(SystemAllocator) line = finish_string(SystemAllocator, output);
+    write_stdout(line.as_str());
+}
+
+DumpResult dump_tokens(&in Vector(Token, SystemAllocator) tokens)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError,
+        BoundsError
+{
+    usize index = usize(0);
+    DumpResult result = DumpResult {
+        invalid = false, line = usize(0), column = usize(0)
+    };
+    while (index < tokens.len()) {
+        &in Token token = tokens.get(index);
+        write_token(token);
+        if (result.invalid == false) {
+            if (token.kind_value() == token_invalid()) {
+                result.invalid = true;
+                result.line = token.line_number();
+                result.column = token.column_number();
+            }
+        }
+        index = index + usize(1);
+    }
+    return result;
+}
+
+void report_number(str category, usize value)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError
+{
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    output.append("error\t");
+    output.append(category);
+    output.append("\t");
+    output.append_usize(value);
+    output.append("\n");
+    String(SystemAllocator) line = finish_string(SystemAllocator, output);
+    write_stderr(line.as_str());
+}
+
+void report_io(i32 code)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError
+{
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    output.append("error\tio\t");
+    output.append_i64(i64(code));
+    output.append("\n");
+    String(SystemAllocator) line = finish_string(SystemAllocator, output);
+    write_stderr(line.as_str());
+}
+
+void report_lex(usize line_number, usize column_number)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError
+{
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    output.append("error\tlex\t");
+    output.append_usize(line_number);
+    output.append("\t");
+    output.append_usize(column_number);
+    output.append("\n");
+    String(SystemAllocator) line = finish_string(SystemAllocator, output);
+    write_stderr(line.as_str());
+}
+
+i32 run(str path)
+    raises IoError, Utf8Error, CapacityError, LayoutError, AllocationError,
+        BoundsError
+{
+    File file = open_read(path);
+    SystemAllocator source_allocator;
+    String(SystemAllocator) source =
+        read_to_string(SystemAllocator, file, source_allocator);
+    close(file);
+
+    &in u8[] source_bytes = source.bytes();
+    SystemAllocator token_allocator;
+    Vector(Token, SystemAllocator) tokens =
+        lex(SystemAllocator, source_bytes, token_allocator);
+    DumpResult result = dump_tokens(tokens);
+    if (result.invalid) {
+        report_lex(result.line, result.column);
+        return 1;
+    }
+    return 0;
+}
+
+i32 main(&in str[] arguments) {
+    if (len(arguments) != 2) {
+        try { write_stderr("usage: jack-bootstrap <source>\n"); }
+        catch IoError { }
+        return 2;
+    }
+    try {
+        return run(arguments[1]);
+    } catch IoError error {
+        try { report_io(error.error_code()); }
+        catch CapacityError { }
+        catch LayoutError { }
+        catch AllocationError { }
+        catch Utf8Error { }
+        catch IoError { }
+    } catch Utf8Error error {
+        try { report_number("utf8", error.position()); }
+        catch CapacityError { }
+        catch LayoutError { }
+        catch AllocationError { }
+        catch Utf8Error { }
+        catch IoError { }
+    } catch CapacityError {
+        try { write_stderr("error\tcapacity\n"); } catch IoError { }
+    } catch LayoutError {
+        try { write_stderr("error\tlayout\n"); } catch IoError { }
+    } catch AllocationError {
+        try { write_stderr("error\tallocation\n"); } catch IoError { }
+    } catch BoundsError {
+        try { write_stderr("error\tbounds\n"); } catch IoError { }
+    }
+    return 1;
+}

@@ -209,10 +209,15 @@ def _pointer_slice(data: object, length: int, *, mutable: bool) -> JackSlice:
         raise TypeError('byte view requires a raw pointer.')
     target = data.target
     if not isinstance(target, JackArrayElementBorrow):
+        if length == 0:
+            return JackSlice(JackArray(TypeReference('u8'), []), 0, 0, mutable=mutable)
         raise TypeError('byte view requires an array-backed raw pointer.')
     if length < 0 or target.index + length > len(target.array.values):
         raise ValueError('byte view exceeds its backing allocation.')
-    return JackSlice(target.array, target.index, length, mutable=mutable)
+    array = target.array
+    if data.unwrap_storage:
+        array = JackArray(TypeReference('u8'), array.values)
+    return JackSlice(array, target.index, length, mutable=mutable)
 
 
 def malloc(size: object) -> JackRawPointer | None:

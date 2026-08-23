@@ -2146,6 +2146,12 @@ class SemanticPass:
                 self._ensure_method_body_validated(type_decl, declaration)
 
         summary = self.borrow_return_summaries.get(id(declaration), ())
+        if not summary and type_decl is not None and not declaration.extern:
+            summary = (
+                BorrowAccess(
+                    BorrowPath('self'), declaration.return_type.borrow or 'in'
+                ),
+            )
         if not summary:
             return ()
 

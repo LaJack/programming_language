@@ -187,13 +187,20 @@ class JackSlice:
         if not borrow_mode_can_read(self.mode):
             raise EvaluationError('Cannot read through a write-only slice.')
         self._check_index(index)
-        return self.array.values[self.start + index]
+        value = self.array.values[self.start + index]
+        if isinstance(value, MemoryMaybeUninit):
+            return value.get()
+        return value
 
     def set(self, index: int, value: object) -> None:
         if not self.mutable:
             raise EvaluationError('Cannot assign through a read-only slice.')
         self._check_index(index)
-        self.array.values[self.start + index] = value
+        slot = self.array.values[self.start + index]
+        if isinstance(slot, MemoryMaybeUninit):
+            slot.set_initialized(value)
+        else:
+            self.array.values[self.start + index] = value
 
     def _check_index(self, index: int) -> None:
         if index < 0 or index >= self.length:
@@ -334,9 +341,12 @@ class JackRawPointer:
     target: JackBorrow | JackArrayElementBorrow
     mutable: bool
     allocation: 'JackAllocationRecord | None' = None
+    unwrap_storage: bool = False
 
     def __deepcopy__(self, memo):
-        return JackRawPointer(self.target, self.mutable, self.allocation)
+        return JackRawPointer(
+            self.target, self.mutable, self.allocation, self.unwrap_storage
+        )
 
     def get(self) -> object:
         self._require_live()
@@ -346,6 +356,8 @@ class JackRawPointer:
             value = self.target.value
         if value is _UNINITIALIZED_VALUE:
             raise EvaluationError('Cannot read uninitialized allocation storage.')
+        if self.unwrap_storage and isinstance(value, MemoryMaybeUninit):
+            return value.get()
         return value
 
     def set(self, value: object) -> None:
@@ -353,7 +365,11 @@ class JackRawPointer:
         if not self.mutable:
             raise EvaluationError('Cannot write through a *in raw pointer.')
         if isinstance(self.target, JackArrayElementBorrow):
-            self.target.value = value
+            current = self.target.value
+            if self.unwrap_storage and isinstance(current, MemoryMaybeUninit):
+                current.set_initialized(value)
+            else:
+                self.target.value = value
         else:
             self.target.value = value
 
@@ -375,6 +391,7 @@ class JackRawPointer:
             ),
             self.mutable,
             self.allocation,
+            self.unwrap_storage,
         )
 
     def as_maybe_uninit(self, element_key: str, element_size: int) -> 'JackRawPointer':
@@ -992,6 +1009,16 @@ class Interpreter:
                 return pointer.as_maybe_uninit(
                     target.name,
                     self._interpreter_type_size(element),
+                )
+            if (
+                isinstance(pointer.target, JackArrayElementBorrow)
+                and isinstance(pointer.target.value, MemoryMaybeUninit)
+            ):
+                return JackRawPointer(
+                    pointer.target,
+                    pointer.mutable,
+                    pointer.allocation,
+                    unwrap_storage=True,
                 )
             return pointer
         raise EvaluationError(f'Unknown HIR expression type "{type(expression).__name__}".')

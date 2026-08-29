@@ -21,7 +21,7 @@ pub struct SearchResult {
 unsafe extern "c" str jack_string_view(*in u8 data, usize length);
 unsafe extern "c" &in u8[] jack_bytes_view(*in u8 data, usize length);
 unsafe extern "c" &inout u8[] jack_bytes_view_mut(*inout u8 data, usize length);
-extern "c" u8 jack_str_byte(str value, usize index);
+pub extern "c" u8 jack_str_byte(str value, usize index);
 
 pub struct ByteBuffer(comptime type A: Allocator) {
     Vector(u8, A) values;

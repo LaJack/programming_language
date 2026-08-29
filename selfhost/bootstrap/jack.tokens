@@ -1,9 +1,13 @@
-# Token kinds are declaration ordered; kind_value depends on this order.
-eof
-identifier
-integer
-floating
-string
-symbol
-invalid
-formatted_string
+# Token declarations define TokenKind discriminants in source order.
+token eof = eof;
+token identifier = /[A-Za-z_]([A-Za-z0-9_])*/;
+token integer = /[0-9]+/;
+token floating = /[0-9]+\.[0-9]+/;
+token string = handler string /"/;
+token symbol = /==|!=|<=|>=|\.\.|=>|[{}();,:+\-.=<>!\[\]&*?%\/]/;
+token invalid = invalid;
+token formatted_string = handler formatted_string /f"/;
+
+skip whitespace = /[ \t\r\n]+/;
+skip line_comment = handler line_comment /\/\//;
+skip block_comment = handler block_comment /\/\*/;

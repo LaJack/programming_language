@@ -1,0 +1,710 @@
+module bootstrap.lexer_generator;
+
+import std.collections.vector;
+import std.memory;
+import std.string;
+
+pub struct LexerSpecError {
+    usize line;
+    usize column;
+}
+
+pub struct LexerRule {
+    u16 token;
+    u8 handler;
+    bool skip;
+    usize pattern_start;
+    usize pattern_end;
+    usize name_start;
+    usize name_end;
+    usize line;
+    usize pattern_column;
+    u8 special;
+}
+
+pub struct NfaState { i32 accept; }
+pub struct NfaEdge { usize from; usize to; u16 byte; }
+pub struct Fragment { usize start; usize end; }
+
+pub struct CompiledLexer {
+    Vector(u16, SystemAllocator) transitions;
+    Vector(u16, SystemAllocator) accepts;
+    Vector(LexerRule, SystemAllocator) rules;
+    usize states;
+    usize rule_count;
+}
+
+pub struct FrozenRule {
+    u16 token;
+    u8 handler;
+    bool skip;
+}
+
+pub struct LexerTables(comptime usize States, comptime usize Rules) {
+    u16[States * usize(256)] transitions;
+    u16[States] accepts;
+    FrozenRule[Rules] rules;
+
+    u16 transition(&in self, u16 state, u8 byte) {
+        return self.transitions[usize(state) * usize(256) + usize(byte)];
+    }
+
+    u16 accepting(&in self, u16 state) {
+        return self.accepts[usize(state)];
+    }
+
+    u16 rule_token(&in self, u16 rule) {
+        FrozenRule metadata = self.rules[usize(rule)];
+        return metadata.token;
+    }
+
+    u8 rule_handler(&in self, u16 rule) {
+        FrozenRule metadata = self.rules[usize(rule)];
+        return metadata.handler;
+    }
+
+    bool rule_skips(&in self, u16 rule) {
+        FrozenRule metadata = self.rules[usize(rule)];
+        return metadata.skip;
+    }
+}
+
+bool ascii_alpha(u8 value) {
+    if (value >= u8(97)) { if (value <= u8(122)) { return true; } }
+    if (value >= u8(65)) { if (value <= u8(90)) { return true; } }
+    return value == u8(95);
+}
+
+bool ascii_digit(u8 value) { return value >= u8(48) && value <= u8(57); }
+
+bool name_byte(u8 value) { return ascii_alpha(value) || ascii_digit(value); }
+
+bool word_at(&in u8[] source, usize start, str word) {
+    if (start + len(word) > usize(len(source))) { return false; }
+    usize index = usize(0);
+    while (index < len(word)) {
+        if (source[start + index] != jack_str_byte(word, index)) { return false; }
+        index = index + usize(1);
+    }
+    return true;
+}
+
+bool ranges_equal(
+    &in u8[] source,
+    usize left_start,
+    usize left_end,
+    usize right_start,
+    usize right_end
+) {
+    if (left_end - left_start != right_end - right_start) { return false; }
+    usize index = usize(0);
+    while (left_start + index < left_end) {
+        if (source[left_start + index] != source[right_start + index]) {
+            return false;
+        }
+        index = index + usize(1);
+    }
+    return true;
+}
+
+usize skip_space(&in u8[] source, usize index, usize end) {
+    usize result = index;
+    bool scanning = true;
+    while (result < end && scanning) {
+        u8 value = source[result];
+        if (value == u8(32) || value == u8(9) || value == u8(13)) {
+            result = result + usize(1);
+        } else {
+            scanning = false;
+        }
+    }
+    return result;
+}
+
+u8 handler_code(&in u8[] source, usize start, usize end)
+    raises LexerSpecError
+{
+    usize length = end - start;
+    if (length == usize(6) && word_at(source, start, "string")) { return u8(1); }
+    if (length == usize(16) && word_at(source, start, "formatted_string")) { return u8(2); }
+    if (length == usize(12) && word_at(source, start, "line_comment")) { return u8(3); }
+    if (length == usize(13) && word_at(source, start, "block_comment")) { return u8(4); }
+    raise LexerSpecError { line = usize(1), column = start + usize(1) };
+}
+
+void parse_spec(
+    comptime bool generating,
+    &in u8[] source,
+    &inout Vector(UnionVariant, SystemAllocator) variants,
+    &inout Vector(LexerRule, SystemAllocator) rules
+) raises LexerSpecError, Utf8Error, CapacityError, LayoutError, AllocationError {
+    usize line_start = usize(0);
+    usize line = usize(1);
+    u16 token_index = u16(0);
+    bool saw_eof = false;
+    bool saw_invalid = false;
+    usize cursor = usize(0);
+    while (cursor <= usize(len(source))) {
+        bool complete = cursor == usize(len(source));
+        if (complete == false) { complete = source[cursor] == u8(10); }
+        if (complete) {
+            usize end = cursor;
+            if (end > line_start) {
+                if (source[end - usize(1)] == u8(13)) { end = end - usize(1); }
+            }
+            usize at = skip_space(source, line_start, end);
+            if (at < end && source[at] != u8(35)) {
+                bool skip = false;
+                if (word_at(source, at, "token")) {
+                    at = at + usize(5);
+                } elif (word_at(source, at, "skip")) {
+                    at = at + usize(4);
+                    skip = true;
+                } else {
+                    raise LexerSpecError { line = line, column = at - line_start + usize(1) };
+                }
+                at = skip_space(source, at, end);
+                usize name_start = at;
+                while (at < end && name_byte(source[at])) { at = at + usize(1); }
+                usize name_end = at;
+                if (at == name_start || ascii_alpha(source[name_start]) == false) {
+                    raise LexerSpecError { line = line, column = name_start - line_start + usize(1) };
+                }
+                usize previous_index = usize(0);
+                while (previous_index < rules.len()) {
+                    &in LexerRule previous = rules.get(previous_index);
+                    if (ranges_equal(
+                        source, name_start, at,
+                        previous.name_start, previous.name_end
+                    )) {
+                        raise LexerSpecError {
+                            line = line,
+                            column = name_start - line_start + usize(1),
+                        };
+                    }
+                    previous_index = previous_index + usize(1);
+                }
+                if (skip == false) {
+                    SystemAllocator name_allocator;
+                    StringBuilder(SystemAllocator) name(name_allocator);
+                    name.append_bytes(source[i32(name_start)..i32(at)]);
+                    String(SystemAllocator) text = finish_string(SystemAllocator, name);
+                    variants.push(variant(text.as_str()));
+                }
+                at = skip_space(source, at, end);
+                if (at >= end || source[at] != u8(61)) {
+                    raise LexerSpecError { line = line, column = at - line_start + usize(1) };
+                }
+                at = skip_space(source, at + usize(1), end);
+                u8 special = u8(0);
+                u8 handler = u8(0);
+                usize pattern_start = at;
+                usize pattern_end = at;
+                if (word_at(source, at, "eof")) {
+                    special = u8(1);
+                    saw_eof = true;
+                    at = at + usize(3);
+                } elif (word_at(source, at, "invalid")) {
+                    special = u8(2);
+                    saw_invalid = true;
+                    at = at + usize(7);
+                } else {
+                    if (word_at(source, at, "handler")) {
+                        at = skip_space(source, at + usize(7), end);
+                        usize handler_start = at;
+                        while (at < end && name_byte(source[at])) { at = at + usize(1); }
+                        handler = handler_code(source, handler_start, at);
+                        at = skip_space(source, at, end);
+                    }
+                    if (at >= end || source[at] != u8(47)) {
+                        raise LexerSpecError { line = line, column = at - line_start + usize(1) };
+                    }
+                    pattern_start = at + usize(1);
+                    at = pattern_start;
+                    bool escaped = false;
+                    bool found = false;
+                    while (at < end && found == false) {
+                        if (escaped) { escaped = false; }
+                        elif (source[at] == u8(92)) { escaped = true; }
+                        elif (source[at] == u8(47)) { found = true; }
+                        if (found == false) { at = at + usize(1); }
+                    }
+                    if (found == false) {
+                        raise LexerSpecError { line = line, column = pattern_start - line_start };
+                    }
+                    pattern_end = at;
+                    at = at + usize(1);
+                }
+                at = skip_space(source, at, end);
+                if (at >= end || source[at] != u8(59)) {
+                    raise LexerSpecError { line = line, column = at - line_start + usize(1) };
+                }
+                previous_index = usize(0);
+                while (special == u8(0) && previous_index < rules.len()) {
+                    &in LexerRule previous = rules.get(previous_index);
+                    if (previous.special == u8(0)) {
+                        if (ranges_equal(
+                            source, pattern_start, pattern_end,
+                            previous.pattern_start, previous.pattern_end
+                        )) {
+                            raise LexerSpecError {
+                                line = line,
+                                column = pattern_start - line_start + usize(1),
+                            };
+                        }
+                    }
+                    previous_index = previous_index + usize(1);
+                }
+                rules.push(LexerRule {
+                    token = token_index,
+                    handler = handler,
+                    skip = skip,
+                    pattern_start = pattern_start,
+                    pattern_end = pattern_end,
+                    name_start = name_start,
+                    name_end = name_end,
+                    line = line,
+                    pattern_column = pattern_start - line_start + usize(1),
+                    special = special,
+                });
+                if (skip == false) { token_index = token_index + u16(1); }
+            }
+            line_start = cursor + usize(1);
+            line = line + usize(1);
+        }
+        cursor = cursor + usize(1);
+    }
+    if (saw_eof == false || saw_invalid == false) {
+        raise LexerSpecError { line = usize(1), column = usize(1) };
+    }
+}
+
+usize add_state(&inout Vector(NfaState, SystemAllocator) states)
+    raises CapacityError, LayoutError, AllocationError
+{
+    usize result = states.len();
+    states.push(NfaState { accept = i32(0) - i32(1) });
+    return result;
+}
+
+void add_edge(
+    &inout Vector(NfaEdge, SystemAllocator) edges,
+    usize from,
+    usize to,
+    u16 byte
+) raises CapacityError, LayoutError, AllocationError {
+    edges.push(NfaEdge { from = from, to = to, byte = byte });
+}
+
+u8 escaped_byte(&in u8[] source, &inout usize position, usize end)
+    raises LexerSpecError
+{
+    if (position >= end) {
+        raise LexerSpecError { line = usize(1), column = position + usize(1) };
+    }
+    u8 value = source[position];
+    position = position + usize(1);
+    if (value == u8(110)) { return u8(10); }
+    if (value == u8(114)) { return u8(13); }
+    if (value == u8(116)) { return u8(9); }
+    return value;
+}
+
+Fragment parse_atom(
+    &in u8[] source,
+    &inout usize position,
+    usize end,
+    &inout Vector(NfaState, SystemAllocator) states,
+    &inout Vector(NfaEdge, SystemAllocator) edges
+) raises LexerSpecError, CapacityError, LayoutError, AllocationError {
+    if (position >= end) {
+        raise LexerSpecError { line = usize(1), column = position + usize(1) };
+    }
+    if (source[position] == u8(40)) {
+        position = position + usize(1);
+        Fragment grouped = parse_alternative(
+            source, position, end, states, edges
+        );
+        if (position >= end || source[position] != u8(41)) {
+            raise LexerSpecError { line = usize(1), column = position + usize(1) };
+        }
+        position = position + usize(1);
+        return grouped;
+    }
+    usize start = add_state(states);
+    usize finish = add_state(states);
+    if (source[position] == u8(91)) {
+        position = position + usize(1);
+        bool[256] included;
+        bool negate = false;
+        if (position < end && source[position] == u8(94)) {
+            negate = true;
+            position = position + usize(1);
+        }
+        bool any = false;
+        while (position < end && source[position] != u8(93)) {
+            u8 first = source[position];
+            position = position + usize(1);
+            if (first == u8(92)) { first = escaped_byte(source, position, end); }
+            u8 last = first;
+            if (position + usize(1) < end && source[position] == u8(45)
+                && source[position + usize(1)] != u8(93)) {
+                position = position + usize(1);
+                last = source[position];
+                position = position + usize(1);
+                if (last == u8(92)) { last = escaped_byte(source, position, end); }
+                if (last < first) {
+                    raise LexerSpecError { line = usize(1), column = position };
+                }
+            }
+            usize byte = usize(first);
+            while (byte <= usize(last)) {
+                included[byte] = true;
+                any = true;
+                byte = byte + usize(1);
+            }
+        }
+        if (position >= end || source[position] != u8(93) || any == false) {
+            raise LexerSpecError { line = usize(1), column = position + usize(1) };
+        }
+        position = position + usize(1);
+        usize byte = usize(0);
+        while (byte < usize(256)) {
+            bool selected = included[byte];
+            if (negate) { selected = selected == false; }
+            if (selected) { add_edge(edges, start, finish, u16(byte)); }
+            byte = byte + usize(1);
+        }
+    } else {
+        u8 value = source[position];
+        position = position + usize(1);
+        if (value == u8(92)) { value = escaped_byte(source, position, end); }
+        add_edge(edges, start, finish, u16(value));
+    }
+    return Fragment { start = start, end = finish };
+}
+
+Fragment parse_repetition(
+    &in u8[] source,
+    &inout usize position,
+    usize end,
+    &inout Vector(NfaState, SystemAllocator) states,
+    &inout Vector(NfaEdge, SystemAllocator) edges
+) raises LexerSpecError, CapacityError, LayoutError, AllocationError {
+    Fragment atom = parse_atom(source, position, end, states, edges);
+    if (position < end) {
+        u8 operator = source[position];
+        if (operator == u8(42) || operator == u8(43) || operator == u8(63)) {
+            position = position + usize(1);
+            usize start = add_state(states);
+            usize finish = add_state(states);
+            add_edge(edges, atom.end, finish, u16(256));
+            if (operator == u8(42) || operator == u8(63)) {
+                add_edge(edges, start, finish, u16(256));
+            }
+            add_edge(edges, start, atom.start, u16(256));
+            if (operator == u8(42) || operator == u8(43)) {
+                add_edge(edges, atom.end, atom.start, u16(256));
+            }
+            return Fragment { start = start, end = finish };
+        }
+    }
+    return atom;
+}
+
+Fragment parse_sequence(
+    &in u8[] source,
+    &inout usize position,
+    usize end,
+    &inout Vector(NfaState, SystemAllocator) states,
+    &inout Vector(NfaEdge, SystemAllocator) edges
+) raises LexerSpecError, CapacityError, LayoutError, AllocationError {
+    bool has_value = false;
+    Fragment result;
+    while (position < end && source[position] != u8(124) && source[position] != u8(41)) {
+        Fragment next = parse_repetition(source, position, end, states, edges);
+        if (has_value) {
+            add_edge(edges, result.end, next.start, u16(256));
+            result.end = next.end;
+        } else {
+            result = next;
+            has_value = true;
+        }
+    }
+    if (has_value == false) {
+        raise LexerSpecError { line = usize(1), column = position + usize(1) };
+    }
+    return result;
+}
+
+Fragment parse_alternative(
+    &in u8[] source,
+    &inout usize position,
+    usize end,
+    &inout Vector(NfaState, SystemAllocator) states,
+    &inout Vector(NfaEdge, SystemAllocator) edges
+) raises LexerSpecError, CapacityError, LayoutError, AllocationError {
+    Fragment first = parse_sequence(source, position, end, states, edges);
+    while (position < end && source[position] == u8(124)) {
+        position = position + usize(1);
+        Fragment right = parse_sequence(source, position, end, states, edges);
+        usize start = add_state(states);
+        usize finish = add_state(states);
+        add_edge(edges, start, first.start, u16(256));
+        add_edge(edges, start, right.start, u16(256));
+        add_edge(edges, first.end, finish, u16(256));
+        add_edge(edges, right.end, finish, u16(256));
+        first = Fragment { start = start, end = finish };
+    }
+    return first;
+}
+
+void set_bool(&inout Vector(bool, SystemAllocator) values, usize index, bool value)
+    raises BoundsError
+{
+    bool previous = values.replace(index, value);
+}
+
+void epsilon_closure(
+    &in Vector(NfaEdge, SystemAllocator) edges,
+    &inout Vector(bool, SystemAllocator) set
+) raises BoundsError {
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        usize edge_index = usize(0);
+        while (edge_index < edges.len()) {
+            &in NfaEdge edge = edges.get(edge_index);
+            if (edge.byte == u16(256) && set.get(edge.from)) {
+                if (set.get(edge.to) == false) {
+                    set_bool(set, edge.to, true);
+                    changed = true;
+                }
+            }
+            edge_index = edge_index + usize(1);
+        }
+    }
+}
+
+bool subset_equal(
+    &in Vector(bool, SystemAllocator) subsets,
+    usize left,
+    &in Vector(bool, SystemAllocator) right,
+    usize count
+) raises BoundsError {
+    usize index = usize(0);
+    while (index < count) {
+        if (subsets.get(left * count + index) != right.get(index)) { return false; }
+        index = index + usize(1);
+    }
+    return true;
+}
+
+pub CompiledLexer compile_lexer(
+    comptime bool generating,
+    &in u8[] source,
+    move SystemAllocator result_allocator,
+    &inout Vector(UnionVariant, SystemAllocator) variants
+) raises LexerSpecError, Utf8Error, CapacityError, LayoutError, AllocationError,
+         BoundsError {
+    SystemAllocator rule_allocator;
+    Vector(LexerRule, SystemAllocator) rules(rule_allocator, usize(0));
+    parse_spec(generating, source, variants, rules);
+
+    SystemAllocator state_allocator;
+    Vector(NfaState, SystemAllocator) states(state_allocator, usize(0));
+    SystemAllocator edge_allocator;
+    Vector(NfaEdge, SystemAllocator) edges(edge_allocator, usize(0));
+    usize root = add_state(states);
+    usize rule_index = usize(0);
+    while (rule_index < rules.len()) {
+        &in LexerRule rule = rules.get(rule_index);
+        if (rule.special == u8(0)) {
+            usize position = rule.pattern_start;
+            Fragment fragment = parse_alternative(
+                source, position, rule.pattern_end, states, edges
+            );
+            if (position != rule.pattern_end) {
+                raise LexerSpecError { line = usize(1), column = position + usize(1) };
+            }
+            SystemAllocator nullable_allocator;
+            Vector(bool, SystemAllocator) nullable(
+                nullable_allocator, states.len()
+            );
+            usize nullable_index = usize(0);
+            while (nullable_index < states.len()) {
+                nullable.push(false);
+                nullable_index = nullable_index + usize(1);
+            }
+            set_bool(nullable, fragment.start, true);
+            epsilon_closure(edges, nullable);
+            if (nullable.get(fragment.end)) {
+                raise LexerSpecError {
+                    line = rule.line,
+                    column = rule.pattern_column,
+                };
+            }
+            add_edge(edges, root, fragment.start, u16(256));
+            NfaState accepted = states.get(fragment.end);
+            accepted.accept = i32(rule_index);
+            NfaState old = states.replace(fragment.end, accepted);
+        }
+        rule_index = rule_index + usize(1);
+    }
+
+    usize nfa_count = states.len();
+    SystemAllocator subset_allocator;
+    Vector(bool, SystemAllocator) subsets(subset_allocator, nfa_count);
+    SystemAllocator work_allocator;
+    Vector(bool, SystemAllocator) work(work_allocator, nfa_count);
+    usize index = usize(0);
+    while (index < nfa_count) {
+        bool active = index == root;
+        work.push(active);
+        index = index + usize(1);
+    }
+    epsilon_closure(edges, work);
+    index = usize(0);
+    while (index < nfa_count) { subsets.push(work.get(index)); index = index + usize(1); }
+
+    SystemAllocator transition_allocator;
+    Vector(u16, SystemAllocator) transitions(transition_allocator, usize(0));
+    SystemAllocator accept_allocator;
+    Vector(u16, SystemAllocator) accepts(accept_allocator, usize(0));
+    SystemAllocator winning_allocator;
+    Vector(bool, SystemAllocator) winning(winning_allocator, rules.len());
+    index = usize(0);
+    while (index < rules.len()) { winning.push(false); index = index + usize(1); }
+    usize dfa_state = usize(0);
+    while (dfa_state * nfa_count < subsets.len()) {
+        i32 accepted_rule = i32(0) - i32(1);
+        index = usize(0);
+        while (index < nfa_count) {
+            if (subsets.get(dfa_state * nfa_count + index)) {
+                &in NfaState candidate_state = states.get(index);
+                i32 candidate = candidate_state.accept;
+                if (candidate >= 0) {
+                    if (accepted_rule < 0 || candidate < accepted_rule) {
+                        accepted_rule = candidate;
+                    }
+                }
+            }
+            index = index + usize(1);
+        }
+        if (accepted_rule < 0) { accepts.push(u16(65535)); }
+        else {
+            accepts.push(u16(accepted_rule));
+            set_bool(winning, usize(accepted_rule), true);
+        }
+
+        bool[256] active_bytes;
+        usize active_edge_index = usize(0);
+        while (active_edge_index < edges.len()) {
+            &in NfaEdge active_edge = edges.get(active_edge_index);
+            if (active_edge.byte < u16(256)) {
+                if (subsets.get(dfa_state * nfa_count + active_edge.from)) {
+                    active_bytes[usize(active_edge.byte)] = true;
+                }
+            }
+            active_edge_index = active_edge_index + usize(1);
+        }
+        usize byte = usize(0);
+        while (byte < usize(256)) {
+            if (active_bytes[byte] == false) {
+                transitions.push(u16(65535));
+            } else {
+                work.clear();
+                index = usize(0);
+                while (index < nfa_count) { work.push(false); index = index + usize(1); }
+                usize edge_index = usize(0);
+                while (edge_index < edges.len()) {
+                    &in NfaEdge edge = edges.get(edge_index);
+                    if (edge.byte == u16(byte)) {
+                        if (subsets.get(dfa_state * nfa_count + edge.from)) {
+                            set_bool(work, edge.to, true);
+                        }
+                    }
+                    edge_index = edge_index + usize(1);
+                }
+                epsilon_closure(edges, work);
+                bool empty = true;
+                index = usize(0);
+                while (index < nfa_count) {
+                    if (work.get(index)) { empty = false; }
+                    index = index + usize(1);
+                }
+                if (empty) {
+                    transitions.push(u16(65535));
+                } else {
+                    usize existing = usize(0);
+                    bool found = false;
+                    usize dfa_count = subsets.len() / nfa_count;
+                    while (existing < dfa_count && found == false) {
+                        if (subset_equal(subsets, existing, work, nfa_count)) { found = true; }
+                        else { existing = existing + usize(1); }
+                    }
+                    if (found == false) {
+                        if (existing >= usize(65535)) {
+                            raise LexerSpecError { line = usize(1), column = usize(1) };
+                        }
+                        index = usize(0);
+                        while (index < nfa_count) {
+                            subsets.push(work.get(index));
+                            index = index + usize(1);
+                        }
+                    }
+                    transitions.push(u16(existing));
+                }
+            }
+            byte = byte + usize(1);
+        }
+        dfa_state = dfa_state + usize(1);
+    }
+    rule_index = usize(0);
+    while (rule_index < rules.len()) {
+        &in LexerRule rule = rules.get(rule_index);
+        if (rule.special == u8(0) && winning.get(rule_index) == false) {
+            raise LexerSpecError {
+                line = rule.line,
+                column = rule.pattern_column,
+            };
+        }
+        rule_index = rule_index + usize(1);
+    }
+    usize rule_count = rules.len();
+    return CompiledLexer {
+        transitions = move transitions,
+        accepts = move accepts,
+        rules = move rules,
+        states = dfa_state,
+        rule_count = rule_count,
+    };
+}
+
+pub LexerTables(States, Rules) freeze_lexer(
+    comptime usize States,
+    comptime usize Rules,
+    comptime bool generating,
+    &in CompiledLexer source
+) raises BoundsError {
+    LexerTables(States, Rules) result;
+    usize index = usize(0);
+    while (index < States * usize(256)) {
+        result.transitions[index] = source.transitions.get(index);
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < States) {
+        result.accepts[index] = source.accepts.get(index);
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < Rules) {
+        &in LexerRule rule = source.rules.get(index);
+        result.rules[index] = FrozenRule {
+            token = rule.token, handler = rule.handler, skip = rule.skip
+        };
+        index = index + usize(1);
+    }
+    return result;
+}

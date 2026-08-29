@@ -15,6 +15,24 @@ class SourceSpan:
     source_path: str | None = field(default=None, compare=False)
 
 
+@dataclass(frozen=True)
+class FrozenArrayValue:
+    elements: tuple[object, ...]
+
+
+@dataclass(frozen=True)
+class FrozenStructValue:
+    type_name: str
+    fields: tuple[tuple[str, object], ...]
+
+
+@dataclass(frozen=True)
+class FrozenUnionValue:
+    type_name: str
+    discriminant: int
+    fields: tuple[object, ...] = ()
+
+
 @dataclass
 class TypeReference:
     name: str

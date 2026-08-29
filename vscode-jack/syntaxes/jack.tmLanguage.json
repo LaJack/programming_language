@@ -375,7 +375,7 @@
         },
         {
           "name": "storage.modifier.jack",
-          "match": "\\b(?:pub|comptime|extern|move|in|out|inout)\\b"
+          "match": "\\b(?:pub|comptime|const|extern|move|in|out|inout)\\b"
         },
         {
           "name": "storage.type.jack",

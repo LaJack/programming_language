@@ -156,8 +156,8 @@ class ParseResult:
 
 
 class Lexer:
-    SYMBOLS = set('{}();,:+-.=<>![]&*?/%')
-    TWO_CHAR_SYMBOLS = {'==', '!=', '<=', '>=', '..', '=>'}
+    SYMBOLS = set('{}();,:+-.=<>![]&|*?/%')
+    TWO_CHAR_SYMBOLS = {'==', '!=', '<=', '>=', '..', '=>', '&&', '||'}
 
     def __init__(self, source: str, source_path: str | Path | None = None) -> None:
         self.source = source
@@ -454,6 +454,7 @@ class Parser:
         'bool',
         'catch',
         'comptime',
+        'const',
         'elif',
         'else',
         'extern',
@@ -536,9 +537,15 @@ class Parser:
             return self._statement()
 
         is_public = self._match_keyword('pub')
+        is_const = self._match_keyword('const')
         is_comptime = self._match_keyword('comptime')
         is_unsafe = self._match_keyword('unsafe')
         is_extern = self._match_keyword('extern')
+        if is_const and (is_comptime or is_unsafe or is_extern):
+            raise self._error(
+                self._previous(),
+                'const declarations use a comptime initializer and cannot be comptime, unsafe, or extern.',
+            )
         extern_abi = self._extern_abi() if is_extern else None
 
         if is_unsafe and self._check('{'):
@@ -549,7 +556,7 @@ class Parser:
             return UnsafeBlock(self._block())
 
         if self._match_keyword('interface'):
-            if is_comptime or is_unsafe or is_extern:
+            if is_const or is_comptime or is_unsafe or is_extern:
                 raise self._error(self._previous(), 'interface cannot be comptime, unsafe, or extern.')
             declaration = self._interface_declaration()
             declaration.public = is_public
@@ -584,7 +591,7 @@ class Parser:
             declaration.public = is_public
             return declaration
         if self._match_keyword('struct'):
-            if is_extern or is_unsafe:
+            if is_const or is_extern or is_unsafe:
                 raise self._error(self._previous(), 'struct cannot be unsafe or extern.')
             declaration = self._type_declaration()
             declaration.comptime = is_comptime
@@ -592,7 +599,7 @@ class Parser:
             return declaration
 
         if self._match_keyword('union'):
-            if is_extern or is_unsafe or is_comptime:
+            if is_const or is_extern or is_unsafe or is_comptime:
                 raise self._error(self._previous(), 'union cannot be comptime, unsafe, or extern.')
             declaration = self._enum_declaration()
             declaration.public = is_public
@@ -629,6 +636,10 @@ class Parser:
                             return declaration
 
                         if self._matching_paren_is_followed_by_function_suffix():
+                            if is_const:
+                                raise self._error(
+                                    self._previous(), 'const can only mark variable declarations.'
+                                )
                             self._advance()
                             declaration = self._finish_function_declaration(
                                 name, declared_type, is_comptime, is_unsafe
@@ -637,6 +648,10 @@ class Parser:
                             return declaration
 
                         self._advance()
+                        if is_const:
+                            raise self._error(
+                                self._previous(), 'Const declarations cannot use constructor syntax.'
+                            )
                         constructor_args = self._finish_argument_list('constructor')
                         self._consume(';', 'Expected ; after constructed variable declaration.')
                         return VariableDeclaration(
@@ -661,16 +676,35 @@ class Parser:
                         )
 
                     initializer = None
+                    comptime_initializer = False
                     if self._match('='):
+                        if is_const:
+                            if not self._match_keyword('comptime'):
+                                raise self._error(
+                                    self._peek(), 'Expected comptime before a const initializer.'
+                                )
+                            comptime_initializer = True
                         initializer = self._expression()
+                    elif is_const:
+                        raise self._error(
+                            self._peek(), 'Const declarations require a comptime initializer.'
+                        )
                     self._consume(';', 'Expected ; after variable declaration.')
                     return VariableDeclaration(
-                        name, declared_type, initializer, comptime=is_comptime, public=is_public
+                        name,
+                        declared_type,
+                        initializer,
+                        comptime=is_comptime,
+                        public=is_public,
+                        constant=is_const,
+                        comptime_initializer=comptime_initializer,
                     )
 
         self.current = start
         if is_public:
             raise self._error(self._peek(), 'pub can only mark declarations.')
+        if is_const:
+            raise self._error(self._peek(), 'const can only mark top-level variable declarations.')
         if is_extern:
             raise self._error(self._peek(), 'extern can only mark type, variable, or function declarations.')
         if is_unsafe:
@@ -1136,7 +1170,11 @@ class Parser:
     def _type_argument(self) -> object:
         if self._check('&') or self._check('*') or self._check('?'):
             return self._type_reference()
-        if self._check_keyword('bool') and self._check_next_type_suffix_or_arguments():
+        if self._check_keyword('bool') and (
+            self._check_next_type_suffix_or_arguments()
+            or self._check_next(',')
+            or self._check_next(')')
+        ):
             return self._type_reference()
         if self._check('IDENT') and (self._check_next('.') or self._check_next_type_suffix_or_arguments()):
             return self._type_reference()
@@ -1371,7 +1409,19 @@ class Parser:
 
     def _expression(self) -> Expression:
         start_token = self._peek()
-        return self._with_span(self._comparison(), start_token)
+        return self._with_span(self._logical_or(), start_token)
+
+    def _logical_or(self) -> Expression:
+        expr = self._logical_and()
+        while self._match('||'):
+            expr = CompositeExpression(expr, self._logical_and(), '||')
+        return expr
+
+    def _logical_and(self) -> Expression:
+        expr = self._comparison()
+        while self._match('&&'):
+            expr = CompositeExpression(expr, self._comparison(), '&&')
+        return expr
 
     def _comparison(self) -> Expression:
         expr = self._addition()

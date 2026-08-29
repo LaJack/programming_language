@@ -114,6 +114,20 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
         }
     }
 
+    T replace(&inout self, usize index, move T value) raises BoundsError {
+        if (index >= self.length) {
+            raise BoundsError { };
+        }
+        unsafe {
+            *inout b8 address = self.allocator.address_mut(self.allocation);
+            *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));
+            &inout MaybeUninit(T) slot = &inout *slots.offset(index);
+            T previous = slot.take();
+            slot.write(value);
+            return previous;
+        }
+    }
+
     T pop(&inout self) raises BoundsError {
         if (self.length == usize(0)) {
             raise BoundsError { };

@@ -991,7 +991,10 @@ class LanguageServer:
                     modifiers.add('extern')
                 if 'comptime ' in symbol.signature:
                     modifiers.add('comptime')
-                if symbol.type_label and symbol.type_label.startswith('&in '):
+                if (
+                    (symbol.type_label and symbol.type_label.startswith('&in '))
+                    or symbol.signature.startswith('const ')
+                ):
                     modifiers.add('readonly')
                 semantic[occurrence.span.start_offset] = (
                     _semantic_symbol_type(symbol), modifiers

@@ -39,6 +39,7 @@ class HIRVariableSymbol(HIRNode):
     abi: str | None = None
     synthetic: bool = False
     passing_mode: str = 'copy'
+    constant: bool = False
 
     @property
     def type(self) -> TypeReference:

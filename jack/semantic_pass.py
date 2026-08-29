@@ -140,6 +140,7 @@ class SymbolInfo:
     can_return_borrow: bool = False
     passing_mode: str = 'copy'
     owned_local: bool = False
+    constant: bool = False
     ownership_key: object = field(default_factory=object, compare=False, repr=False)
 
 
@@ -1116,6 +1117,15 @@ class SemanticPass:
         self, declaration: VariableDeclaration, scope: SemanticScope
     ) -> None:
         self._validate_abi(declaration.abi, f'variable "{declaration.name}"')
+        if declaration.constant:
+            if scope is not self.global_scope:
+                raise SemanticError('Const declarations must be top-level.')
+            if declaration.expr is None or not declaration.comptime_initializer:
+                raise SemanticError(
+                    f'Const declaration "{declaration.name}" requires a comptime initializer.'
+                )
+            if declaration.constructor_args or declaration.extern:
+                raise SemanticError('Const declarations cannot be extern or use constructors.')
         if declaration.extern:
             if scope is not self.global_scope:
                 raise SemanticError(f'Extern variable "{declaration.name}" must be declared at top level.')
@@ -1150,7 +1160,7 @@ class SemanticPass:
 
         borrow_accesses: tuple[BorrowAccess, ...] = ()
         view_borrow_accesses: tuple[ViewBorrowAccess, ...] = ()
-        if declaration.expr is not None:
+        if declaration.expr is not None and not declaration.constant:
             expr_type = self._expression_type_for_target(declaration.expr, declaration.type, scope)
             self._expect_assignable(declaration.type, expr_type, declaration.expr, f'initializer for "{declaration.name}"')
             if self._is_borrow_type(declaration.type):
@@ -1176,6 +1186,7 @@ class SemanticPass:
             view_borrow_accesses=view_borrow_accesses,
             can_return_borrow=scope is self.global_scope,
             owned_local=scope is not self.global_scope and not self._is_borrow_type(declaration.type),
+            constant=declaration.constant,
         )
         scope.declare(declaration.name, info)
         self.ownership_states[info.ownership_key] = 'initialized'
@@ -1187,6 +1198,10 @@ class SemanticPass:
             )
 
     def _validate_assignment(self, assignment: Assignment, scope: SemanticScope) -> None:
+        root = self._assignment_root_name(assignment.name)
+        info = scope.get(root) if root is not None else None
+        if info is not None and info.constant:
+            raise SemanticError(f'Cannot assign to constant "{root}".')
         target_type = self._assignment_target_type(assignment.name, scope)
         if not self._is_borrow_type(target_type):
             write_accesses = self._place_accesses(assignment.name, 'out', scope)
@@ -1201,6 +1216,17 @@ class SemanticPass:
         place = self._ownership_place(assignment.name, scope, require_static_index=False)
         if place is not None:
             self._set_place_state(place, 'initialized')
+
+    def _assignment_root_name(self, target: str | Expression) -> str | None:
+        if isinstance(target, str):
+            return target.split('.', 1)[0]
+        if type(target) is VariableExpression:
+            return target.name.split('.', 1)[0]
+        if type(target) is IndexExpression:
+            return self._assignment_root_name(target.target)
+        if type(target) is DereferenceExpression:
+            return None
+        return None
 
     def _require_initialized(self, name: str, scope: SemanticScope) -> None:
         place = self._ownership_place(name, scope, require_static_index=False)
@@ -1598,6 +1624,9 @@ class SemanticPass:
                     'compile-time fixed-array index.'
                 )
             _, root, projections = place
+            root_info = scope.get(root)
+            if root_info is not None and root_info.constant:
+                raise SemanticError(f'Cannot move constant "{root}".')
             if root == 'self' and not projections and self.current_deinit_owner is None:
                 raise SemanticError(
                     'Only a consuming destructor may move its complete self value.'
@@ -1674,6 +1703,16 @@ class SemanticPass:
         if type(expression) is SliceExpression:
             return self._slice_type(expression, scope)
         if type(expression) is BorrowExpression:
+            root = self._assignment_root_name(expression.expr)
+            info = scope.get(root) if root is not None else None
+            if (
+                info is not None
+                and info.constant
+                and borrow_mode_can_write(expression.mode)
+            ):
+                raise SemanticError(
+                    f'Cannot create writable borrow of constant "{root}".'
+                )
             inner_type = self._borrow_target_type(expression.expr, scope)
             if expression.mode not in BORROW_MODES:
                 raise SemanticError(f'Unknown borrow mode "{expression.mode}".')
@@ -1860,6 +1899,13 @@ class SemanticPass:
         right_type = self._expression_value_type(expression.right, scope)
         left_name = self._type_name(left_type)
         right_name = self._type_name(right_type)
+
+        if expression.operator in {'&&', '||'}:
+            if left_name != 'bool' or right_name != 'bool':
+                raise SemanticError(
+                    f'Logical operator "{expression.operator}" requires bool operands.'
+                )
+            return TypeReference('bool')
 
         if expression.operator in {'==', '!='} and (
             left_name == 'null' or right_name == 'null'
@@ -2737,9 +2783,15 @@ class SemanticPass:
         self, target: str | Expression, scope: SemanticScope
     ) -> TypeReference:
         if type(target) is str:
-            return self._resolve_name_type(target, scope)
+            resolved = self._resolve_name_type(target, scope)
+            if self._is_borrow_type(resolved) and not self._is_slice_type(resolved):
+                return self._element_type(resolved)
+            return resolved
         if type(target) is VariableExpression:
-            return self._resolve_name_type(target.name, scope)
+            resolved = self._resolve_name_type(target.name, scope)
+            if self._is_borrow_type(resolved) and not self._is_slice_type(resolved):
+                return self._element_type(resolved)
+            return resolved
         if type(target) is IndexExpression:
             index_type = self._expression_value_type(target.index, scope)
             if not self._is_integer_type(index_type):

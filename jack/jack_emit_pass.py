@@ -280,12 +280,15 @@ class JackEmitPass:
 
     def _variable_declaration(self, declaration: VariableDeclaration) -> str:
         prefix = self._declaration_prefix(declaration)
+        if declaration.constant:
+            prefix += 'const '
         source = f'{prefix}{self._type_reference(declaration.type)} {declaration.name}'
         if declaration.constructor_args:
             args = ', '.join(self._expression(argument) for argument in declaration.constructor_args)
             return f'{source}({args})'
         if declaration.expr is not None:
-            return f'{source} = {self._expression(declaration.expr)}'
+            marker = 'comptime ' if declaration.comptime_initializer else ''
+            return f'{source} = {marker}{self._expression(declaration.expr)}'
         return source
 
     def _field_declaration(self, declaration: VariableDeclaration) -> str:

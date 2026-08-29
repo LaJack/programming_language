@@ -6,6 +6,7 @@ try:
         Assignment,
         BorrowExpression,
         CompositeExpression,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -36,6 +37,7 @@ except ImportError:
         Assignment,
         BorrowExpression,
         CompositeExpression,
+        EnumVariantExpression,
         Expression,
         FormattedStringExpression,
         For,
@@ -183,6 +185,10 @@ class ExecutionEngine(Generic[Value, Scope]):
             return self._eval_literal(expression, scope)
         if type(expression) is CompositeExpression:
             left = self._eval_expression(expression.left, scope)
+            if expression.operator == '&&' and not self._is_truthy(left):
+                return left
+            if expression.operator == '||' and self._is_truthy(left):
+                return left
             right = self._eval_expression(expression.right, scope)
             return self._eval_composite_operator(expression.operator, left, right)
         if type(expression) is VariableExpression:
@@ -201,6 +207,8 @@ class ExecutionEngine(Generic[Value, Scope]):
             return self._eval_slice(expression, scope)
         if type(expression) is StructLiteralExpression:
             return self._eval_struct_literal(expression, scope)
+        if type(expression) is EnumVariantExpression:
+            return self._eval_enum_variant(expression, scope)
         self._unknown_expression(expression)
 
     def _eval_return(self, statement: Return, scope: Scope) -> Value:
@@ -268,6 +276,11 @@ class ExecutionEngine(Generic[Value, Scope]):
 
     def _eval_struct_literal(
         self, expression: StructLiteralExpression, scope: Scope
+    ) -> Value:
+        raise NotImplementedError
+
+    def _eval_enum_variant(
+        self, expression: EnumVariantExpression, scope: Scope
     ) -> Value:
         raise NotImplementedError
 

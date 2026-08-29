@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import struct
 
 import sys
 from dataclasses import dataclass, fields, is_dataclass
@@ -61,7 +62,13 @@ from .llvm_ir import (
     LLVMModule,
     quoted,
 )
-from .source_model import SourceSpan, TypeReference
+from .source_model import (
+    FrozenArrayValue,
+    FrozenStructValue,
+    FrozenUnionValue,
+    SourceSpan,
+    TypeReference,
+)
 
 
 class LLVMLoweringError(Exception):
@@ -368,8 +375,112 @@ class LLVMLoweringPass:
             type_name = self._type(symbol.type_ref)
             if symbol.extern:
                 self.module.globals.append(f'{name} = external global {type_name}')
+            elif symbol.constant:
+                if not isinstance(declaration.initializer, HIRLiteralExpression):
+                    raise LLVMLoweringError('Const globals require a folded literal initializer.')
+                initializer = self._llvm_frozen_constant(
+                    declaration.initializer.value, symbol.type_ref
+                )
+                self.module.globals.append(f'{name} = constant {type_name} {initializer}')
             else:
                 self.module.globals.append(f'{name} = global {type_name} zeroinitializer')
+
+    def _llvm_frozen_constant(self, value: object, type_ref: TypeReference) -> str:
+        if isinstance(value, FrozenArrayValue):
+            element_type = self._element_type(type_ref)
+            llvm_type = self._type(element_type)
+            return '[' + ', '.join(
+                f'{llvm_type} {self._llvm_frozen_constant(element, element_type)}'
+                for element in value.elements
+            ) + ']'
+        if isinstance(value, FrozenStructValue):
+            declaration = self.types.get(type_ref.name)
+            if declaration is None:
+                raise LLVMLoweringError(f'Unknown const struct type "{type_ref.name}".')
+            fields = dict(value.fields)
+            return '{ ' + ', '.join(
+                f'{self._type(field.type_ref)} '
+                f'{self._llvm_frozen_constant(fields[field.name], field.type_ref)}'
+                for field in declaration.fields
+            ) + ' }'
+        if isinstance(value, FrozenUnionValue):
+            declaration = self.types.get(type_ref.name)
+            if not isinstance(declaration, HIREnumDeclaration):
+                raise LLVMLoweringError(f'Unknown const union type "{type_ref.name}".')
+            payload_size, payload_align = self._enum_payload_layout(declaration)
+            scalar = {1: 'i8', 2: 'i16', 4: 'i32', 8: 'i64'}[payload_align]
+            carrier = (
+                f'{{ {scalar}, [{max(payload_size - payload_align, 0)} x i8] }}'
+            )
+            payload = bytearray(payload_size)
+            variant = declaration.variants[value.discriminant]
+            offset = 0
+            for field, frozen_value in zip(variant.fields, value.fields):
+                size, alignment = self._abi_size_align(field.type_ref)
+                offset = self._align_to(offset, alignment)
+                encoded = self._frozen_bytes(
+                    frozen_value, field.type_ref
+                )
+                payload[offset:offset + size] = encoded[:size]
+                offset += size
+            first = int.from_bytes(payload[:payload_align], sys.byteorder)
+            remaining = payload[payload_align:]
+            tail = '[' + ', '.join(f'i8 {byte}' for byte in remaining) + ']'
+            payload_constant = f'{{ {scalar} {first}, [{len(remaining)} x i8] {tail} }}'
+            return f'{{ i32 {value.discriminant}, {carrier} {payload_constant} }}'
+        if type_ref.name == 'bool':
+            return 'true' if value else 'false'
+        if type_ref.name in {'f32', 'f64'}:
+            return str(float(value))
+        return str(int(value))
+
+    def _frozen_bytes(self, value: object, type_ref: TypeReference) -> bytes:
+        size, _ = self._abi_size_align(type_ref)
+        if isinstance(value, FrozenArrayValue):
+            element_type = self._element_type(type_ref)
+            element_size, element_align = self._abi_size_align(element_type)
+            stride = self._align_to(element_size, element_align)
+            result = bytearray(size)
+            for index, element in enumerate(value.elements):
+                encoded = self._frozen_bytes(element, element_type)
+                start = index * stride
+                result[start:start + element_size] = encoded[:element_size]
+            return bytes(result)
+        if isinstance(value, FrozenStructValue):
+            declaration = self.types[type_ref.name]
+            frozen_fields = dict(value.fields)
+            result = bytearray(size)
+            offset = 0
+            for field in declaration.fields:
+                field_size, field_align = self._abi_size_align(field.type_ref)
+                offset = self._align_to(offset, field_align)
+                encoded = self._frozen_bytes(frozen_fields[field.name], field.type_ref)
+                result[offset:offset + field_size] = encoded[:field_size]
+                offset += field_size
+            return bytes(result)
+        if isinstance(value, FrozenUnionValue):
+            declaration = self.types[type_ref.name]
+            assert isinstance(declaration, HIREnumDeclaration)
+            payload_size, payload_align = self._enum_payload_layout(declaration)
+            result = bytearray(size)
+            result[:4] = int(value.discriminant).to_bytes(4, sys.byteorder)
+            payload_offset = self._align_to(4, payload_align)
+            variant = declaration.variants[value.discriminant]
+            offset = 0
+            for field, frozen_value in zip(variant.fields, value.fields):
+                field_size, field_align = self._abi_size_align(field.type_ref)
+                offset = self._align_to(offset, field_align)
+                encoded = self._frozen_bytes(frozen_value, field.type_ref)
+                result[payload_offset + offset:payload_offset + offset + field_size] = encoded[:field_size]
+                offset += field_size
+            return bytes(result)
+        if type_ref.name == 'bool':
+            return bytes((1 if value else 0,))
+        if type_ref.name in {'f32', 'f64'}:
+            return struct.pack('=f' if type_ref.name == 'f32' else '=d', float(value))
+        spec = BUILTIN_TYPE_SPECS[type_ref.name]
+        signed = spec.family in {'signed', 'endian_signed'}
+        return int(value).to_bytes(size, sys.byteorder, signed=signed)
 
     def _declare_functions(self, program: HIRProgram) -> None:
         declarations: list[tuple[HIRFunctionDeclaration, str | None]] = []
@@ -469,8 +580,12 @@ class LLVMLoweringPass:
             previous_span = builder.current_span
             builder.current_span = statement.span or previous_span
             if isinstance(statement, HIRGlobalVariable):
-                if statement.initializer is not None:
-                    value = self._expression(statement.initializer, builder.env)
+                if statement.initializer is not None and not statement.symbol.constant:
+                    value = (
+                        self._borrow_argument(statement.initializer, builder.env)
+                        if statement.symbol.type_ref.borrow is not None
+                        else self._expression(statement.initializer, builder.env)
+                    )
                     value = self._coerce(value, statement.symbol.type_ref)
                     pointer, _ = builder.env[statement.symbol.name]
                     builder.emit(f'store {value.type_name} {value.operand}, ptr {pointer}')
@@ -489,7 +604,11 @@ class LLVMLoweringPass:
             )
         if not builder.terminated:
             for declaration in reversed(program.declarations):
-                if not isinstance(declaration, HIRGlobalVariable) or declaration.symbol.extern:
+                if (
+                    not isinstance(declaration, HIRGlobalVariable)
+                    or declaration.symbol.extern
+                    or declaration.symbol.constant
+                ):
                     continue
                 type_declaration = self.types.get(declaration.symbol.type_ref.name)
                 self._emit_global_deinit_value(
@@ -624,7 +743,11 @@ class LLVMLoweringPass:
                     statement.symbol.span or statement.span,
                 )
             if statement.initializer is not None:
-                value = self._expression(statement.initializer, env)
+                value = (
+                    self._borrow_argument(statement.initializer, env)
+                    if statement.symbol.type_ref.borrow is not None
+                    else self._expression(statement.initializer, env)
+                )
                 value = self._coerce(value, statement.symbol.type_ref)
                 self._b.emit(f'store {type_name} {value.operand}, ptr {slot}')
             if statement.constructor_call is not None:
@@ -632,7 +755,11 @@ class LLVMLoweringPass:
             return
         if isinstance(statement, HIRAssignment):
             pointer, _ = self._lvalue(statement.target, env)
-            value = self._expression(statement.expr, env)
+            value = (
+                self._borrow_argument(statement.expr, env)
+                if statement.target_type.borrow is not None
+                else self._expression(statement.expr, env)
+            )
             value = self._coerce(value, statement.target_type)
             self._b.emit(f'store {self._type(statement.target_type)} {value.operand}, ptr {pointer}')
             return
@@ -1076,6 +1203,17 @@ class LLVMLoweringPass:
                 self._b.emit(f'{pointer} = getelementptr {self._type(element_type)}, ptr {target_ptr}, i64 {index_operand}')
             return pointer, element_type
         if isinstance(expression, HIRDereferenceExpression):
+            if isinstance(expression.expr, HIRVariableExpression):
+                storage, source_type = env[expression.expr.name]
+                if (
+                    source_type.borrow is not None
+                    and source_type.name not in self.views
+                    and not self._is_slice(source_type)
+                    and source_type.array_size is None
+                ):
+                    pointer = self._b.temp('borrow.ptr')
+                    self._b.emit(f'{pointer} = load ptr, ptr {storage}')
+                    return pointer, expression.type_ref
             pointer = self._expression(expression.expr, env)
             return pointer.operand, expression.type_ref
         raise LLVMLoweringError(
@@ -1114,9 +1252,31 @@ class LLVMLoweringPass:
 
     def _composite(self, expression: HIRCompositeExpression, env) -> LLVMValue:
         left = self._expression(expression.left, env)
-        right = self._expression(expression.right, env)
         operator = expression.operator
         result_type = self._type(expression.type_ref)
+        if operator in {'&&', '||'}:
+            result_slot = self._b.alloca('i1', 'logical.result')
+            short_value = 'false' if operator == '&&' else 'true'
+            self._b.emit(f'store i1 {short_value}, ptr {result_slot}')
+            right_label = self._b.label('logical.right')
+            merge_label = self._b.label('logical.merge')
+            if operator == '&&':
+                self._b.terminate(
+                    f'br i1 {left.operand}, label %{right_label}, label %{merge_label}'
+                )
+            else:
+                self._b.terminate(
+                    f'br i1 {left.operand}, label %{merge_label}, label %{right_label}'
+                )
+            self._b.start(right_label)
+            right = self._expression(expression.right, env)
+            self._b.emit(f'store i1 {right.operand}, ptr {result_slot}')
+            self._b.branch(merge_label)
+            self._b.start(merge_label)
+            result = self._b.temp('logical')
+            self._b.emit(f'{result} = load i1, ptr {result_slot}')
+            return LLVMValue(result_type, result, expression.type_ref)
+        right = self._expression(expression.right, env)
         left_name = expression.left.type_ref.name
         if left_name == 'str':
             return self._string_compare(left, right, operator, expression.type_ref)
@@ -1145,7 +1305,9 @@ class LLVMLoweringPass:
         self._b.emit(f'{value} = {instruction} {left.type_name} {left.operand}, {right.operand}')
         return LLVMValue(result_type, value, expression.type_ref)
 
-    def _call(self, call: HIRCallExpression, env) -> LLVMValue:
+    def _call(
+        self, call: HIRCallExpression, env, *, read_borrow: bool = True
+    ) -> LLVMValue:
         if call.target.kind == 'len':
             return self._len(call, env)
         if call.target.kind == 'builtin_conversion':
@@ -1174,7 +1336,8 @@ class LLVMLoweringPass:
         name = call.target.name
         candidate = self._inline_candidate(call)
         if candidate is not None:
-            return self._inline_call(call, candidate, arguments)
+            value = self._inline_call(call, candidate, arguments)
+            return self._read_call_borrow(call, value) if read_borrow else value
         args = ', '.join(f'{argument.type_name} {argument.operand}' for argument in arguments)
         return_type = self._function_call_return_type(call)
         if return_type == 'void':
@@ -1183,8 +1346,26 @@ class LLVMLoweringPass:
         result = self._b.temp('call')
         self._b.emit(f'{result} = call {return_type} @{quoted(name)}({args})')
         if call.target.raises:
-            return self._unwrap_call(call, result, return_type)
-        return LLVMValue(self._type(call.type_ref), result, call.type_ref)
+            value = self._unwrap_call(call, result, return_type)
+            return self._read_call_borrow(call, value) if read_borrow else value
+        value = LLVMValue(self._type(call.type_ref), result, call.type_ref)
+        return self._read_call_borrow(call, value) if read_borrow else value
+
+    def _read_call_borrow(
+        self, call: HIRCallExpression, value: LLVMValue
+    ) -> LLVMValue:
+        if (
+            call.type_ref.borrow is None
+            or call.type_ref.name in self.views
+            or self._is_slice(call.type_ref)
+            or call.type_ref.array_size is not None
+            or call.read_type is None
+        ):
+            return value
+        read_type = self._type(call.read_type)
+        loaded = self._b.temp('call.borrowed')
+        self._b.emit(f'{loaded} = load {read_type}, ptr {value.operand}')
+        return LLVMValue(read_type, loaded, call.read_type)
 
     def _inline_candidate(self, call: HIRCallExpression) -> InlineCandidate | None:
         if (
@@ -1306,6 +1487,8 @@ class LLVMLoweringPass:
             value = self._b.temp('borrow')
             self._b.emit(f'{value} = load {type_name}, ptr {slot}')
             return LLVMValue(type_name, value, type_ref)
+        if isinstance(expression, HIRCallExpression):
+            return self._call(expression, env, read_borrow=False)
         return self._expression(expression, env)
 
     def _slice(self, expression: HIRSliceExpression, env, mutable: bool) -> LLVMValue:

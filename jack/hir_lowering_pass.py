@@ -785,15 +785,22 @@ class HIRLoweringPass(SemanticPass):
     def _variable_declaration(
         self, declaration: VariableDeclaration, scope: SemanticScope, top_level: bool
     ) -> HIRVariableDeclaration:
-        initializer = (
-            None
-            if declaration.expr is None
-            else self._maybe_custom_copy(
+        if declaration.expr is None:
+            initializer = None
+        elif declaration.constant and type(declaration.expr) is LiteralExpression:
+            initializer = HIRLiteralExpression(
+                value=copy.deepcopy(declaration.expr.value),
+                literal_type=self._type_name(declaration.type),
+                type_ref=self._copy_type(declaration.type),
+                read_type=self._read_type(declaration.type),
+                span=declaration.expr.span,
+            )
+        else:
+            initializer = self._maybe_custom_copy(
                 self._expression(declaration.expr, scope),
                 declaration.type,
                 declaration.expr,
             )
-        )
         symbol = self._symbol(declaration)
         if not top_level:
             scope.declare(
@@ -845,7 +852,20 @@ class HIRLoweringPass(SemanticPass):
         self, target: str | Expression, scope: SemanticScope, span: SourceSpan | None
     ) -> HIRExpression:
         if type(target) is str:
-            return self._name_expression(target, scope, span)
+            expression = self._name_expression(target, scope, span)
+            if (
+                expression.type_ref.borrow is not None
+                and not expression.type_ref.is_slice
+                and expression.type_ref.array_size is None
+            ):
+                element_type = self._element_type(expression.type_ref)
+                return HIRDereferenceExpression(
+                    expr=expression,
+                    type_ref=element_type,
+                    read_type=self._read_type(element_type),
+                    span=span,
+                )
+            return expression
         return self._expression(target, scope)
 
     def _if_statement(self, statement: If, scope: SemanticScope) -> HIRIf:
@@ -1641,6 +1661,7 @@ class HIRLoweringPass(SemanticPass):
             extern=declaration.extern,
             abi=declaration.abi,
             passing_mode=declaration.passing_mode,
+            constant=declaration.constant,
             span=declaration.span,
         )
 

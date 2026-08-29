@@ -436,6 +436,22 @@ successfully opened files become compiler dependencies. Creation, append,
 read-write access, and output streams are rejected during comptime evaluation.
 Live editor analysis defers host IO until a saved or explicit full analysis.
 
+### Immutable Runtime Constants
+
+`const` materializes a comptime result as an immutable runtime global:
+
+```jack
+pub const u16[4] transition = comptime build_transition();
+```
+
+The declaration requires an explicit fixed-layout type and a `comptime`
+initializer. Numeric and boolean primitives, raw bytes, fixed arrays, structs,
+and unions composed from those values may be materialized. Strings, slices,
+borrows, pointers, allocator tokens, metadata handles, and resource-owning
+values may not escape comptime storage. Constants may be read or borrowed with
+`&in`, but cannot be assigned, moved, or mutably borrowed. Native backends emit
+them in read-only storage.
+
 ## Tagged Unions And Matching
 
 Unions are nominal and tagged. Variants are declared in source order and may

@@ -62,6 +62,7 @@ try:
         While,
     )
     from .execution import ExecutionEngine
+    from .source_model import FrozenArrayValue, FrozenStructValue, FrozenUnionValue
 except ImportError:
     from borrow_modes import borrow_mode_can_write, borrow_mode_compatible
     from builtin_types import (
@@ -120,6 +121,7 @@ except ImportError:
         While,
     )
     from execution import ExecutionEngine
+    from source_model import FrozenArrayValue, FrozenStructValue, FrozenUnionValue
 
 
 class CompileTimeError(Exception):
@@ -165,6 +167,14 @@ class ComptimeOpaqueValue:
 class ComptimeArrayValue:
     element_type: TypeReference
     elements: list[LiteralExpression]
+
+
+@dataclass
+class ComptimeEnumValue:
+    type_ref: TypeReference
+    variant_name: str
+    discriminant: int
+    fields: list[LiteralExpression]
 
 
 @dataclass(frozen=True)
@@ -284,6 +294,7 @@ class CompileTimeScope:
     def __init__(self, parent: "CompileTimeScope | None" = None) -> None:
         self.parent = parent
         self.variables: dict[str, LiteralExpression] = {}
+        self.runtime_constants: set[str] = set()
 
     def declare(self, name: str, value: LiteralExpression) -> None:
         if "." in name:
@@ -291,6 +302,15 @@ class CompileTimeScope:
         if name in self.variables:
             raise CompileTimeError(f'Comptime variable "{name}" is already declared in this scope.')
         self.variables[name] = value
+
+    def declare_runtime_constant(self, name: str, value: LiteralExpression) -> None:
+        self.declare(name, value)
+        self.runtime_constants.add(name)
+
+    def is_runtime_constant(self, name: str) -> bool:
+        root = name.split('.', 1)[0]
+        scope = self._scope_containing(root)
+        return scope is not None and root in scope.runtime_constants
 
     def assign(self, name: str, value: LiteralExpression) -> bool:
         parts = name.split('.')
@@ -338,6 +358,8 @@ class CompileTimeScope:
     def _field_value(
         self, value: LiteralExpression, field_name: str, current_path: str
     ) -> LiteralExpression:
+        if isinstance(value.value, ComptimeBorrowValue):
+            value = value.value.element_cell(0)
         struct_value = self._struct_value(value, current_path)
         if field_name not in struct_value.fields:
             raise CompileTimeError(
@@ -839,6 +861,29 @@ class CompileTimePass:
             )
         if declaration.comptime and self._is_type_type(runtime_type):
             return self._apply_computed_type_declaration(declaration, scope)
+        if declaration.constant:
+            if not declaration.comptime_initializer or declaration.expr is None:
+                raise CompileTimeError(
+                    f'Const declaration "{declaration.name}" requires a comptime initializer.'
+                )
+            if declaration.constructor_args:
+                raise CompileTimeError('Const declarations cannot use constructor syntax.')
+            value = self._eval_comptime_expression(declaration.expr, scope)
+            value = LiteralExpression(
+                self._cast_comptime(value.value, runtime_type, source_type=value.type),
+                self._type_name(runtime_type),
+            )
+            frozen = self._freeze_runtime_constant(value, runtime_type)
+            scope.declare_runtime_constant(declaration.name, copy.deepcopy(value))
+            return [VariableDeclaration(
+                declaration.name,
+                runtime_type,
+                LiteralExpression(frozen, self._type_name(runtime_type)),
+                public=declaration.public,
+                constant=True,
+                comptime_initializer=True,
+                span=declaration.span,
+            )]
         if declaration.comptime:
             if declaration.expr is None:
                 value = self._default_literal(runtime_type, scope)
@@ -879,6 +924,67 @@ class CompileTimePass:
                 declaration.name, runtime_type, expr, public=declaration.public
             ),
         ]
+
+    def _freeze_runtime_constant(
+        self, value: LiteralExpression, type_ref: TypeReference
+    ) -> object:
+        if (
+            type_ref.borrow is not None
+            or type_ref.pointer_mode is not None
+            or type_ref.is_slice
+            or type_ref.name == 'str'
+        ):
+            raise CompileTimeError(
+                f'Const type "{self._type_name(type_ref)}" is not fixed-layout materializable.'
+            )
+        if type_ref.array_size is not None:
+            if not isinstance(value.value, ComptimeArrayValue):
+                raise CompileTimeError('Const array initializer did not produce an array value.')
+            element_type = self._element_type(type_ref)
+            return FrozenArrayValue(tuple(
+                self._freeze_runtime_constant(element, element_type)
+                for element in value.value.elements
+            ))
+        if is_builtin_type(type_ref.name):
+            return copy.deepcopy(value.value)
+        declaration = self.types.get(type_ref.name)
+        if type(declaration) is TypeDeclaration:
+            if declaration.extern or any(
+                (method.source_name or method.name) == 'deinit'
+                for method in declaration.methods
+            ):
+                raise CompileTimeError(
+                    f'Const type "{self._type_name(type_ref)}" owns a runtime resource.'
+                )
+            if not isinstance(value.value, ComptimeStructValue):
+                raise CompileTimeError(
+                    f'Const initializer for "{self._type_name(type_ref)}" did not produce a struct value.'
+                )
+            fields = []
+            for field in declaration.fields:
+                field_value = value.value.fields[field.name]
+                fields.append((
+                    field.name,
+                    self._freeze_runtime_constant(field_value, field.type),
+                ))
+            return FrozenStructValue(type_ref.name, tuple(fields))
+        if type(declaration) is EnumDeclaration:
+            if not isinstance(value.value, ComptimeEnumValue):
+                raise CompileTimeError(
+                    'Comptime union values are not materializable in this initializer.'
+                )
+            variant = declaration.variants[value.value.discriminant]
+            return FrozenUnionValue(
+                type_ref.name,
+                value.value.discriminant,
+                tuple(
+                    self._freeze_runtime_constant(item, parameter.type)
+                    for item, parameter in zip(value.value.fields, variant.parameters)
+                ),
+            )
+        raise CompileTimeError(
+            f'Const type "{self._type_name(type_ref)}" is not fixed-layout materializable.'
+        )
 
     def _apply_computed_type_declaration(
         self, declaration: VariableDeclaration, scope: CompileTimeScope
@@ -974,7 +1080,7 @@ class CompileTimePass:
             char.isalnum() or char == '_' for char in name
         ):
             raise CompileTimeError(f'Generated {role} name "{name}" is not a valid Jack identifier.')
-        if name in {'as', 'catch', 'comptime', 'else', 'extern', 'false', 'for', 'if',
+        if name in {'as', 'catch', 'comptime', 'const', 'else', 'extern', 'false', 'for', 'if',
                     'implements', 'import', 'in', 'inout', 'interface', 'match', 'module',
                     'move', 'out', 'print', 'pub', 'raise', 'raises', 'rethrow', 'return',
                     'struct', 'true', 'try', 'union', 'unsafe', 'use', 'view', 'while'}:
@@ -990,6 +1096,10 @@ class CompileTimePass:
             return []
 
         if type(assignment.name) is str:
+            if scope.is_runtime_constant(assignment.name):
+                raise CompileTimeError(
+                    f'Cannot assign constant "{assignment.name.split(".", 1)[0]}".'
+                )
             if scope.contains(assignment.name):
                 raise CompileTimeError(
                     f'Assignment to comptime variable "{assignment.name}" must be marked comptime.'
@@ -1333,6 +1443,8 @@ class CompileTimePass:
                     return [], resolved
             value = scope.get(expression.name)
             if value is not None:
+                if scope.is_runtime_constant(expression.name):
+                    return [], copy.deepcopy(expression)
                 if value.type == 'type':
                     raise CompileTimeError(f'Cannot use type "{expression.name}" as a runtime value.')
                 if self._is_comptime_struct_literal(value):
@@ -1630,6 +1742,8 @@ class CompileTimePass:
             return None
 
         receiver_name, method_name = call.function_name.rsplit('.', 1)
+        if scope.is_runtime_constant(receiver_name.split('.', 1)[0]):
+            return None
         receiver = scope.get(receiver_name)
         if receiver is None:
             return None
@@ -2025,6 +2139,8 @@ class CompileTimePass:
     ) -> Expression | None:
         if expression is None:
             return None
+        if self._expression_has_comptime_root(expression, scope):
+            return self._eval_comptime_expression(expression, scope)
         prelude, lowered = self._apply_expression(expression, scope)
         if prelude:
             raise CompileTimeError('Function specialization inside array sizes is not implemented yet.')
@@ -2104,6 +2220,18 @@ class CompileTimePass:
             return self._eval_comptime_len_function_call(call, scope)
         if is_builtin_type(call.function_name):
             return self._eval_comptime_builtin_conversion(call, scope)
+        if '.' in call.function_name:
+            type_name, variant_name = call.function_name.rsplit('.', 1)
+            declaration = self.types.get(type_name)
+            if isinstance(declaration, EnumDeclaration) and any(
+                variant.name == variant_name for variant in declaration.variants
+            ):
+                return self.executor._eval_enum_variant(
+                    EnumVariantExpression(
+                        TypeReference(type_name), variant_name, list(call.parameters)
+                    ),
+                    scope,
+                )
 
         declaration = self.functions.get(call.function_name)
         if declaration is None:
@@ -2385,6 +2513,18 @@ class CompileTimePass:
     def _eval_comptime_extern_function_call(
         self, declaration: FunctionDeclaration, call: FunctionCall, scope: CompileTimeScope
     ) -> LiteralExpression:
+        if (declaration.source_name or declaration.name) == 'jack_str_byte':
+            if len(call.parameters) != 2:
+                raise CompileTimeError('jack_str_byte expects two arguments.')
+            text = self._eval_comptime_expression(call.parameters[0], scope)
+            index = self._eval_comptime_expression(call.parameters[1], scope)
+            if type(text.value) is not str:
+                raise CompileTimeError('jack_str_byte expects a comptime str.')
+            data = text.value.encode('utf-8')
+            offset = int(index.value)
+            if offset < 0 or offset >= len(data):
+                raise CompileTimeError('jack_str_byte index is out of bounds.')
+            return LiteralExpression(data[offset], 'u8')
         handler = self.comptime_externs.get(declaration.name)
         if not declaration.comptime:
             if declaration.abi != 'c':
@@ -2474,6 +2614,16 @@ class CompileTimePass:
             return self._eval_comptime_function_call(call, scope)
 
         receiver_name, method_name = call.function_name.rsplit('.', 1)
+        declaration = self.types.get(receiver_name)
+        if isinstance(declaration, EnumDeclaration) and any(
+            variant.name == method_name for variant in declaration.variants
+        ):
+            return self.executor._eval_enum_variant(
+                EnumVariantExpression(
+                    TypeReference(receiver_name), method_name, list(call.parameters)
+                ),
+                scope,
+            )
         receiver = scope.get(receiver_name)
         if receiver is None:
             raise CompileTimeError(f'Unknown comptime receiver "{receiver_name}".')
@@ -2598,6 +2748,22 @@ class CompileTimePass:
                 ComptimeBorrowValue(type_ref, False, cell=vector.elements[index]),
                 self._type_name(type_ref),
             )
+        if method_name == 'replace':
+            if len(arguments) != 2:
+                raise CompileTimeError('Vector.replace expects index and value.')
+            index = int(self._eval_comptime_expression(arguments[0], scope).value)
+            if index < 0 or index >= len(vector.elements):
+                self._raise_comptime_simple_error('BoundsError')
+            value = self._eval_comptime_expression(arguments[1], scope)
+            replacement = LiteralExpression(
+                self._cast_comptime(
+                    value.value, vector.element_type, source_type=value.type
+                ),
+                self._type_name(vector.element_type),
+            )
+            previous = vector.elements[index]
+            vector.elements[index] = replacement
+            return previous
         if method_name == 'pop':
             if not vector.elements:
                 self._raise_comptime_simple_error('BoundsError')
@@ -2744,6 +2910,12 @@ class CompileTimePass:
         raise CompileTimeError(f'Unknown comptime comparison operator "{operator}".')
 
     def _is_truthy(self, value: LiteralExpression) -> bool:
+        if (
+            isinstance(value.value, ComptimeBorrowValue)
+            and value.value.array is None
+            and value.value.cell is not None
+        ):
+            value = value.value.cell
         if is_bool_type(value.type):
             return bool(value.value)
         raise CompileTimeError(f'Cannot use comptime value of type "{value.type}" as a condition.')
@@ -2875,6 +3047,18 @@ class CompileTimePass:
         source_type: str | None = None,
         memory_raw: bool = False,
     ) -> object:
+        if (
+            isinstance(value, ComptimeBorrowValue)
+            and value.array is None
+            and value.cell is not None
+            and type_ref.borrow is None
+        ):
+            return self._cast_comptime(
+                value.cell.value,
+                type_ref,
+                source_type=value.cell.type,
+                memory_raw=memory_raw,
+            )
         if self._is_type_type(type_ref):
             if type(value) is TypeReference:
                 return copy.deepcopy(value)
@@ -2933,6 +3117,15 @@ class CompileTimePass:
             if value is None or type(value) is ComptimeUnionField:
                 return copy.deepcopy(value)
             raise CompileTimeError(f'Cannot convert {value!r} to UnionField.')
+        if type(declaration) is EnumDeclaration:
+            if (
+                type(value) is not ComptimeEnumValue
+                or self._type_name(value.type_ref) != type_name
+            ):
+                raise CompileTimeError(
+                    f'Cannot convert comptime union value to type "{type_name}".'
+                )
+            return copy.deepcopy(value)
         if is_builtin_type(type_name):
             try:
                 return cast_builtin_value(
@@ -2988,6 +3181,19 @@ class CompileTimePass:
             return ComptimeVectorValue(copy.deepcopy(type_ref), element_type, [])
         if declaration is not None and declaration.source_name == 'StringBuilder':
             return ComptimeStringBuilderValue(copy.deepcopy(type_ref), bytearray())
+        if type(declaration) is EnumDeclaration:
+            if not declaration.variants:
+                raise CompileTimeError(f'Union "{type_name}" has no variants.')
+            variant = declaration.variants[0]
+            return ComptimeEnumValue(
+                copy.deepcopy(type_ref),
+                variant.name,
+                0,
+                [
+                    self._default_literal(parameter.type, scope or CompileTimeScope())
+                    for parameter in variant.parameters
+                ],
+            )
         if self._is_struct_type(type_ref):
             return self._default_struct_value(type_ref, scope or CompileTimeScope())
         raise CompileTimeFeatureNotImplemented(
@@ -3367,7 +3573,10 @@ class CompileTimePass:
 
     def _expression_has_comptime_root(self, expression: Expression, scope: CompileTimeScope) -> bool:
         if type(expression) is VariableExpression:
-            return scope.contains_root(expression.name)
+            return (
+                scope.contains_root(expression.name)
+                and not scope.is_runtime_constant(expression.name)
+            )
         if type(expression) is IndexExpression:
             return self._expression_has_comptime_root(expression.target, scope)
         if type(expression) is SliceExpression:
@@ -4036,6 +4245,15 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
             current = scope.get(assignment.name)
             assert current is not None
 
+            if isinstance(current.value, ComptimeBorrowValue):
+                target = current.value.element_cell(0)
+                target_type = self.compile_time_pass._literal_type_reference(target)
+                target.value = self.compile_time_pass._cast_comptime(
+                    value.value, target_type, source_type=value.type
+                )
+                target.type = self.compile_time_pass._type_name(target_type)
+                return
+
             current_type = self.compile_time_pass._literal_type_reference(current)
             scope.assign(
                 assignment.name,
@@ -4115,11 +4333,34 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
         if value is not None:
             if value.type == 'type':
                 raise CompileTimeError(f'Cannot use type "{variable.name}" as a value.')
+            if (
+                isinstance(value.value, ComptimeBorrowValue)
+                and value.value.array is None
+                and value.value.cell is not None
+            ):
+                return copy.deepcopy(value.value.cell)
             return copy.deepcopy(value)
         if scope.contains_root(variable.name):
             raise CompileTimeError(
                 f'Cannot read comptime value "{variable.name}" as a value.'
             )
+        if '.' in variable.name:
+            type_name, variant_name = variable.name.rsplit('.', 1)
+            declaration = self.compile_time_pass.types.get(type_name)
+            if type(declaration) is EnumDeclaration:
+                found = next(
+                    ((index, variant) for index, variant in enumerate(declaration.variants)
+                     if variant.name == variant_name and not variant.parameters),
+                    None,
+                )
+                if found is not None:
+                    discriminant, variant = found
+                    return LiteralExpression(
+                        ComptimeEnumValue(
+                            TypeReference(type_name), variant.name, discriminant, []
+                        ),
+                        type_name,
+                    )
         raise CompileTimeError(f'Comptime expression references runtime name "{variable.name}".')
 
     def _eval_function_call(
@@ -4234,6 +4475,54 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
             )
         return LiteralExpression(
             ComptimeStructValue(copy.deepcopy(type_ref), fields),
+            self.compile_time_pass._type_name(type_ref),
+        )
+
+    def _eval_enum_variant(
+        self, expression: EnumVariantExpression, scope: CompileTimeScope
+    ) -> LiteralExpression:
+        type_ref = self.compile_time_pass._apply_type_reference(
+            expression.type_ref, scope
+        )
+        declaration = self.compile_time_pass.types.get(
+            self.compile_time_pass._type_name(type_ref)
+        )
+        if type(declaration) is not EnumDeclaration:
+            raise CompileTimeError(
+                f'Unknown comptime union "{self.compile_time_pass._type_name(type_ref)}".'
+            )
+        found = next(
+            (
+                (index, variant)
+                for index, variant in enumerate(declaration.variants)
+                if variant.name == expression.variant_name
+            ),
+            None,
+        )
+        if found is None:
+            raise CompileTimeError(
+                f'Union "{declaration.name}" has no variant "{expression.variant_name}".'
+            )
+        discriminant, variant = found
+        arguments = expression.arguments or []
+        if len(arguments) != len(variant.parameters):
+            raise CompileTimeError(
+                f'Variant "{declaration.name}.{variant.name}" expects '
+                f'{len(variant.parameters)} argument(s), got {len(arguments)}.'
+            )
+        fields = []
+        for argument, parameter in zip(arguments, variant.parameters):
+            value = self._eval_expression(argument, scope)
+            fields.append(LiteralExpression(
+                self.compile_time_pass._cast_comptime(
+                    value.value, parameter.type, source_type=value.type
+                ),
+                self.compile_time_pass._type_name(parameter.type),
+            ))
+        return LiteralExpression(
+            ComptimeEnumValue(
+                copy.deepcopy(type_ref), variant.name, discriminant, fields
+            ),
             self.compile_time_pass._type_name(type_ref),
         )
 
@@ -4370,6 +4659,29 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
     def _eval_composite_operator(
         self, operator: str, left: LiteralExpression, right: LiteralExpression
     ) -> LiteralExpression:
+        if (
+            isinstance(left.value, ComptimeBorrowValue)
+            and left.value.array is None
+            and left.value.cell is not None
+        ):
+            left = copy.deepcopy(left.value.cell)
+        if (
+            isinstance(right.value, ComptimeBorrowValue)
+            and right.value.array is None
+            and right.value.cell is not None
+        ):
+            right = copy.deepcopy(right.value.cell)
+        if operator in {'&&', '||'}:
+            if left.type != 'bool' or right.type != 'bool':
+                raise CompileTimeError(
+                    f'Logical operator "{operator}" requires bool operands.'
+                )
+            return LiteralExpression(
+                (bool(left.value) and bool(right.value))
+                if operator == '&&'
+                else (bool(left.value) or bool(right.value)),
+                'bool',
+            )
         if operator in {'+', '-', '*', '/', '%'}:
             merged_type = self.compile_time_pass._merge_types(left, right)
             if not is_numeric_type(merged_type) or is_raw_byte_type(merged_type):
@@ -4400,6 +4712,12 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
         self._unknown_operator(operator)
 
     def _is_truthy(self, value: LiteralExpression) -> bool:
+        if (
+            isinstance(value.value, ComptimeBorrowValue)
+            and value.value.array is None
+            and value.value.cell is not None
+        ):
+            value = value.value.cell
         if is_bool_type(value.type):
             return bool(value.value)
         raise CompileTimeError(

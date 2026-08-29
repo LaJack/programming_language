@@ -68,6 +68,7 @@ try:
     )
     from .parser import parse
     from .memory_model import MaybeUninit as MemoryMaybeUninit
+    from .source_model import FrozenArrayValue, FrozenStructValue, FrozenUnionValue
 except ImportError:
     from borrow_modes import borrow_mode_can_read, borrow_mode_can_write, borrow_mode_compatible
     from builtin_types import (
@@ -134,6 +135,7 @@ except ImportError:
     )
     from parser import parse
     from memory_model import MaybeUninit as MemoryMaybeUninit
+    from source_model import FrozenArrayValue, FrozenStructValue, FrozenUnionValue
 
 
 class InterpreterError(Exception):
@@ -504,6 +506,7 @@ class SymbolTable:
         self.parent = parent
         self.symbols: dict[str, object] = dict(self.BUILTINS)
         self.deinit_names: list[str] = []
+        self.constant_names: set[str] = set()
 
     def get(self, name: str) -> object:
         parts = self._split_name(name)
@@ -538,13 +541,15 @@ class SymbolTable:
         except AttributeError as err:
             raise NameResolutionError(f'Unknown field "{field}" in "{name}".') from err
 
-    def declare(self, name: str, value: object) -> None:
+    def declare(self, name: str, value: object, *, constant: bool = False) -> None:
         parts = self._split_name(name)
         if len(parts) != 1:
             raise NameResolutionError(f'Cannot declare dotted name "{name}".')
         if name in self.symbols:
             raise NameResolutionError(f'Name "{name}" is already declared in this scope.')
         self.symbols[name] = value
+        if constant:
+            self.constant_names.add(name)
 
     def mark_for_deinit(self, name: str) -> None:
         if name not in self.symbols:
@@ -562,6 +567,8 @@ class SymbolTable:
         target_scope = self._scope_containing(name)
         if target_scope is None:
             raise NameResolutionError(f'Cannot move undeclared name "{name}".')
+        if name in target_scope.constant_names:
+            raise EvaluationError(f'Cannot move constant "{name}".')
         value = target_scope.symbols[name]
         while name in target_scope.deinit_names:
             target_scope.deinit_names.remove(name)
@@ -573,6 +580,8 @@ class SymbolTable:
 
         if len(parts) == 1:
             target_scope = self._scope_containing(parts[0])
+            if target_scope is not None and parts[0] in target_scope.constant_names:
+                raise EvaluationError(f'Cannot assign to constant "{parts[0]}".')
             if target_scope is None:
                 raise NameResolutionError(f'Cannot assign undeclared name "{name}".')
             target_scope.symbols[parts[0]] = value
@@ -850,7 +859,7 @@ class Interpreter:
             value = self._eval_hir_expression_as_type(
                 declaration.initializer, symbol.type_ref, scope
             )
-        scope.declare(symbol.name, value)
+        scope.declare(symbol.name, value, constant=symbol.constant)
         if self._value_needs_drop(value):
             scope.mark_for_deinit(symbol.name)
         if declaration.constructor_call is not None:
@@ -1016,6 +1025,10 @@ class Interpreter:
     # Expressions
     def _eval_hir_expression(self, expression: HIRExpression, scope: SymbolTable) -> object:
         if isinstance(expression, HIRLiteralExpression):
+            if isinstance(
+                expression.value, (FrozenArrayValue, FrozenStructValue, FrozenUnionValue)
+            ):
+                return self._thaw_runtime_constant(expression.value, expression.type_ref, scope)
             return self._eval_literal_value(expression.value, expression.literal_type, scope)
         if isinstance(expression, HIRVariableExpression):
             return scope.get(expression.name)
@@ -1603,6 +1616,17 @@ class Interpreter:
             raise EvaluationError(
                 f'Cannot combine values of type "{left.type_name}" and "{right.type_name}".'
             )
+        if operator in {'&&', '||'}:
+            if left.type_name != 'bool':
+                raise EvaluationError(
+                    f'Logical operator "{operator}" requires bool operands.'
+                )
+            result = (
+                bool(left.value) and bool(right.value)
+                if operator == '&&'
+                else bool(left.value) or bool(right.value)
+            )
+            return self.global_scope.get('bool')(result)
         if is_raw_byte_type(left.type_name) and operator not in {'==', '!='}:
             raise EvaluationError(f'Operator "{operator}" is not implemented for raw byte types.')
         if not is_numeric_type(left.type_name) and operator not in {'==', '!='}:
@@ -2009,6 +2033,45 @@ class Interpreter:
             pointer.set(value)
             return
         raise EvaluationError(f'Unsupported HIR assignment target "{type(target).__name__}".')
+
+    def _thaw_runtime_constant(
+        self, value: object, type_ref: TypeReference, scope: SymbolTable
+    ) -> object:
+        if isinstance(value, FrozenArrayValue):
+            element_type = self._element_type(type_ref)
+            return JackArray(
+                element_type,
+                [self._thaw_runtime_constant(item, element_type, scope)
+                 if isinstance(item, (FrozenArrayValue, FrozenStructValue, FrozenUnionValue))
+                 else self._eval_literal_value(item, element_type.name, scope)
+                 for item in value.elements],
+            )
+        if isinstance(value, FrozenStructValue):
+            struct_type = scope.get(type_ref.name)
+            result = struct_type()
+            declaration = self.hir_types_by_name[type_ref.name]
+            field_types = {field.name: field.type_ref for field in declaration.fields}
+            for name, item in value.fields:
+                field_type = field_types[name]
+                field_value = (
+                    self._thaw_runtime_constant(item, field_type, scope)
+                    if isinstance(item, (FrozenArrayValue, FrozenStructValue, FrozenUnionValue))
+                    else self._eval_literal_value(item, field_type.name, scope)
+                )
+                setattr(result, name, field_value)
+            return result
+        if isinstance(value, FrozenUnionValue):
+            declaration = self.hir_types_by_name[type_ref.name]
+            variant = declaration.variants[value.discriminant]
+            payload = []
+            for item, parameter in zip(value.fields, variant.fields):
+                payload.append(
+                    self._thaw_runtime_constant(item, parameter.type_ref, scope)
+                    if isinstance(item, (FrozenArrayValue, FrozenStructValue, FrozenUnionValue))
+                    else self._eval_literal_value(item, parameter.type_ref.name, scope)
+                )
+            return JackEnumValue(type_ref.name, variant.name, value.discriminant, payload)
+        return self._eval_literal_value(value, type_ref.name, scope)
 
     def _take_hir_place(
         self, target: HIRExpression, scope: SymbolTable

@@ -1,49 +1,11 @@
 module bootstrap.lexer;
 
 import bootstrap.source;
+import bootstrap.lexer_generator;
 import std.collections.vector;
 import std.io;
 import std.memory;
 import std.string;
-
-void collect_token_variants(
-    comptime bool generating,
-    &in u8[] source,
-    &inout Vector(UnionVariant, SystemAllocator) variants
-) raises CapacityError, LayoutError, AllocationError, Utf8Error {
-    usize start = usize(0);
-    usize index = usize(0);
-    while (index <= usize(len(source))) {
-        bool at_end = index == usize(len(source));
-        bool at_newline = false;
-        if (at_end == false) {
-            at_newline = source[index] == u8(10);
-        }
-        bool line_complete = at_end;
-        if (at_newline) { line_complete = true; }
-        if (line_complete) {
-            usize end = index;
-            if (end > start) {
-                if (source[end - usize(1)] == u8(13)) {
-                    end = end - usize(1);
-                }
-            }
-            if (end > start) {
-                if (source[start] != u8(35)) {
-                    SystemAllocator name_allocator;
-                    StringBuilder(SystemAllocator) name(name_allocator);
-                    name.append_bytes(source[i32(start)..i32(end)]);
-                    String(SystemAllocator) text = finish_string(
-                        SystemAllocator, name
-                    );
-                    variants.push(variant(text.as_str()));
-                }
-            }
-            start = index + usize(1);
-        }
-        index = index + usize(1);
-    }
-}
 
 comptime File token_file = open_read("selfhost/bootstrap/jack.tokens");
 comptime SystemAllocator token_source_allocator;
@@ -54,10 +16,18 @@ comptime SystemAllocator token_variant_allocator;
 comptime Vector(UnionVariant, SystemAllocator) token_variants(
     token_variant_allocator, usize(0)
 );
-comptime collect_token_variants(
-    true, token_source.bytes(), token_variants
+comptime SystemAllocator compiled_lexer_allocator;
+comptime CompiledLexer compiled_lexer = compile_lexer(
+    true,
+    token_source.bytes(),
+    compiled_lexer_allocator,
+    token_variants
 );
 pub comptime type TokenKind = Union(token_variants.as_slice());
+const LexerTables(compiled_lexer.states, compiled_lexer.rule_count) lexer_tables =
+    comptime freeze_lexer(
+        compiled_lexer.states, compiled_lexer.rule_count, true, compiled_lexer
+    );
 
 pub struct Token {
     TokenKind kind;
@@ -90,45 +60,6 @@ pub TokenKind token_symbol() { return TokenKind.symbol; }
 pub TokenKind token_invalid() { return TokenKind.invalid; }
 pub TokenKind token_formatted_string() { return TokenKind.formatted_string; }
 
-bool is_alpha(u8 value) {
-    if (value >= u8(97)) {
-        if (value <= u8(122)) { return true; }
-    }
-    if (value >= u8(65)) {
-        if (value <= u8(90)) { return true; }
-    }
-    return value == u8(95);
-}
-
-bool is_digit(u8 value) {
-    if (value < u8(48)) { return false; }
-    return value <= u8(57);
-}
-
-bool is_symbol(u8 value) {
-    if (value == u8(123)) { return true; }
-    if (value == u8(125)) { return true; }
-    if (value == u8(40)) { return true; }
-    if (value == u8(41)) { return true; }
-    if (value == u8(91)) { return true; }
-    if (value == u8(93)) { return true; }
-    if (value == u8(59)) { return true; }
-    if (value == u8(44)) { return true; }
-    if (value == u8(58)) { return true; }
-    if (value == u8(43)) { return true; }
-    if (value == u8(45)) { return true; }
-    if (value == u8(46)) { return true; }
-    if (value == u8(61)) { return true; }
-    if (value == u8(60)) { return true; }
-    if (value == u8(62)) { return true; }
-    if (value == u8(33)) { return true; }
-    if (value == u8(42)) { return true; }
-    if (value == u8(63)) { return true; }
-    if (value == u8(47)) { return true; }
-    if (value == u8(37)) { return true; }
-    return value == u8(38);
-}
-
 bool is_escape(u8 value) {
     if (value == u8(34)) { return true; }
     if (value == u8(92)) { return true; }
@@ -158,266 +89,184 @@ void emit(
     });
 }
 
+TokenKind token_kind(u16 index) {
+    if (index == u16(0)) { return TokenKind.eof; }
+    if (index == u16(1)) { return TokenKind.identifier; }
+    if (index == u16(2)) { return TokenKind.integer; }
+    if (index == u16(3)) { return TokenKind.floating; }
+    if (index == u16(4)) { return TokenKind.string; }
+    if (index == u16(5)) { return TokenKind.symbol; }
+    if (index == u16(7)) { return TokenKind.formatted_string; }
+    return TokenKind.invalid;
+}
+
+struct HandlerResult {
+    usize end;
+    usize line;
+    usize column;
+    bool valid;
+    bool emit_token;
+}
+
+HandlerResult scan_handler(
+    &in u8[] source,
+    usize start,
+    usize prefix_end,
+    usize line,
+    usize column,
+    u8 handler
+) {
+    usize index = prefix_end;
+    usize current_line = line;
+    usize current_column = column + prefix_end - start;
+    bool valid = true;
+    bool emit_token = true;
+    bool scanning = true;
+    if (handler == u8(3)) {
+        emit_token = false;
+        while (index < usize(len(source)) && source[index] != u8(10)) {
+            index = index + usize(1);
+            current_column = current_column + usize(1);
+        }
+        scanning = false;
+    } elif (handler == u8(4)) {
+        emit_token = false;
+        valid = false;
+        while (index < usize(len(source)) && scanning) {
+            if (index + usize(1) < usize(len(source))) {
+                if (source[index] == u8(42) && source[index + usize(1)] == u8(47)) {
+                    index = index + usize(2);
+                    current_column = current_column + usize(2);
+                    scanning = false;
+                    valid = true;
+                } elif (source[index] == u8(10)) {
+                    index = index + usize(1);
+                    current_line = current_line + usize(1);
+                    current_column = usize(1);
+                } else {
+                    index = index + usize(1);
+                    current_column = current_column + usize(1);
+                }
+            } else {
+                index = index + usize(1);
+                current_column = current_column + usize(1);
+            }
+        }
+        if (valid == false) { emit_token = true; }
+    } else {
+        while (index < usize(len(source)) && scanning) {
+            u8 value = source[index];
+            if (value == u8(10)) {
+                valid = false;
+                scanning = false;
+            } elif (value == u8(34)) {
+                index = index + usize(1);
+                current_column = current_column + usize(1);
+                scanning = false;
+            } elif (value == u8(92)) {
+                index = index + usize(1);
+                current_column = current_column + usize(1);
+                if (index >= usize(len(source))) {
+                    valid = false;
+                    scanning = false;
+                } else {
+                    if (handler == u8(1) && is_escape(source[index]) == false) {
+                        valid = false;
+                    }
+                    index = index + usize(1);
+                    current_column = current_column + usize(1);
+                }
+            } else {
+                index = index + usize(1);
+                current_column = current_column + usize(1);
+            }
+        }
+        if (scanning) { valid = false; }
+    }
+    return HandlerResult {
+        end = index,
+        line = current_line,
+        column = current_column,
+        valid = valid,
+        emit_token = emit_token,
+    };
+}
+
 pub Vector(Token, A) lex(
     comptime type A: Allocator,
     &in u8[] source,
     move A allocator
 ) raises CapacityError, LayoutError, AllocationError {
     Vector(Token, A) tokens(allocator, usize(0));
-    usize index = 0;
-    usize line = 1;
-    usize column = 1;
-
+    usize index = usize(0);
+    usize line = usize(1);
+    usize column = usize(1);
     while (index < usize(len(source))) {
-        u8 current = source[index];
-        bool formatted_string = false;
-        if (current == u8(102)) {
-            if (index + usize(1) < usize(len(source))) {
-                if (source[index + usize(1)] == u8(34)) {
-                    formatted_string = true;
+        usize start = index;
+        usize start_line = line;
+        usize start_column = column;
+        u16 state = u16(0);
+        u16 accepted = u16(65535);
+        usize accepted_end = index;
+        usize cursor = index;
+        bool scanning = true;
+        while (cursor < usize(len(source)) && scanning) {
+            u16 next = lexer_tables.transition(state, source[cursor]);
+            if (next == u16(65535)) {
+                scanning = false;
+            } else {
+                state = next;
+                cursor = cursor + usize(1);
+                u16 candidate = lexer_tables.accepting(state);
+                if (candidate != u16(65535)) {
+                    accepted = candidate;
+                    accepted_end = cursor;
                 }
             }
         }
-        if (current == u8(32)) {
-            index = index + usize(1);
-            column = column + usize(1);
-        } elif (current == u8(9)) {
-            index = index + usize(1);
-            column = column + usize(1);
-        } elif (current == u8(13)) {
-            index = index + usize(1);
-            column = column + usize(1);
-        } elif (current == u8(10)) {
-            index = index + usize(1);
-            line = line + usize(1);
-            column = 1;
-        } elif (formatted_string) {
-            usize start = index;
-            usize start_line = line;
-            usize start_column = column;
-            index = index + usize(2);
-            column = column + usize(2);
-            bool scanning = true;
-            bool valid = true;
-            while (scanning) {
-                if (index >= usize(len(source))) {
-                    scanning = false;
-                    valid = false;
-                } elif (source[index] == u8(10)) {
-                    scanning = false;
-                    valid = false;
-                } elif (source[index] == u8(34)) {
-                    index = index + usize(1);
-                    column = column + usize(1);
-                    scanning = false;
-                } elif (source[index] == u8(92)) {
-                    index = index + usize(1);
-                    column = column + usize(1);
-                    if (index < usize(len(source))) {
-                        index = index + usize(1);
-                        column = column + usize(1);
-                    } else {
-                        scanning = false;
-                        valid = false;
-                    }
-                } else {
-                    index = index + usize(1);
-                    column = column + usize(1);
-                }
-            }
-            if (valid) {
-                emit(A, tokens, token_formatted_string(), start, index, start_line, start_column);
-            } else {
-                emit(A, tokens, token_invalid(), start, index, start_line, start_column);
-            }
-        } elif (is_alpha(current)) {
-            usize start = index;
-            usize start_column = column;
-            bool scanning = true;
-            while (scanning) {
-                index = index + usize(1);
-                column = column + usize(1);
-                if (index >= usize(len(source))) {
-                    scanning = false;
-                } elif (is_alpha(source[index])) {
-                } elif (is_digit(source[index])) {
-                } else {
-                    scanning = false;
-                }
-            }
-            emit(A, tokens, token_identifier(), start, index, line, start_column);
-        } elif (is_digit(current)) {
-            usize start = index;
-            usize start_column = column;
-            bool scanning = true;
-            bool floating = false;
-            while (scanning) {
-                index = index + usize(1);
-                column = column + usize(1);
-                if (index >= usize(len(source))) {
-                    scanning = false;
-                } elif (is_digit(source[index])) {
-                } else {
-                    scanning = false;
-                }
-            }
-            if (index < usize(len(source))) {
-                if (source[index] == u8(46)) {
-                    if (index + usize(1) < usize(len(source))) {
-                        if (is_digit(source[index + usize(1)])) {
-                            floating = true;
-                            index = index + usize(1);
-                            column = column + usize(1);
-                            bool fraction = true;
-                            while (fraction) {
-                                index = index + usize(1);
-                                column = column + usize(1);
-                                if (index >= usize(len(source))) {
-                                    fraction = false;
-                                } elif (is_digit(source[index])) {
-                                } else {
-                                    fraction = false;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if (floating) {
-                emit(A, tokens, token_float(), start, index, line, start_column);
-            } else {
-                emit(A, tokens, token_integer(), start, index, line, start_column);
-            }
-        } elif (current == u8(34)) {
-            usize start = index;
-            usize start_line = line;
-            usize start_column = column;
-            index = index + usize(1);
-            column = column + usize(1);
-            bool scanning = true;
-            bool valid = true;
-            while (scanning) {
-                if (index >= usize(len(source))) {
-                    scanning = false;
-                    valid = false;
-                } elif (source[index] == u8(10)) {
-                    scanning = false;
-                    valid = false;
-                } elif (source[index] == u8(34)) {
-                    index = index + usize(1);
-                    column = column + usize(1);
-                    scanning = false;
-                } elif (source[index] == u8(92)) {
-                    index = index + usize(1);
-                    column = column + usize(1);
-                    if (index < usize(len(source))) {
-                        if (is_escape(source[index]) == false) { valid = false; }
-                        index = index + usize(1);
-                        column = column + usize(1);
-                    } else {
-                        scanning = false;
-                        valid = false;
-                    }
-                } else {
-                    index = index + usize(1);
-                    column = column + usize(1);
-                }
-            }
-            if (valid) {
-                emit(A, tokens, token_string(), start, index, start_line, start_column);
-            } else {
-                emit(A, tokens, token_invalid(), start, index, start_line, start_column);
-            }
-        } elif (current == u8(47)) {
-            bool line_comment = false;
-            bool block_comment = false;
-            if (index + usize(1) < usize(len(source))) {
-                if (source[index + usize(1)] == u8(47)) { line_comment = true; }
-                if (source[index + usize(1)] == u8(42)) { block_comment = true; }
-            }
-            if (line_comment) {
-                index = index + usize(2);
-                column = column + usize(2);
-                bool scanning = true;
-                while (scanning) {
-                    if (index >= usize(len(source))) {
-                        scanning = false;
-                    } elif (source[index] == u8(10)) {
-                        scanning = false;
-                    } else {
-                        index = index + usize(1);
-                        column = column + usize(1);
-                    }
-                }
-            } elif (block_comment) {
-                usize start = index;
-                usize start_line = line;
-                usize start_column = column;
-                index = index + usize(2);
-                column = column + usize(2);
-                bool scanning = true;
-                bool valid = false;
-                while (scanning) {
-                    if (index >= usize(len(source))) {
-                        scanning = false;
-                    } elif (index + usize(1) < usize(len(source))) {
-                        if (source[index] == u8(42)) {
-                            if (source[index + usize(1)] == u8(47)) {
-                                index = index + usize(2);
-                                column = column + usize(2);
-                                scanning = false;
-                                valid = true;
-                            } else {
-                                index = index + usize(1);
-                                column = column + usize(1);
-                            }
-                        } elif (source[index] == u8(10)) {
-                            index = index + usize(1);
-                            line = line + usize(1);
-                            column = 1;
-                        } else {
-                            index = index + usize(1);
-                            column = column + usize(1);
-                        }
-                    } else {
-                        index = index + usize(1);
-                        column = column + usize(1);
-                    }
-                }
-                if (valid == false) {
-                    emit(A, tokens, token_invalid(), start, index, start_line, start_column);
-                }
-            } else {
-                emit(A, tokens, token_symbol(), index, index + usize(1), line, column);
-                index = index + usize(1);
-                column = column + usize(1);
-            }
-        } elif (is_symbol(current)) {
-            usize width = 1;
-            if (index + usize(1) < usize(len(source))) {
-                u8 next = source[index + usize(1)];
-                if (current == u8(61)) {
-                    if (next == u8(61)) { width = 2; }
-                } elif (current == u8(33)) {
-                    if (next == u8(61)) { width = 2; }
-                } elif (current == u8(60)) {
-                    if (next == u8(61)) { width = 2; }
-                } elif (current == u8(62)) {
-                    if (next == u8(61)) { width = 2; }
-                } elif (current == u8(46)) {
-                    if (next == u8(46)) { width = 2; }
-                }
-            }
-            emit(A, tokens, token_symbol(), index, index + width, line, column);
-            index = index + width;
-            column = column + width;
-        } else {
+        if (accepted == u16(65535)) {
             emit(A, tokens, token_invalid(), index, index + usize(1), line, column);
             index = index + usize(1);
             column = column + usize(1);
+        } else {
+            u16 rule_token = lexer_tables.rule_token(accepted);
+            u8 rule_handler = lexer_tables.rule_handler(accepted);
+            bool rule_skips = lexer_tables.rule_skips(accepted);
+            if (rule_handler != u8(0)) {
+                HandlerResult result = scan_handler(
+                    source, start, accepted_end, line, column, rule_handler
+                );
+                index = result.end;
+                line = result.line;
+                column = result.column;
+                if (result.emit_token) {
+                    TokenKind kind = token_kind(rule_token);
+                    if (result.valid == false) { kind = token_invalid(); }
+                    emit(A, tokens, kind, start, index, start_line, start_column);
+                }
+            } else {
+                index = accepted_end;
+                usize consumed_at = start;
+                while (consumed_at < accepted_end) {
+                    u8 consumed = source[consumed_at];
+                    if (consumed == u8(10)) {
+                        line = line + usize(1);
+                        column = usize(1);
+                    } else {
+                        column = column + usize(1);
+                    }
+                    consumed_at = consumed_at + usize(1);
+                }
+                if (rule_skips == false) {
+                    emit(
+                        A, tokens, token_kind(rule_token),
+                        start, index,
+                        start_line, start_column
+                    );
+                }
+            }
         }
     }
-
     emit(A, tokens, token_eof(), index, index, line, column);
     return tokens;
 }

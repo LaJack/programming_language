@@ -145,6 +145,8 @@ class VariableDeclaration(Statement):
     abi: str | None = None
     passing_mode: str = 'copy'
     constraints: List[TypeReference] = field(default_factory=list)
+    constant: bool = False
+    comptime_initializer: bool = False
 
 
 @dataclass

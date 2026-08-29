@@ -23,6 +23,7 @@ try:
     from .compile_time_pass import apply_compile_time_pass
     from .cleanup_lowering_pass import lower_hir_static_cleanups
     from .hir_lowering_pass import lower_to_hir
+    from .source_model import FrozenArrayValue, FrozenStructValue, FrozenUnionValue
     from .hir_nodes import (
         HIRAssignment,
         HIRBlock,
@@ -91,6 +92,7 @@ except ImportError:
     from compile_time_pass import apply_compile_time_pass
     from cleanup_lowering_pass import lower_hir_static_cleanups
     from hir_lowering_pass import lower_to_hir
+    from source_model import FrozenArrayValue, FrozenStructValue, FrozenUnionValue
     from hir_nodes import (
         HIRAssignment,
         HIRBlock,
@@ -351,6 +353,7 @@ class CEmitPass:
             for declaration in program.declarations
             if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration))
         ]
+        types = self._order_hir_type_declarations(types)
         views = [
             declaration
             for declaration in program.declarations
@@ -451,7 +454,15 @@ class CEmitPass:
                 )
             line = f'extern {declaration_source};'
         else:
-            line = f'{declaration_source};'
+            qualifier = 'const ' if symbol.constant else ''
+            initializer = ''
+            if symbol.constant:
+                if not isinstance(declaration.initializer, HIRLiteralExpression):
+                    raise CEmitError('Const globals require a folded literal initializer.')
+                initializer = ' = ' + self._emit_frozen_constant(
+                    declaration.initializer.value, symbol.type_ref
+                )
+            line = f'{qualifier}{declaration_source}{initializer};'
         return '\n'.join(self._with_source_directive([line], declaration))
 
     def _emit_hir_main(
@@ -470,7 +481,8 @@ class CEmitPass:
             ])
         for statement in program.top_level:
             if isinstance(statement, HIRGlobalVariable):
-                body.extend(self._emit_hir_top_level_variable(statement, env))
+                if not statement.symbol.constant:
+                    body.extend(self._emit_hir_top_level_variable(statement, env))
             elif not isinstance(statement, HIRDeclaration):
                 body.extend(self._emit_hir_statement(statement, env))
         if typed:
@@ -995,8 +1007,9 @@ class CEmitPass:
             self._mangle(symbol.name),
             self.global_variable_types,
         )
+        qualifier = 'const ' if symbol.constant else ''
         return '\n'.join(self._with_source_directive(
-            [f'extern {declaration_source};'], declaration
+            [f'extern {qualifier}{declaration_source};'], declaration
         ))
 
     def _emit_hir_global_variable_definition(
@@ -1007,19 +1020,63 @@ class CEmitPass:
         symbol = declaration.symbol
         if symbol.extern:
             return ''
-        prefix = 'static ' if static else ''
+        prefix = ('static ' if static else '') + ('const ' if symbol.constant else '')
         line = prefix + self._emit_declaration(
             symbol.type_ref,
             self._mangle(symbol.name),
             self.global_variable_types,
-        ) + ';'
+        )
+        if symbol.constant:
+            if not isinstance(declaration.initializer, HIRLiteralExpression):
+                raise CEmitError('Const globals require a folded literal initializer.')
+            line += ' = ' + self._emit_frozen_constant(
+                declaration.initializer.value, symbol.type_ref
+            )
+        line += ';'
         return '\n'.join(self._with_source_directive([line], declaration))
+
+    def _emit_frozen_constant(self, value: object, type_ref: TypeReference) -> str:
+        if isinstance(value, FrozenArrayValue):
+            element_type = self._element_type(type_ref)
+            return '{' + ', '.join(
+                self._emit_frozen_constant(element, element_type)
+                for element in value.elements
+            ) + '}'
+        if isinstance(value, FrozenStructValue):
+            declaration = self.type_declarations.get(type_ref.name)
+            if declaration is None:
+                raise CEmitError(f'Unknown const struct type "{type_ref.name}".')
+            field_types = {field.name: field.type_ref for field in declaration.fields}
+            return '{' + ', '.join(
+                f'.{self._mangle(name)} = '
+                f'{self._emit_frozen_constant(field, field_types[name])}'
+                for name, field in value.fields
+            ) + '}'
+        if isinstance(value, FrozenUnionValue):
+            declaration = self.type_declarations.get(type_ref.name)
+            if not isinstance(declaration, HIREnumDeclaration):
+                raise CEmitError(f'Unknown const union type "{type_ref.name}".')
+            variant = declaration.variants[value.discriminant]
+            payload = ''
+            if value.fields:
+                payload = (
+                    f', .jack_payload.{self._mangle(variant.name)} = {{'
+                    + ', '.join(
+                        f'.{self._mangle(field.name)} = '
+                        f'{self._emit_frozen_constant(item, field.type_ref)}'
+                        for item, field in zip(value.fields, variant.fields)
+                    )
+                    + '}'
+                )
+            return f'{{.jack_tag = {value.discriminant}u{payload}}}'
+        return self._emit_literal_value(value, type_ref.name)
 
     def _hir_module_needs_init(self, statements: list[HIRStatement]) -> bool:
         for statement in statements:
             if isinstance(statement, HIRGlobalVariable):
                 if (
                     not statement.symbol.extern
+                    and not statement.symbol.constant
                     and (
                         statement.initializer is not None
                         or statement.constructor_call is not None
@@ -1047,7 +1104,7 @@ class CEmitPass:
         return [
             declaration.symbol.name
             for declaration in globals_
-            if not declaration.symbol.extern
+            if not declaration.symbol.extern and not declaration.symbol.constant
             and self._has_method(declaration.symbol.type_ref, 'deinit')
         ]
 
@@ -1315,6 +1372,49 @@ class CEmitPass:
         if lines:
             lines.append('')
         return lines
+
+    def _order_hir_type_declarations(
+        self,
+        declarations: list[HIRTypeDeclaration | HIREnumDeclaration],
+    ) -> list[HIRTypeDeclaration | HIREnumDeclaration]:
+        """Place by-value dependencies before aggregates that contain them."""
+        by_name = {declaration.name: declaration for declaration in declarations}
+        ordered: list[HIRTypeDeclaration | HIREnumDeclaration] = []
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def field_types(declaration):
+            if isinstance(declaration, HIREnumDeclaration):
+                return (
+                    field.type_ref
+                    for variant in declaration.variants
+                    for field in variant.fields
+                )
+            return (field.type_ref for field in declaration.fields)
+
+        def visit(declaration):
+            if declaration.name in visited:
+                return
+            if declaration.name in visiting:
+                return
+            visiting.add(declaration.name)
+            for type_ref in field_types(declaration):
+                if (
+                    type_ref.borrow is not None
+                    or type_ref.pointer_mode is not None
+                    or type_ref.is_slice
+                ):
+                    continue
+                dependency = by_name.get(type_ref.name)
+                if dependency is not None:
+                    visit(dependency)
+            visiting.remove(declaration.name)
+            visited.add(declaration.name)
+            ordered.append(declaration)
+
+        for declaration in declarations:
+            visit(declaration)
+        return ordered
 
     def _emit_enum_declaration(self, declaration: HIREnumDeclaration) -> str:
         name = self._mangle(declaration.name)
@@ -2264,7 +2364,7 @@ class CEmitPass:
         if is_builtin_type(left_name) or is_builtin_type(right_name):
             if left_name != right_name:
                 raise CEmitError(f'Cannot combine values of type "{left_name}" and "{right_name}".')
-            if is_bool_type(left_name) and expression.operator not in {'==', '!='}:
+            if is_bool_type(left_name) and expression.operator not in {'==', '!=', '&&', '||'}:
                 raise CEmitError(f'Operator "{expression.operator}" is not implemented for bool values.')
             if is_raw_byte_type(left_name) and expression.operator not in {'==', '!='}:
                 raise CEmitError(f'Operator "{expression.operator}" is not implemented for raw byte types.')

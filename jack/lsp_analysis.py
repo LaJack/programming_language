@@ -62,7 +62,7 @@ SKIPPED_DIRECTORIES = {
     '__pycache__',
 }
 JACK_KEYWORDS = {
-    'as', 'catch', 'comptime', 'else', 'extern', 'false', 'for', 'if',
+    'as', 'catch', 'comptime', 'const', 'else', 'extern', 'false', 'for', 'if',
     'implements', 'import', 'in', 'inout', 'interface', 'match', 'module', 'move', 'out',
     'print', 'pub', 'raise', 'raises', 'rethrow', 'return', 'struct', 'true',
     'try', 'union', 'unsafe', 'use', 'view', 'while',
@@ -1203,7 +1203,8 @@ def _declaration_signature(node: Statement, name: str) -> str:
             return (
                 f'{'pub ' if node.public else ''}comptime generated union {name}'
             )
-        return f'{_type_label(node.type)} {name}'
+        prefix = 'const ' if node.constant else ''
+        return f'{prefix}{_type_label(node.type)} {name}'
     return name
 
 

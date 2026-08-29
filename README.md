@@ -1,246 +1,257 @@
 # Jack
 
-Jack is a small experimental language for exploring explicit `comptime` evaluation before interpretation. The Python implementation is intentionally minimalist and serves as a bootstrap path toward a compiler written in Jack itself.
+Jack is an experimental systems programming language built around explicit
+ownership, static dispatch, and compile-time specialization. It is primarily
+aimed at embedded and critical software, while the current bootstrap work uses
+host IO and dynamic allocation to move toward a compiler written in Jack.
 
-For a compact description of the current language, see [the language reference](docs/language-reference.md).
+The stage-0 compiler is implemented in Python. It can interpret Jack directly
+or emit native executables through LLVM or C and Clang.
 
-Build a native executable with the LLVM backend:
-
-```bash
-jack source.jk
-./source
-```
-
-Choose the output path or the C backend explicitly:
-
-```bash
-jack source.jk -o build/source
-jack --backend c source.jk -o build/source-c
-jack -O2 source.jk -o build/source-optimized
-jack -g source.jk -o build/source-debug
-```
-
-Run a program with the interpreter instead:
-
-```bash
-jack -i source.jk
-```
-
-Editor support lives in `vscode-jack/`. It provides VSCode syntax highlighting,
-project-aware diagnostics, semantic hover, cross-file definition, completion,
-references, and project-wide rename through `python3 -m jack.lsp_server` for
-`.jack` and `.jk` files. The semantic index includes open workspaces and
-configured module roots, with unsaved editor buffers taking precedence over
-disk contents.
-On Linux x86-64, the extension also provides CodeLLDB source debugging: press
-`F5` in a Jack file to build it with `-g -O0`, stop on Jack breakpoints, step
-through statements, and inspect LLVM-backed parameters and locals.
-
-Emit C for inspection:
-
-```bash
-jack -c source.jk
-```
-
-The emitted C output is a single bundled translation unit by default. For separate compilation of imported Jack modules, write split output to a directory:
-
-```bash
-jack -c source.jk -o build/c
-```
-
-Split output writes `main.c`, one `.h`/`.c` pair per imported Jack module, and copies the small C runtime files into the output directory. The generated files include `jack_runtime.h`; programs using `std.io` also include and compile `jack_std_io.c`.
-
-Normal native builds keep intermediates in a temporary directory. Preserve the
-textual LLVM IR or generated C inputs with `--save-temps DIR`.
-Native optimization defaults to `-O0`; `-O1` through `-O3` are passed directly
-to Clang for both backends.
-Use `-g` to retain Jack function and statement locations in native debug
-information. It can be combined with either backend and any optimization level.
-
-
-Modules can declare their source name and import other files before the compile-time pass runs. Module paths are resolved from the entry file directory and module roots by mapping `foo.bar` to `foo/bar.jack` or `foo/bar.jk`; the current implementation flattens loaded declarations into the program AST, then uses module metadata to enforce import visibility.
-
-```c
-module app.main;
-import math.ops;
-import geometry as geo;
-import protocol.frame.{Frame, Id};
-
-i32 y = add(2, 3);
-geo.Point point;
-Frame frame;
-```
-
-Library files mark exported declarations with `pub`. Private declarations remain usable inside their own module, but importers can only access public declarations from modules they directly import. Selective imports expose only the listed public names, and alias imports require qualified use such as `geo.Point` or `ops.add()`. Imported declarations are internally qualified with their module path, so private helpers with the same source name can coexist across modules; public name collisions on bare imports are reported with an explicit diagnostic.
-
-Test builds can replace an imported module at resolution time:
-
-```bash
-jack --stub hw.spi=tests.stubs.spi -i tests/can_driver.jack
-```
-
-
-External declarations describe symbols provided outside Jack. The default form declares a Jack ABI function, while `extern "c"` declares C ABI symbols for C emission. Opaque C types and C globals can also be declared this way:
-
-```c
-extern void host_write(str text);
-comptime extern i32 host_env_i32(str name);
-
-extern "c" type FILE;
-extern "c" &inout FILE stdout;
-extern "c" usize fwrite(&in c_void data, usize size, usize count, &inout FILE stream);
-```
-
-Runtime `extern` declarations are emitted as C prototypes and must be supplied to the interpreter through a Python extern registry. `comptime extern` declarations are host-only for now: they can run during the compile-time pass only when an explicit comptime binding is registered, and they are removed from the runtime AST.
-
-The C ABI surface is intentionally narrow: `usize` maps to C `size_t`, opaque C types such as `FILE` must be used behind explicit borrows, and C helper types such as `c_char` and `c_void` can only appear as borrowed types such as `&in c_char` or `&in c_void`. Jack `str` is still a Jack ABI value, not a C `char *`, so libc-style examples should use byte buffers plus explicit lengths for now.
-
-The interpreter and native runtimes provide the private host bridges used by
-`std.io`. `File` is an owned, non-copyable resource; opening, reading, writing,
-seeking, flushing, metadata lookup, and explicit close report typed errors.
-EOF is a successful zero-byte read.
-
-```c
-import std.io;
-
-void read() raises IoError {
-    File file = open_read("examples/io.txt");
-    usize bytes_read = file.read(buffer[..]);
-    close(file);
-}
-```
-
-Run the example from the repository root with:
-
-```bash
-jack -i examples/io_read_file.jack
-```
-
-
-Built-in primitive types are explicit about size:
-
-```c
-i64 signed_value = 12;
-u8 byte = 255;
-b16 raw = 48879;
-f32 ratio = 1.5;
-bool enabled = true;
-
-print(f"{signed_value} {byte} {raw} {ratio} {enabled}");
-```
-
-Signed integers are `i64`, `i32`, `i16`, and `i8`; unsigned integers are `usize`, `u64`, `u32`, `u16`, and `u8`; floats are `f64` and `f32`; booleans are `bool` with `true` and `false` literals. Endian-explicit signed 32-bit integers are `be_i32` and `le_i32`; they are signed numeric values with `i32` range, and their byte order becomes visible when converted to raw bytes. Raw byte values are `b64`, `b32`, `b16`, and `b8`: they can be stored, compared, and printed as fixed-width hex, but integer arithmetic is intentionally rejected.
-
-Built-in value conversions use explicit type-call syntax:
-
-```c
-u8 byte = u8(255);
-i64 wide = i64(byte);
-f32 ratio = f32(3);
-b16 raw = b16(48879);
-be_i32 big = be_i32(45);
-le_i32 little = le_i32(45);
-b32 big_raw = b32(big);       // 0x0000002d
-b32 little_raw = b32(little); // 0x2d000000
-```
-
-Integer conversions are range-checked by the interpreter and compile-time pass. Direct raw assignments such as `b32 raw = 45;` are numeric raw values. Explicit same-width integer-to-raw conversions such as `b32(i32_value)`, `b32(be_i32_value)`, and `b32(le_i32_value)` expose the value's memory byte order. Float-to-integer, bool-to-numeric, and numeric-to-bool conversions are rejected for now.
-
-
-Generic structs are expressed with explicit `comptime` parameters:
-
-```c
-struct Box(comptime type T, comptime i32 N) {
-    T value;
-}
-
-Box(i32, 4) small;
-```
-
-The compile-time pass specializes this to a concrete runtime struct before interpretation.
-
-
-Struct values can also live entirely at comptime. Their scalar fields may be used by runtime code after the compile-time pass substitutes them:
-
-```c
-struct Point {
-    i32 x;
-    i32 y;
-}
-
-comptime Point point;
-comptime point.x = 3;
-comptime point.y = point.x + 4;
-
-i32 y = point.y;
-```
-
-Comptime arrays support indexed assignment, indexing, `len`, and explicit borrows/slices. Mutable comptime borrows alias the original array, so helper functions can fill caller-owned buffers during the compile-time pass:
-
-```c
-void fill(&inout u8[] dst) {
-    dst[0] = 42;
-}
-
-comptime u8[4] buffer;
-comptime fill(buffer[..]);
-
-u8 first = buffer[0];
-i32 count = len(buffer);
-```
-
-Programs may use runtime top-level statements or a typed entrypoint. Typed
-entrypoints receive UTF-8 process arguments (including argument zero):
-
-```c
+```jack
 i32 main(&in str[] arguments) {
-    print(len(arguments));
+    print(f"received {len(arguments)} process arguments");
     return 0;
 }
 ```
 
+The language is under active development and does not yet promise a stable
+source or binary interface. See the [language reference](docs/language-reference.md)
+for the syntax currently implemented.
 
-Methods can be declared inside a type definition. Every method declares its `self` borrow explicitly:
+## Getting Started
 
-```c
-struct Line {
-    i32 p1;
-    i32 p2;
+Jack requires Python 3.11 or newer. Native builds require Clang 18 or a
+compatible newer release.
 
-    i32 sum(&in self) {
-        return self.p1 + self.p2;
-    }
-}
-
-Line line;
-i32 total = line.sum();
+```bash
+python3 -m pip install -e .
+mkdir -p build
+jack examples/built_in.jack -o build/built-in
+./build/built-in
 ```
 
+LLVM is the default native backend. Other useful modes are:
 
-Functions and methods can return `void`; use `return;` for an early bare return:
+```bash
+jack -i source.jack                     # interpret
+jack -O2 source.jack -o build/program   # optimized native build
+jack -g source.jack -o build/program    # Jack source debug information
+jack --backend c source.jack            # build through generated C
+jack -c source.jack                     # print generated C
+jack --save-temps build/ir source.jack  # preserve backend artifacts
+```
 
-```c
-void reset() {
-    return;
+Jack source files conventionally use `.jack`; `.jk` is also accepted.
+
+## Language Tour
+
+### Compile-Time Specialization
+
+`comptime` parameters form part of a declaration's specialization. Their
+values are removed before runtime HIR is produced:
+
+```jack
+i32 scale(comptime i32 factor, i32 value) {
+    return factor * value;
+}
+
+i32 doubled = scale(2, 21);
+i32 tripled = scale(3, 14);
+```
+
+Generic types use the same mechanism. Interface constraints make required
+operations explicit rather than discovering them during specialization:
+
+```jack
+struct Pair(comptime type T: Copyable) {
+    T first;
+    T second;
 }
 ```
 
+### Ownership And Borrows
 
-Structs can define an `init` constructor and a `deinit` destructor. `deinit` only takes the explicit `self` receiver. Direct construction uses the variable name, so no temporary copy is implied:
+Function signatures completely describe argument behavior. Plain parameters
+copy, `move` parameters consume, and borrow parameters alias temporarily. Call
+sites use ordinary call syntax in every case:
 
-```c
-struct CanDriver {
-    i32 slave_address;
+```jack
+void inspect(&in Message message) { }
+void update(&inout Message message) { }
+void enqueue(move Message message) { }
 
-    init(&inout self, i32 slave_address) {
-        self.slave_address = slave_address;
+inspect(message);
+update(message);
+enqueue(message); // message is moved
+```
+
+Returning an owned value transfers it automatically. Explicit `move` is used
+when transferring between local owners:
+
+```jack
+Message pending = move message;
+```
+
+Destructors consume their object with `deinit(move self)`. They are intended
+for actual owned resources; ordinary data structs need no destructor. The
+compiler tracks moved and partially moved places and inserts cleanup on normal
+and error exits.
+
+### Tagged Unions
+
+Nominal tagged unions can carry owned payloads. Matching an owned place states
+whether it is borrowed or consumed:
+
+```jack
+import std.option;
+
+Option(i32) answer = Option(i32).some(42);
+
+i32 value = match (move answer) {
+    .some(item) => item,
+    .none => 0,
+};
+```
+
+Matches are exhaustive. `&in` and `&inout` matches expose borrowed payloads;
+`move` matches transfer payload ownership into the selected arm.
+
+### Errors
+
+Errors are typed values declared in a function's `raises` clause. They use
+ordinary structured control flow rather than implicit global error state:
+
+```jack
+struct BoundsError { }
+
+i32 read_index(usize index) raises BoundsError {
+    if (index >= 4) {
+        raise BoundsError { };
     }
-
-    deinit(move self) {
-        print(self.slave_address);
-    }
+    return i32(index);
 }
 
-CanDriver can(5);
-comptime CanDriver comptime_can(7);
+try {
+    print(read_index(5));
+}
+catch BoundsError {
+    print("index out of bounds");
+}
 ```
+
+The LLVM backend uses an explicit result ABI at function boundaries and
+effect-aware inlining to remove that envelope from eligible optimized calls.
+
+### Allocation And Collections
+
+Allocation policy is a type parameter. The same `Vector` automatically grows
+with a system allocator or reports `CapacityError` when bounded static storage
+cannot satisfy growth:
+
+```jack
+import std.collections.vector;
+import std.memory;
+
+void collect() raises CapacityError, LayoutError, AllocationError {
+    StaticAllocator(i32, 8) storage;
+    Vector(i32, StaticAllocator(i32, 8)) values(storage, 4);
+
+    values.push(10);
+    values.push(20);
+    print(values.len());
+}
+```
+
+`MaybeUninit(T)`, `Allocation`, raw pointers, and `unsafe` blocks provide the
+low-level foundation. Safe collections do not retain pointers into movable
+allocators. `Arena(T, A)` adds stable typed index handles over monotonic
+storage.
+
+### IO And Strings
+
+`str` is a non-owning immutable UTF-8 view. `std.string` provides allocator-
+aware owned strings and byte buffers. `std.io.File` is a non-copyable owned
+resource with typed failures:
+
+```jack
+import std.io;
+
+void read_header() raises IoError {
+    File file = open_read("examples/io.txt");
+    u8[8] buffer;
+    usize count = file.read(buffer[..]);
+    close(file);
+
+    print(count);
+}
+```
+
+EOF is represented by a successful zero-byte read. Explicit `close` reports
+errors; automatic destruction performs best-effort closure.
+
+## Modules
+
+A source file may declare a module and import public declarations from other
+modules:
+
+```jack
+module app.main;
+
+import math.ops;
+import geometry as geo;
+import protocol.frame.{Frame, Id};
+
+i32 total = add(2, 3);
+geo.Point origin;
+Frame frame;
+```
+
+Module paths map to files such as `protocol/frame.jack`. Imports may be bare,
+aliased, or selective. Declarations are private unless marked `pub`.
+Additional search roots and test-time module replacements are available from
+the CLI:
+
+```bash
+jack --module-root libraries source.jack
+jack --stub hw.spi=tests.stubs.spi -i source.jack
+```
+
+## Editor And Debugger
+
+The extension in `vscode-jack/` provides:
+
+- project-aware diagnostics and recovering syntax analysis;
+- semantic highlighting, hover, completion, and signature help;
+- cross-file definitions, references, rename, and safe code actions;
+- Linux x86-64 source debugging through CodeLLDB.
+
+Press `F5` in a Jack file to compile it with LLVM at `-g -O0` and start a debug
+session. Breakpoints, Jack statement stepping, stack frames, parameters, and
+source-visible locals are supported.
+
+## Self-Hosting
+
+`selfhost/bootstrap/` contains the growing Jack frontend. Its lexer reads real
+files through `std.io`, stores tokens dynamically, and uses a tagged
+`TokenKind` union while preserving deterministic source spans. The Python
+compiler remains stage 0 while parsing and semantic infrastructure are moved
+into Jack.
+
+## Development
+
+Run the Python test suite from the repository root:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Extension tests live separately:
+
+```bash
+cd vscode-jack
+npm test
+```
+
+The checked-in programs under `examples/` are exercised across the interpreter,
+C, and LLVM implementations as part of the conformance suite.

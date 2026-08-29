@@ -443,7 +443,7 @@ at branch exit. Arms must be exhaustive; `_` is permitted only once as the
 final catch-all. Statement arms use blocks, expression arms use `=>` and must
 all produce exactly the same type.
 
-Fieldless enums support `==` and `!=`. Payload enums must be inspected with
+Fieldless unions support `==` and `!=`. Payload unions must be inspected with
 `match`. `std.option` provides generic `Option(T)` with `none`, `some`,
 `is_some`, and `is_none`.
 

@@ -409,6 +409,33 @@ comptime fill(buffer[..]);
 u8 first = buffer[0];
 ```
 
+### Computed Union Types
+
+A comptime type binding can materialize a nominal union from metadata assembled
+by ordinary Jack code:
+
+```jack
+comptime str[3] names;
+comptime names[0] = "idle";
+comptime names[1] = "running";
+comptime names[2] = "failed";
+pub comptime type State = Union(names[..]);
+```
+
+`Union` also accepts `UnionVariant` descriptors. `variant`, `field`, and
+`move_field` describe payloads using the same copy and move contracts as a
+source-declared union. The generated type is nominally owned by its binding;
+assigning an existing type to a comptime type binding creates an alias instead.
+Bindings are immutable, become visible in source order, and generated variants
+cannot be renamed independently.
+
+Ordinary `Vector`, `String`, allocator, ownership, and error behavior are
+available while constructing metadata. `Vector.as_slice()` provides the
+immutable slice accepted by `Union`. Comptime filesystem access is read-only;
+successfully opened files become compiler dependencies. Creation, append,
+read-write access, and output streams are rejected during comptime evaluation.
+Live editor analysis defers host IO until a saved or explicit full analysis.
+
 ## Tagged Unions And Matching
 
 Unions are nominal and tagged. Variants are declared in source order and may

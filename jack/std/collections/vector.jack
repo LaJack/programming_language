@@ -78,6 +78,12 @@ pub struct Vector(comptime type T, comptime type A: Allocator) {
         return slots.cast(T);
     }
 
+    &in T[] as_slice(&in self) {
+        unsafe {
+            return initialized_slice(self.data(), self.length);
+        }
+    }
+
     unsafe *inout T data_mut(&inout self) {
         *inout b8 address = self.allocator.address_mut(self.allocation);
         *inout MaybeUninit(T) slots = address.cast(MaybeUninit(T));

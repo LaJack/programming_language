@@ -45,9 +45,10 @@ class BootstrapLexerTests(unittest.TestCase):
             ENTRY, CompilationOptions(module_roots=(SELFHOST_ROOT,))
         )
         cls.executables = {}
+        cls.compilation_results = {}
         for backend in ('c', 'llvm'):
             output = cls.root / f'bootstrap-{backend}'
-            driver.compile_executable(
+            cls.compilation_results[backend] = driver.compile_executable(
                 ENTRY,
                 CompilationOptions(
                     backend=backend,
@@ -177,6 +178,12 @@ class BootstrapLexerTests(unittest.TestCase):
         path = ROOT / 'examples' / 'vector.jack'
         expected = expected_dump(path.read_text())
         self.assertEqual((0, expected, ''), self.run_native('llvm-o2', str(path)))
+
+    def test_token_specification_is_a_recorded_comptime_dependency(self):
+        expected = (SELFHOST_ROOT / 'bootstrap' / 'jack.tokens').resolve()
+        for backend, result in self.compilation_results.items():
+            with self.subTest(backend=backend):
+                self.assertIn(expected, result.comptime_dependencies)
 
 
 if __name__ == '__main__':

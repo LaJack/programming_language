@@ -8,7 +8,7 @@ from typing import Callable, Iterator
 try:
     from .borrow_modes import borrow_mode_can_read
     from .builtin_types import is_builtin_type
-    from .compile_time_pass import apply_compile_time_pass
+    from .compile_time_pass import ComptimeEffects, apply_compile_time_pass
     from .ast_nodes import (
         Assignment,
         BorrowExpression,
@@ -70,6 +70,7 @@ try:
         HIRIfBranch,
         HIRImportDeclaration,
         HIRIndexExpression,
+        HIRInitializedSliceExpression,
         HIRLiteralExpression,
         HIRMatch,
         HIRMatchArm,
@@ -105,7 +106,7 @@ try:
 except ImportError:
     from borrow_modes import borrow_mode_can_read
     from builtin_types import is_builtin_type
-    from compile_time_pass import apply_compile_time_pass
+    from compile_time_pass import ComptimeEffects, apply_compile_time_pass
     from ast_nodes import (
         Assignment,
         BorrowExpression,
@@ -167,6 +168,7 @@ except ImportError:
         HIRIfBranch,
         HIRImportDeclaration,
         HIRIndexExpression,
+        HIRInitializedSliceExpression,
         HIRLiteralExpression,
         HIRMatch,
         HIRMatchArm,
@@ -216,11 +218,13 @@ def compile_to_hir(
     ast: list[Statement],
     print_handler: Callable[[str], None] | None = print,
     externs: dict[str, object] | None = None,
+    effects: ComptimeEffects | None = None,
 ) -> HIRProgram:
     runtime_ast = apply_compile_time_pass(
         ast,
         print_handler=print_handler,
         externs=externs,
+        effects=effects,
     )
     return lower_to_hir(runtime_ast)
 
@@ -1050,6 +1054,25 @@ class HIRLoweringPass(SemanticPass):
                     HIRRawAddressExpression(
                         mode=argument.mode,
                         expr=inner,
+                        type_ref=type_ref,
+                        read_type=self._copy_type(type_ref),
+                        span=expression.span,
+                    ),
+                )
+            if expression.function_name == 'initialized_slice':
+                pointer = self._expression(expression.parameters[0], scope)
+                length = self._expression(expression.parameters[1], scope)
+                type_ref = TypeReference(
+                    pointer.type_ref.name,
+                    copy.deepcopy(pointer.type_ref.arguments),
+                    is_slice=True,
+                    borrow='in',
+                )
+                return self._record_expression(
+                    expression,
+                    HIRInitializedSliceExpression(
+                        pointer=pointer,
+                        length=length,
                         type_ref=type_ref,
                         read_type=self._copy_type(type_ref),
                         span=expression.span,

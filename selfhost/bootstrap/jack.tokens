@@ -1,0 +1,9 @@
+# Token kinds are declaration ordered; kind_value depends on this order.
+eof
+identifier
+integer
+floating
+string
+symbol
+invalid
+formatted_string

@@ -11,6 +11,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 from .c_emit_pass import emit_hir_c_files
 from .cleanup_lowering_pass import lower_hir_static_cleanups
 from .comptime_externs import default_comptime_externs
+from .compile_time_pass import ComptimeEffects
 from .hir_lowering_pass import compile_to_hir
 from .hir_nodes import HIRProgram
 from .hir_validation_pass import validate_backend_hir
@@ -94,6 +95,7 @@ class CompilationResult:
     output_path: Path
     backend: str
     saved_artifacts: tuple[Path, ...] = ()
+    comptime_dependencies: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -174,7 +176,8 @@ class CompilerDriver:
         )
 
     def compile_hir(
-        self, entry: Path, options: CompilationOptions | None = None
+        self, entry: Path, options: CompilationOptions | None = None,
+        *, effects: ComptimeEffects | None = None,
     ) -> HIRProgram:
         options = options or CompilationOptions()
         ast = load_source_file(
@@ -186,13 +189,15 @@ class CompilerDriver:
             ast,
             print_handler=self.print_handler,
             externs=self.comptime_externs,
+            effects=effects,
         )
 
     def backend_hir(
-        self, entry: Path, options: CompilationOptions | None = None
+        self, entry: Path, options: CompilationOptions | None = None,
+        *, effects: ComptimeEffects | None = None,
     ) -> HIRProgram:
         return validate_backend_hir(
-            lower_hir_static_cleanups(self.compile_hir(entry, options))
+            lower_hir_static_cleanups(self.compile_hir(entry, options, effects=effects))
         )
 
     def compile_executable(
@@ -208,7 +213,8 @@ class CompilerDriver:
         if type(options.optimization) is not int or options.optimization not in range(4):
             raise CompilerDriverError('Optimization level must be an integer from 0 to 3.')
 
-        program = self.backend_hir(entry, options)
+        effects = ComptimeEffects()
+        program = self.backend_hir(entry, options, effects=effects)
         artifacts = backend.emit(
             program,
             BackendEmissionOptions(
@@ -225,13 +231,18 @@ class CompilerDriver:
             build_dir.mkdir(parents=True, exist_ok=True)
             saved = self._materialize_artifacts(build_dir, artifacts)
             self._link_atomically(build_dir, artifacts, output, options)
-            return CompilationResult(output, backend.name, saved)
+            return CompilationResult(
+                output, backend.name, saved, tuple(sorted(effects.dependencies))
+            )
 
         with tempfile.TemporaryDirectory(prefix='jack-build-') as tmpdir:
             build_dir = Path(tmpdir)
             self._materialize_artifacts(build_dir, artifacts)
             self._link_atomically(build_dir, artifacts, output, options)
-        return CompilationResult(output, backend.name)
+        return CompilationResult(
+            output, backend.name,
+            comptime_dependencies=tuple(sorted(effects.dependencies)),
+        )
 
     @staticmethod
     def _validate_artifacts(artifacts: BackendArtifacts) -> None:

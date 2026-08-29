@@ -9,13 +9,14 @@ def default_comptime_externs() -> dict[str, object]:
         'jack_std_io_open_read': jack_std_io_open_read,
         'fread': fread,
         'fclose': fclose,
-        'fwrite': fwrite,
     }
 
 
 def fopen(path: object, mode: object) -> object:
     path_text = _borrowed_c_string(path)
     mode_text = _borrowed_c_string(mode)
+    if any(flag in mode_text for flag in ('w', 'a', '+')):
+        raise ValueError('Comptime filesystem access is read-only.')
     python_mode = mode_text if 'b' in mode_text else mode_text + 'b'
     return open(path_text, python_mode)
 
@@ -43,22 +44,6 @@ def fread(data: object, size: object, count: object, stream: object) -> int:
 def fclose(stream: object) -> int:
     stream.close()
     return 0
-
-
-def fwrite(data: object, size: object, count: object, stream: object) -> int:
-    size_value = _as_int(size)
-    count_value = _as_int(count)
-    if size_value < 0 or count_value < 0:
-        raise ValueError('fwrite size and count must be non-negative.')
-    if size_value == 0 or count_value == 0:
-        return 0
-
-    byte_count = size_value * count_value
-    stream.write(_borrowed_bytes(data, byte_count))
-    flush = getattr(stream, 'flush', None)
-    if flush is not None:
-        flush()
-    return count_value
 
 
 def _as_int(value: object) -> int:

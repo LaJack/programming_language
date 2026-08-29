@@ -26,6 +26,7 @@ from .hir_nodes import (
     HIRGlobalVariable,
     HIRIf,
     HIRIndexExpression,
+    HIRInitializedSliceExpression,
     HIRLiteralExpression,
     HIRMatch,
     HIRMaybeUninitBorrowExpression,
@@ -985,6 +986,21 @@ class LLVMLoweringPass:
             return LLVMValue('ptr', pointer.operand, expression.type_ref)
         if isinstance(expression, HIRSliceExpression):
             return self._slice(expression, env, mutable=True)
+        if isinstance(expression, HIRInitializedSliceExpression):
+            pointer = self._expression(expression.pointer, env)
+            length = self._coerce(
+                self._expression(expression.length, env), TypeReference('i32')
+            )
+            slice_type = self._type(expression.type_ref)
+            first = self._b.temp('slice')
+            result = self._b.temp('slice')
+            self._b.emit(
+                f'{first} = insertvalue {slice_type} poison, ptr {pointer.operand}, 0'
+            )
+            self._b.emit(
+                f'{result} = insertvalue {slice_type} {first}, i32 {length.operand}, 1'
+            )
+            return LLVMValue(slice_type, result, expression.type_ref)
         if isinstance(expression, HIRCompositeExpression):
             return self._composite(expression, env)
         if isinstance(expression, HIRCallExpression):

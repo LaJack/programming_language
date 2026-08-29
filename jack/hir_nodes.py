@@ -247,6 +247,12 @@ class HIRSliceExpression(HIRExpression):
 
 
 @dataclass(frozen=True, kw_only=True)
+class HIRInitializedSliceExpression(HIRExpression):
+    pointer: HIRExpression
+    length: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
 class HIRCompositeExpression(HIRExpression):
     left: HIRExpression
     operator: str

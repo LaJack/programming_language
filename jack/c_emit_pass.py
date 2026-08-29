@@ -43,6 +43,7 @@ try:
         HIRIf,
         HIRFormattedStringExpression,
         HIRIndexExpression,
+        HIRInitializedSliceExpression,
         HIRLiteralExpression,
         HIRMatch,
         HIRMaybeUninitBorrowExpression,
@@ -110,6 +111,7 @@ except ImportError:
         HIRIf,
         HIRFormattedStringExpression,
         HIRIndexExpression,
+        HIRInitializedSliceExpression,
         HIRLiteralExpression,
         HIRMatch,
         HIRMaybeUninitBorrowExpression,
@@ -388,6 +390,7 @@ class CEmitPass:
         lines.append('')
         lines.extend(self._emit_error_runtime_globals())
         lines.extend(self._emit_error_declarations())
+        lines.extend(self._emit_type_forward_declarations(types))
         lines.extend(self._emit_slice_type_declarations())
 
         if types:
@@ -1300,6 +1303,19 @@ class CEmitPass:
         lines.append(f'}} {self._mangle(declaration.name)};')
         return '\n'.join(self._with_source_directive(lines, declaration))
 
+    def _emit_type_forward_declarations(
+        self, declarations: Iterable[HIRTypeDeclaration]
+    ) -> list[str]:
+        lines: list[str] = []
+        for declaration in declarations:
+            if getattr(declaration, 'extern', False) or getattr(declaration, 'language_item', None) == 'MaybeUninit':
+                continue
+            name = self._mangle(declaration.name)
+            lines.append(f'typedef struct {name} {name};')
+        if lines:
+            lines.append('')
+        return lines
+
     def _emit_enum_declaration(self, declaration: HIREnumDeclaration) -> str:
         name = self._mangle(declaration.name)
         lines = [f'typedef struct {name} {{', '    uint32_t jack_tag;', '    union {']
@@ -2048,6 +2064,13 @@ class CEmitPass:
             return self._emit_hir_index_expression(expression, env)
         if isinstance(expression, HIRSliceExpression):
             return self._emit_hir_slice_literal(expression, env, mutable=False)
+        if isinstance(expression, HIRInitializedSliceExpression):
+            pointer = self._emit_hir_expression(expression.pointer, env)
+            length = self._emit_hir_value_expression(expression.length, env)
+            slice_type = self._slice_type_name(
+                self._element_type(expression.type_ref), mutable=False
+            )
+            return f'({slice_type}){{ {pointer}, {length} }}'
         if isinstance(expression, HIRBorrowExpression):
             return self._emit_hir_borrow_expression(expression, env)
         if isinstance(expression, HIRMoveExpression):

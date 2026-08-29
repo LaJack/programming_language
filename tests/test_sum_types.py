@@ -4,7 +4,7 @@ from contextlib import redirect_stdout
 
 from jack.ast_nodes import EnumDeclaration, Match
 from jack.cleanup_lowering_pass import lower_hir_static_cleanups
-from jack.compile_time_pass import apply_compile_time_pass
+from jack.compile_time_pass import CompileTimeError, apply_compile_time_pass
 from jack.hir_lowering_pass import lower_to_hir
 from jack.interpreter import Interpreter
 from jack.llvm_emit_pass import emit_hir_llvm
@@ -38,6 +38,57 @@ class SumTypeTests(unittest.TestCase):
 
         self.assertTrue(result.diagnostics)
         self.assertEqual(['first', 'broken', 'later'], [v.name for v in result.statements[0].variants])
+
+    def test_generates_nominal_union_from_comptime_string_slice(self):
+        ast = self.runtime_ast('''
+            comptime str[2] names;
+            comptime names[0] = "none";
+            comptime names[1] = "some";
+            pub comptime type Choice = Union(names[..]);
+            Choice value = Choice.none;
+        ''')
+
+        self.assertIsInstance(ast[0], EnumDeclaration)
+        self.assertTrue(ast[0].public)
+        self.assertEqual(['none', 'some'], [variant.name for variant in ast[0].variants])
+        validate_runtime_ast(ast)
+
+    def test_generates_union_with_payload_metadata(self):
+        ast = self.runtime_ast('''
+            comptime UnionVariant[2] variants;
+            comptime variants[0] = variant("none");
+            comptime variants[1] = variant(
+                "some", move_field("value", i32)
+            );
+            comptime type Choice = Union(variants[..]);
+            Choice value = Choice.some(42);
+        ''')
+
+        payload = ast[0].variants[1].parameters[0]
+        self.assertEqual(('value', 'i32', 'move'), (
+            payload.name, payload.type.name, payload.passing_mode
+        ))
+        validate_runtime_ast(ast)
+
+    def test_computed_type_alias_preserves_identity(self):
+        ast = self.runtime_ast('''
+            comptime str[1] names;
+            comptime names[0] = "ready";
+            comptime type State = Union(names[..]);
+            comptime type Alias = State;
+            Alias state = State.ready;
+        ''')
+
+        self.assertEqual('State', ast[1].type.name)
+
+    def test_computed_type_binding_is_immutable(self):
+        with self.assertRaisesRegex(CompileTimeError, 'immutable'):
+            self.runtime_ast('''
+                comptime str[1] names;
+                comptime names[0] = "ready";
+                comptime type State = Union(names[..]);
+                comptime State = i32;
+            ''')
 
     def test_requires_explicit_ownership_for_owned_place(self):
         ast = self.runtime_ast('union E { a; } void f() { E value = E.a; match (value) { .a { } } }')

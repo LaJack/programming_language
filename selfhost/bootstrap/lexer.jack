@@ -2,18 +2,62 @@ module bootstrap.lexer;
 
 import bootstrap.source;
 import std.collections.vector;
+import std.io;
 import std.memory;
+import std.string;
 
-pub union TokenKind {
-    eof;
-    identifier;
-    integer;
-    floating;
-    string;
-    symbol;
-    invalid;
-    formatted_string;
+void collect_token_variants(
+    comptime bool generating,
+    &in u8[] source,
+    &inout Vector(UnionVariant, SystemAllocator) variants
+) raises CapacityError, LayoutError, AllocationError, Utf8Error {
+    usize start = usize(0);
+    usize index = usize(0);
+    while (index <= usize(len(source))) {
+        bool at_end = index == usize(len(source));
+        bool at_newline = false;
+        if (at_end == false) {
+            at_newline = source[index] == u8(10);
+        }
+        bool line_complete = at_end;
+        if (at_newline) { line_complete = true; }
+        if (line_complete) {
+            usize end = index;
+            if (end > start) {
+                if (source[end - usize(1)] == u8(13)) {
+                    end = end - usize(1);
+                }
+            }
+            if (end > start) {
+                if (source[start] != u8(35)) {
+                    SystemAllocator name_allocator;
+                    StringBuilder(SystemAllocator) name(name_allocator);
+                    name.append_bytes(source[i32(start)..i32(end)]);
+                    String(SystemAllocator) text = finish_string(
+                        SystemAllocator, name
+                    );
+                    variants.push(variant(text.as_str()));
+                }
+            }
+            start = index + usize(1);
+        }
+        index = index + usize(1);
+    }
 }
+
+comptime File token_file = open_read("selfhost/bootstrap/jack.tokens");
+comptime SystemAllocator token_source_allocator;
+comptime String(SystemAllocator) token_source = read_to_string(
+    SystemAllocator, token_file, token_source_allocator
+);
+comptime SystemAllocator token_variant_allocator;
+comptime Vector(UnionVariant, SystemAllocator) token_variants(
+    token_variant_allocator, usize(0)
+);
+comptime collect_token_variants(
+    true, token_source.bytes(), token_variants
+);
+pub comptime type TokenKind = Union(token_variants.as_slice());
 
 pub struct Token {
     TokenKind kind;

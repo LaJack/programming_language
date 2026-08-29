@@ -40,6 +40,7 @@ try:
         HIRIf,
         HIRFormattedStringExpression,
         HIRIndexExpression,
+        HIRInitializedSliceExpression,
         HIRLiteralExpression,
         HIRMatch,
         HIRMaybeUninitBorrowExpression,
@@ -105,6 +106,7 @@ except ImportError:
         HIRIf,
         HIRFormattedStringExpression,
         HIRIndexExpression,
+        HIRInitializedSliceExpression,
         HIRLiteralExpression,
         HIRMatch,
         HIRMaybeUninitBorrowExpression,
@@ -188,6 +190,7 @@ class JackSlice:
     length: int
     mutable: bool = False
     mode: str = 'in'
+    unwrap_storage: bool = False
 
     def __post_init__(self) -> None:
         if self.mutable and self.mode == 'in':
@@ -195,13 +198,18 @@ class JackSlice:
         self.mutable = borrow_mode_can_write(self.mode)
 
     def __deepcopy__(self, memo):
-        return JackSlice(self.array, self.start, self.length, self.mutable, self.mode)
+        return JackSlice(
+            self.array, self.start, self.length, self.mutable, self.mode,
+            self.unwrap_storage,
+        )
 
     def get(self, index: int) -> object:
         if not borrow_mode_can_read(self.mode):
             raise EvaluationError('Cannot read through a write-only slice.')
         self._check_index(index)
         value = self.array.values[self.start + index]
+        if self.unwrap_storage and isinstance(value, MemoryMaybeUninit):
+            return value.get()
         if isinstance(value, MemoryMaybeUninit):
             return value.get()
         return value
@@ -1039,6 +1047,21 @@ class Interpreter:
             return self._eval_hir_index(expression, scope)
         if isinstance(expression, HIRSliceExpression):
             return self._slice_from_hir_expression(expression, scope, mutable=False)
+        if isinstance(expression, HIRInitializedSliceExpression):
+            pointer = self._eval_hir_expression(expression.pointer, scope)
+            length = self._hir_index_value(expression.length, scope)
+            if not isinstance(pointer, JackRawPointer):
+                raise EvaluationError('initialized_slice requires a raw pointer.')
+            pointer._require_live()
+            if not isinstance(pointer.target, JackArrayElementBorrow):
+                raise EvaluationError('initialized_slice requires array provenance.')
+            start = pointer.target.index
+            if length < 0 or start + length > len(pointer.target.array.values):
+                raise EvaluationError('initialized_slice exceeds allocation bounds.')
+            return JackSlice(
+                pointer.target.array, start, length, mode='in',
+                unwrap_storage=pointer.unwrap_storage,
+            )
         if isinstance(expression, HIRBorrowExpression):
             return self._eval_hir_borrow(expression, scope)
         if isinstance(expression, HIRMoveExpression):

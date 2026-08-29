@@ -70,6 +70,11 @@ struct Pair(comptime type T: Copyable) {
 }
 ```
 
+Compile-time code may also construct a nominal union from metadata. The
+self-hosted lexer reads `selfhost/bootstrap/jack.tokens`, collects its names in
+an ordinary `Vector`, and binds the result as its concrete `TokenKind` type.
+Comptime file access is read-only and tracked as a build dependency.
+
 ### Ownership And Borrows
 
 Function signatures completely describe argument behavior. Plain parameters

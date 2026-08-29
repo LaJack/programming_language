@@ -1,6 +1,11 @@
 from .c_emit_pass import CEmitError, CEmitFeatureNotImplemented, emit_c, emit_c_files, emit_hir_c, emit_hir_c_files, emit_runtime_c, emit_runtime_c_files
 from .cleanup_lowering_pass import lower_hir_static_cleanups
-from .compile_time_pass import CompileTimeError, CompileTimeFeatureNotImplemented, apply_compile_time_pass
+from .compile_time_pass import (
+    ComptimeEffects,
+    CompileTimeError,
+    CompileTimeFeatureNotImplemented,
+    apply_compile_time_pass,
+)
 from .compiler_driver import (
     BackendArtifacts,
     BackendArtifactError,
@@ -38,6 +43,7 @@ __all__ = [
     'CEmitError',
     'CompileTimeError',
     'CompileTimeFeatureNotImplemented',
+    'ComptimeEffects',
     'BackendArtifacts',
     'BackendArtifactError',
     'BackendEmissionOptions',

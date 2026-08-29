@@ -29,6 +29,7 @@ try:
         HIRIf,
         HIRIfBranch,
         HIRIndexExpression,
+        HIRInitializedSliceExpression,
         HIRLiteralExpression,
         HIRMatch,
         HIRMatchArm,
@@ -81,6 +82,7 @@ except ImportError:
         HIRIf,
         HIRIfBranch,
         HIRIndexExpression,
+        HIRInitializedSliceExpression,
         HIRLiteralExpression,
         HIRMatch,
         HIRMatchArm,
@@ -352,6 +354,13 @@ class HIRStaticCleanupLoweringPass:
             )
             self._merge_errors(
                 errors, self._hir_expression_raised_errors(expression.end)
+            )
+        elif isinstance(expression, HIRInitializedSliceExpression):
+            self._merge_errors(
+                errors, self._hir_expression_raised_errors(expression.pointer)
+            )
+            self._merge_errors(
+                errors, self._hir_expression_raised_errors(expression.length)
             )
         elif isinstance(expression, HIRFieldAccessExpression):
             self._merge_errors(

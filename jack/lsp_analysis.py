@@ -49,6 +49,7 @@ from .builtin_types import (
     cast_builtin_value,
 )
 from .comptime_externs import default_comptime_externs
+from .compile_time_pass import ComptimeEffects
 from .hir_lowering_pass import compile_to_hir
 from .module_loader import LoadedSourceGraph, ModuleLoadError, load_source_graph
 from .parser import Lexer, ParseError, Token, parse, parse_recovering
@@ -68,9 +69,13 @@ JACK_KEYWORDS = {
 }
 BUILTIN_TYPES = {
     'void', 'str', 'c_char', 'c_void', 'type', 'Copyable', 'MaybeUninit',
+    'UnionField', 'UnionVariant',
     *BUILTIN_TYPE_SPECS
 }
-BUILTIN_FUNCTIONS = {'len', 'sizeof', 'alignof', 'raw'}
+BUILTIN_FUNCTIONS = {
+    'len', 'sizeof', 'alignof', 'raw', 'Union', 'variant', 'field',
+    'move_field', 'initialized_slice',
+}
 
 
 def path_from_uri(uri: str) -> Path | None:
@@ -238,6 +243,7 @@ class ProjectAnalyzer:
         self.module_roots = self._unique_roots(module_roots)
         self.import_overrides = dict(import_overrides or {})
         self._cache: dict[tuple[Path, str, bool], ProjectAnalysis] = {}
+        self._comptime_dependencies: set[Path] = set()
 
     @staticmethod
     def _unique_roots(roots: Iterable[Path]) -> list[Path]:
@@ -287,6 +293,12 @@ class ProjectAnalyzer:
                     source = ''
             digest.update(source.encode())
             project_sources[path] = source
+        for path in sorted(self._comptime_dependencies):
+            digest.update(str(path).encode())
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b'<missing>')
         cache_key = (focus, digest.hexdigest(), full_comptime)
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -355,16 +367,21 @@ class ProjectAnalyzer:
                 continue
             seen_graphs.add(graph_key)
             try:
+                effects = ComptimeEffects(allow_host_io=full_comptime)
                 compile_to_hir(
                     copy.deepcopy(graph.ast),
                     print_handler=None,
                     externs=default_comptime_externs() if full_comptime else {},
+                    effects=effects,
                 )
+                if full_comptime:
+                    self._comptime_dependencies.update(effects.dependencies)
             except Exception as err:
                 message = str(err)
                 if (
                     not full_comptime
-                    and ('No comptime extern binding registered' in message
+                    and ('Comptime host IO deferred' in message
+                         or 'No comptime extern binding registered' in message
                          or 'without a registered C host binding' in message)
                 ):
                     deferred = True
@@ -1143,6 +1160,12 @@ def _source_span(path: Path, source: str) -> SourceSpan:
 
 
 def _declaration_kind(node: Statement) -> str:
+    if (
+        isinstance(node, VariableDeclaration)
+        and node.comptime
+        and node.type.name == 'type'
+    ):
+        return 'type'
     if isinstance(node, (TypeDeclaration, EnumDeclaration)):
         return 'type'
     if isinstance(node, ViewDeclaration):
@@ -1176,6 +1199,10 @@ def _declaration_signature(node: Statement, name: str) -> str:
     if isinstance(node, FunctionDeclaration):
         return _function_signature(node, name)
     if isinstance(node, VariableDeclaration):
+        if node.comptime and node.type.name == 'type':
+            return (
+                f'{'pub ' if node.public else ''}comptime generated union {name}'
+            )
         return f'{_type_label(node.type)} {name}'
     return name
 

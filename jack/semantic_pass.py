@@ -1923,6 +1923,21 @@ class SemanticPass:
                 copy.deepcopy(pointee.arguments),
                 pointer_mode='inout' if borrow_mode_can_write(argument.mode) else 'in',
             )
+        if call.function_name == 'initialized_slice':
+            if self.unsafe_depth == 0:
+                raise SemanticError('initialized_slice requires an unsafe context.')
+            if len(call.parameters) != 2:
+                raise SemanticError('initialized_slice expects a pointer and a length.')
+            pointer_type = self._expression_type(call.parameters[0], scope)
+            if pointer_type.pointer_mode is None or pointer_type.nullable:
+                raise SemanticError('initialized_slice requires a non-null raw pointer.')
+            self._expect_integer_expression(call.parameters[1], scope, 'slice length')
+            return TypeReference(
+                pointer_type.name,
+                copy.deepcopy(pointer_type.arguments),
+                is_slice=True,
+                borrow='in',
+            )
         if call.function_name.endswith('.offset'):
             if self.unsafe_depth == 0:
                 raise SemanticError('Raw pointer offset requires an unsafe context.')
@@ -2219,6 +2234,16 @@ class SemanticPass:
             )
             and self.unsafe_depth > 0
         ):
+            return
+        if (
+            type(expression) is FunctionCall
+            and expression.function_name == 'initialized_slice'
+            and self.unsafe_depth > 0
+        ):
+            if self.current_borrow_return_accesses is not None:
+                self.current_borrow_return_accesses.append(
+                    BorrowAccess(BorrowPath('self'), return_type.borrow or 'in')
+                )
             return
         if type(expression) is FunctionCall and '.' in expression.function_name:
             receiver_name, method_name = expression.function_name.rsplit('.', 1)

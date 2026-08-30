@@ -98,6 +98,35 @@ class ErrorEffectsTests(unittest.TestCase):
         self.assertIsInstance(cleanup, HIRIf)
         self.assertEqual('Tracer.deinit', cleanup.branches[0].body[0].expr.target.name)
 
+    def test_cleanup_finds_moves_nested_in_a_moved_aggregate_temporary(self):
+        program = lower_to_hir(compile_and_validate('''
+            struct Resource {
+                i32 id;
+                deinit(move self) { }
+            }
+            struct Pair { Resource left; Resource right; }
+            void consume(move Pair pair) { }
+            void run() {
+                Resource left = Resource { id = 1 };
+                Resource right = Resource { id = 2 };
+                consume(Pair { left = move left, right = move right });
+            }
+        '''))
+        function = next(
+            declaration for declaration in program.declarations
+            if isinstance(declaration, HIRFunctionDeclaration)
+            and declaration.name == 'run'
+        )
+        statement = next(
+            statement for statement in function.body
+            if isinstance(statement, HIRExpressionStatement)
+        )
+
+        self.assertEqual(
+            {'left', 'right'},
+            HIRStaticCleanupLoweringPass()._hir_moved_places_in_statement(statement),
+        )
+
     def test_hir_cleanup_lowering_wraps_raising_calls(self):
         program = lower_to_hir(compile_and_validate(
             access_error_source() + fail_source() + '''

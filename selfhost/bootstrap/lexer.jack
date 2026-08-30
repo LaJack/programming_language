@@ -49,6 +49,7 @@ pub struct Token {
     usize end_offset(&in self) { return self.span.end_offset(); }
     usize line_number(&in self) { return self.span.line_number(); }
     usize column_number(&in self) { return self.span.column_number(); }
+    SourceSpan source_location(&in self) { return self.span; }
 }
 
 pub TokenKind token_eof() { return TokenKind.eof; }
@@ -76,16 +77,12 @@ void emit(
     usize start,
     usize end,
     usize line,
-    usize column
+    usize column,
+    SourceId source_id
 ) raises CapacityError, LayoutError, AllocationError {
     tokens.push(Token {
         kind = kind;
-        span = SourceSpan {
-            start = start;
-            end = end;
-            line = line;
-            column = column;
-        };
+        span = source_span(source_id, start, end, line, column);
     });
 }
 
@@ -194,6 +191,7 @@ HandlerResult scan_handler(
 
 pub Vector(Token, A) lex(
     comptime type A: Allocator,
+    SourceId source_id,
     &in u8[] source,
     move A allocator
 ) raises CapacityError, LayoutError, AllocationError {
@@ -225,7 +223,10 @@ pub Vector(Token, A) lex(
             }
         }
         if (accepted == u16(65535)) {
-            emit(A, tokens, token_invalid(), index, index + usize(1), line, column);
+            emit(
+                A, tokens, token_invalid(), index, index + usize(1),
+                line, column, source_id
+            );
             index = index + usize(1);
             column = column + usize(1);
         } else {
@@ -242,7 +243,10 @@ pub Vector(Token, A) lex(
                 if (result.emit_token) {
                     TokenKind kind = token_kind(rule_token);
                     if (result.valid == false) { kind = token_invalid(); }
-                    emit(A, tokens, kind, start, index, start_line, start_column);
+                    emit(
+                        A, tokens, kind, start, index,
+                        start_line, start_column, source_id
+                    );
                 }
             } else {
                 index = accepted_end;
@@ -261,12 +265,12 @@ pub Vector(Token, A) lex(
                     emit(
                         A, tokens, token_kind(rule_token),
                         start, index,
-                        start_line, start_column
+                        start_line, start_column, source_id
                     );
                 }
             }
         }
     }
-    emit(A, tokens, token_eof(), index, index, line, column);
+    emit(A, tokens, token_eof(), index, index, line, column, source_id);
     return tokens;
 }

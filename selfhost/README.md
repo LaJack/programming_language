@@ -17,14 +17,34 @@ stateful handlers.
 
 `bootstrap.main` is a separately compiled executable. It reads a UTF-8 Jack
 source file, prints the numeric token stream to stdout, and writes deterministic
-errors to stderr. Build and run it from the repository root with:
+diagnostics to stderr. Build and run it from the repository root with:
 
 ```sh
 jack --backend llvm -O2 selfhost/bootstrap/main.jack --module-root selfhost -o jack-bootstrap
 ./jack-bootstrap examples/vector.jack
 ```
 
-The token dump remains numeric for stable differential testing, lexemes remain
-in the source buffer, and source positions are byte-oriented. Comptime table
-construction currently favors simple ordinary Jack code over build speed.
-Parsing and richer bootstrap diagnostics are later milestones.
+Human diagnostics are the default. Differential tools can request the stable,
+escaped record format without changing token stdout:
+
+```sh
+./jack-bootstrap --diagnostic-format stable examples/vector.jack
+```
+
+`bootstrap.source.SourceMap` owns source paths, UTF-8 contents, and line-start
+tables. Its opaque IDs remain stable while the map is alive, including across
+internal growth and movement. Spans and displayed positions are byte-oriented;
+tabs expand to four spaces only while rendering excerpts.
+
+`bootstrap.diagnostics.DiagnosticBag` owns diagnostics, labels, and notes. It
+preserves insertion order, deduplicates matching code/source/offset tuples, and
+reports entries omitted by its configured cap. Labels may refer to different
+source files. Dotted lowercase diagnostic codes are stable tooling identifiers;
+human wording is not part of the compatibility contract. The stable renderer
+emits indexed `diagnostic`, `label`, `note`, and `omitted` tab-separated records
+and escapes backslash, tab, carriage return, and newline in all text fields.
+
+The token dump remains numeric for stable differential testing and lexemes
+remain in the source buffer. Comptime table construction uses ordinary Jack
+code and word-based DFA state sets. Parser recovery will consume the diagnostic
+bag in the next frontend milestone.

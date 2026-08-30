@@ -1,27 +1,229 @@
 module bootstrap.source;
 
+import std.collections.vector;
+import std.memory;
+import std.string;
+
+pub struct SourceMapError { }
+
+pub struct SourceId {
+    usize value;
+
+    bool equals(&in self, SourceId other) { return self.value == other.value; }
+}
+
+pub struct SourceFile {
+    String(SystemAllocator) path;
+    String(SystemAllocator) text;
+    Vector(usize, SystemAllocator) line_starts;
+}
+
+pub struct SourceMap {
+    Vector(SourceFile, SystemAllocator) files;
+
+    init(&inout self)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        SystemAllocator allocator;
+        Vector(SourceFile, SystemAllocator) files(allocator, usize(0));
+        self.files = move files;
+    }
+
+    SourceId add(
+        &inout self,
+        str path,
+        move String(SystemAllocator) text
+    ) raises CapacityError, LayoutError, AllocationError {
+        SystemAllocator path_allocator;
+        String(SystemAllocator) owned_path(path_allocator, path);
+        SystemAllocator line_allocator;
+        Vector(usize, SystemAllocator) line_starts(line_allocator, usize(1));
+        line_starts.push(usize(0));
+        usize index = usize(0);
+        while (index < text.len()) {
+            if (text.bytes()[index] == u8(10)) {
+                line_starts.push(index + usize(1));
+            }
+            index = index + usize(1);
+        }
+        SourceId id = SourceId { value = self.files.len() };
+        self.files.push(SourceFile {
+            path = move owned_path,
+            text = move text,
+            line_starts = move line_starts,
+        });
+        return id;
+    }
+
+    usize len(&in self) { return self.files.len(); }
+
+    str path(&in self, SourceId id) raises SourceMapError {
+        try {
+            &in SourceFile file = self.files.get(id.value);
+            return file.path.as_str();
+        } catch BoundsError {
+            raise SourceMapError { };
+        }
+    }
+
+    &in u8[] bytes(&in self, SourceId id) raises SourceMapError {
+        try {
+            &in SourceFile file = self.files.get(id.value);
+            return file.text.bytes();
+        } catch BoundsError {
+            raise SourceMapError { };
+        }
+    }
+
+    usize line_count(&in self, SourceId id) raises SourceMapError {
+        try {
+            &in SourceFile file = self.files.get(id.value);
+            return file.line_starts.len();
+        } catch BoundsError {
+            raise SourceMapError { };
+        }
+    }
+
+    usize source_len(&in self, SourceId id) raises SourceMapError {
+        try {
+            &in SourceFile file = self.files.get(id.value);
+            return file.text.len();
+        } catch BoundsError {
+            raise SourceMapError { };
+        }
+    }
+
+    u8 byte_at(&in self, SourceId id, usize offset) raises SourceMapError {
+        try {
+            &in SourceFile file = self.files.get(id.value);
+            if (offset >= file.text.len()) { raise SourceMapError { }; }
+            return file.text.bytes()[offset];
+        } catch BoundsError {
+            raise SourceMapError { };
+        }
+    }
+
+    usize line_for_offset(&in self, SourceId id, usize offset)
+        raises SourceMapError
+    {
+        try {
+            &in SourceFile file = self.files.get(id.value);
+            if (offset > file.text.len()) { raise SourceMapError { }; }
+            usize line = usize(1);
+            bool scanning = true;
+            while (line < file.line_starts.len() && scanning) {
+                if (file.line_starts.get(line) > offset) { scanning = false; }
+                else { line = line + usize(1); }
+            }
+            return line;
+        } catch BoundsError {
+            raise SourceMapError { };
+        }
+    }
+
+    usize line_start(&in self, SourceId id, usize line) raises SourceMapError {
+        if (line == usize(0)) { raise SourceMapError { }; }
+        try {
+            &in SourceFile file = self.files.get(id.value);
+            return file.line_starts.get(line - usize(1));
+        } catch BoundsError {
+            raise SourceMapError { };
+        }
+    }
+
+    usize line_end(&in self, SourceId id, usize line) raises SourceMapError {
+        if (line == usize(0)) { raise SourceMapError { }; }
+        try {
+            &in SourceFile file = self.files.get(id.value);
+            usize start = file.line_starts.get(line - usize(1));
+            usize end = file.text.len();
+            if (line < file.line_starts.len()) {
+                end = file.line_starts.get(line) - usize(1);
+            }
+            &in u8[] bytes = file.text.bytes();
+            if (end > start && bytes[end - usize(1)] == u8(13)) {
+                end = end - usize(1);
+            }
+            return end;
+        } catch BoundsError {
+            raise SourceMapError { };
+        }
+    }
+
+    void validate(&in self, &in SourceSpan span) raises SourceMapError {
+        try {
+            &in SourceFile file = self.files.get(span.source.value);
+            if (span.start > span.end || span.end > file.text.len()) {
+                raise SourceMapError { };
+            }
+            if (span.line == usize(0) || span.line > file.line_starts.len()) {
+                raise SourceMapError { };
+            }
+            usize expected_start = file.line_starts.get(span.line - usize(1));
+            usize expected_end = file.text.len();
+            if (span.line < file.line_starts.len()) {
+                expected_end = file.line_starts.get(span.line);
+            }
+            if (span.start < expected_start) {
+                raise SourceMapError { };
+            }
+            if (
+                span.line < file.line_starts.len()
+                && span.start >= expected_end
+            ) {
+                raise SourceMapError { };
+            }
+            if (span.column != span.start - expected_start + usize(1)) {
+                raise SourceMapError { };
+            }
+        } catch BoundsError {
+            raise SourceMapError { };
+        }
+    }
+}
+
 pub struct SourceSpan {
+    SourceId source;
     usize start;
     usize end;
     usize line;
     usize column;
 
+    SourceId source_id(&in self) { return self.source; }
     usize start_offset(&in self) { return self.start; }
     usize end_offset(&in self) { return self.end; }
     usize line_number(&in self) { return self.line; }
     usize column_number(&in self) { return self.column; }
+
+    bool same_range(&in self, &in SourceSpan other) {
+        return self.source.equals(other.source)
+            && self.start == other.start
+            && self.end == other.end;
+    }
 }
 
 pub SourceSpan source_span(
+    SourceId source,
     usize start,
     usize end,
     usize line,
     usize column
 ) {
     return SourceSpan {
+        source = source,
         start = start,
         end = end,
         line = line,
-        column = column
+        column = column,
+    };
+}
+
+pub SourceSpan empty_source_span() {
+    return SourceSpan {
+        source = SourceId { value = usize(0) };
+        start = usize(0);
+        end = usize(0);
+        line = usize(1);
+        column = usize(1);
     };
 }

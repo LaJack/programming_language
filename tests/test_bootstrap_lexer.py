@@ -73,14 +73,19 @@ class BootstrapLexerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.build.cleanup()
 
-    def run_interpreter(self, path: Path, *arguments: str):
+    def run_interpreter(self, path: Path | None, *arguments: str):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             status = Interpreter(
                 externs=default_runtime_externs()
             ).eval_hir_program(
-                self.program, ['jack-bootstrap', str(path), *arguments]
+                self.program,
+                [
+                    'jack-bootstrap',
+                    *arguments,
+                    *([] if path is None else [str(path)]),
+                ],
             )
         return status, stdout.getvalue(), stderr.getvalue()
 
@@ -125,8 +130,32 @@ class BootstrapLexerTests(unittest.TestCase):
             '0\t7\t7\t1\t8\n'
         )
         self.assert_runtime_parity(
-            path, expected, status=1, expected_stderr='error\tlex\t1\t1\n'
+            path,
+            expected,
+            status=1,
+            expected_stderr=(
+                'error[lex.invalid-token]: invalid token\n'
+                f' --> {path}:1:1\n'
+                '  |\n'
+                '1 | @ valid\n'
+                '  | ^\n'
+            ),
         )
+        stable = (
+            'diagnostic\t0\terror\tlex.invalid-token\t'
+            f'{path}\t0\t1\t1\t1\tinvalid token\n'
+        )
+        results = [
+            self.run_interpreter(path, '--diagnostic-format', 'stable')
+        ]
+        results.extend(
+            self.run_native(
+                backend, '--diagnostic-format', 'stable', str(path)
+            )
+            for backend in ('c', 'llvm')
+        )
+        for result in results:
+            self.assertEqual((1, expected, stable), result)
 
     def test_unterminated_string_and_comment_report_invalid_tokens(self):
         for name, source in (
@@ -146,21 +175,31 @@ class BootstrapLexerTests(unittest.TestCase):
     def test_usage_and_missing_file_contracts(self):
         for backend in ('c', 'llvm'):
             status, stdout, stderr = self.run_native(backend)
-            self.assertEqual((2, '', 'usage: jack-bootstrap <source>\n'),
+            self.assertEqual((2, '', 'usage: jack-bootstrap [--diagnostic-format human|stable] <source>\n'),
                              (status, stdout, stderr))
             status, stdout, stderr = self.run_native(
                 backend, str(self.root / 'missing.jack')
             )
             self.assertEqual(1, status)
             self.assertEqual('', stdout)
-            self.assertRegex(stderr, r'^error\tio\t[0-9]+\n$')
+            self.assertRegex(
+                stderr,
+                r'^error\[io\.operation\]: I/O operation failed with code [0-9]+\n$',
+            )
 
     def test_invalid_utf8_source_reports_byte_offset(self):
         path = self.root / 'invalid-utf8.jack'
         path.write_bytes(b'ok \xff')
         for backend in ('c', 'llvm'):
             status, stdout, stderr = self.run_native(backend, str(path))
-            self.assertEqual((1, '', 'error\tutf8\t3\n'), (status, stdout, stderr))
+            self.assertEqual(
+                (
+                    1,
+                    '',
+                    'error[source.invalid-utf8]: invalid UTF-8 at byte offset 3\n',
+                ),
+                (status, stdout, stderr),
+            )
 
     def test_valid_utf8_uses_byte_offsets_and_columns(self):
         path = self.root / 'utf8.jack'
@@ -171,7 +210,16 @@ class BootstrapLexerTests(unittest.TestCase):
             '0\t2\t2\t1\t3\n'
         )
         self.assert_runtime_parity(
-            path, expected, status=1, expected_stderr='error\tlex\t1\t1\n'
+            path,
+            expected,
+            status=1,
+            expected_stderr=(
+                'error[lex.invalid-token]: invalid token\n'
+                f' --> {path}:1:1\n'
+                '  |\n'
+                '1 | é\n'
+                '  | ^\n'
+            ),
         )
 
     def test_optimized_llvm_matches_bootstrap_output(self):

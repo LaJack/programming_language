@@ -118,6 +118,12 @@ pub struct StringBuilder(comptime type A: Allocator) {
         self.buffer.append(value);
     }
 
+    void append_byte(&inout self, u8 value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.buffer.push(value);
+    }
+
     void append_u64(&inout self, u64 value)
         raises CapacityError, LayoutError, AllocationError
     {

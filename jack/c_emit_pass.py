@@ -2283,7 +2283,10 @@ class CEmitPass:
         expression_result: str | None,
     ) -> list[str]:
         temp = self._next_temporary_name('match_value')
-        borrowed = statement.ownership in {'in', 'out', 'inout'}
+        borrowed = (
+            statement.ownership in {'in', 'out', 'inout'}
+            or statement.scrutinee.type_ref.borrow in {'in', 'out', 'inout'}
+        )
         temp_type = copy.deepcopy(statement.scrutinee.type_ref)
         initializer = self._emit_hir_expression(statement.scrutinee, env)
         lines = [f'{self._emit_declaration(temp_type, temp, env)} = {initializer};']

@@ -1552,6 +1552,10 @@ class HIRStaticCleanupLoweringPass:
                 place = self._hir_place_name(value.expr)
                 if place is not None:
                     names.add(place)
+                    return
+                # Moving a temporary consumes the temporary itself, but its
+                # construction may have moved owned places into it.
+                visit(value.expr)
                 return
             if isinstance(value, (str, int, float, bool, bytes, TypeReference)) or value is None:
                 return

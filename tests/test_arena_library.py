@@ -140,11 +140,16 @@ import bootstrap.arena_fixture;
 import bootstrap.source;
 import std.collections.arena;
 import std.memory;
+import std.string;
 
 void run() raises CapacityError, LayoutError, AllocationError {
+    SystemAllocator source_allocator;
+    String(SystemAllocator) text(source_allocator, "abc");
+    SourceMap sources;
+    SourceId source = sources.add("fixture.jack", text);
     SourceSpan[2] spans;
-    spans[0] = source_span(usize(0), usize(1), usize(1), usize(1));
-    spans[1] = source_span(usize(2), usize(3), usize(1), usize(3));
+    spans[0] = source_span(source, usize(0), usize(1), usize(1), usize(1));
+    spans[1] = source_span(source, usize(2), usize(3), usize(1), usize(3));
     SystemAllocator allocator;
     Arena(SourceSpan, SystemAllocator) arena =
         store_source_spans(SystemAllocator, spans[..], allocator);

@@ -1,16 +1,12 @@
 module bootstrap.main;
 
+import bootstrap.diagnostics;
 import bootstrap.lexer;
+import bootstrap.source;
 import std.collections.vector;
 import std.io;
 import std.memory;
 import std.string;
-
-struct DumpResult {
-    bool invalid;
-    usize line;
-    usize column;
-}
 
 void append_separator(&inout StringBuilder(SystemAllocator) output)
     raises CapacityError, LayoutError, AllocationError
@@ -37,72 +33,125 @@ void write_token(&in Token token)
     write_stdout(line.as_str());
 }
 
-DumpResult dump_tokens(&in Vector(Token, SystemAllocator) tokens)
+bool dump_tokens(
+    &in Vector(Token, SystemAllocator) tokens,
+    &inout DiagnosticBag diagnostics
+)
     raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError,
         BoundsError
 {
     usize index = usize(0);
-    DumpResult result = DumpResult {
-        invalid = false, line = usize(0), column = usize(0)
-    };
+    bool invalid = false;
     while (index < tokens.len()) {
         &in Token token = tokens.get(index);
         write_token(token);
-        if (result.invalid == false) {
+        if (invalid == false) {
             if (token.kind_value() == u8(6)) {
-                result.invalid = true;
-                result.line = token.line_number();
-                result.column = token.column_number();
+                invalid = true;
+                Diagnostic diagnostic = source_diagnostic(
+                    DiagnosticSeverity.error,
+                    "lex.invalid-token",
+                    token.source_location(),
+                    "invalid token"
+                );
+                diagnostics.add(diagnostic);
             }
         }
         index = index + usize(1);
     }
-    return result;
+    return invalid;
 }
 
-void report_number(str category, usize value)
-    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError
+void write_locationless(
+    DiagnosticFormat format,
+    str code,
+    str message
+)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError,
+        SourceMapError, BoundsError
 {
+    SourceMap sources;
+    DiagnosticBag diagnostics(usize(1));
+    Diagnostic diagnostic = locationless_diagnostic(
+        DiagnosticSeverity.error, code, message
+    );
+    diagnostics.add(diagnostic);
+    String(SystemAllocator) rendered = render_diagnostics(
+        sources, diagnostics, format
+    );
+    write_stderr(rendered.as_str());
+}
+
+void write_numbered_locationless(
+    DiagnosticFormat format,
+    str code,
+    str prefix,
+    usize value
+) raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError,
+         SourceMapError, BoundsError {
     SystemAllocator allocator;
     StringBuilder(SystemAllocator) output(allocator);
-    output.append("error\t");
-    output.append(category);
-    output.append("\t");
+    output.append(prefix);
     output.append_usize(value);
-    output.append("\n");
-    String(SystemAllocator) line = finish_string(SystemAllocator, output);
-    write_stderr(line.as_str());
+    String(SystemAllocator) message = finish_string(SystemAllocator, output);
+    write_locationless(format, code, message.as_str());
 }
 
-void report_io(i32 code)
-    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError
+void write_io_locationless(DiagnosticFormat format, i32 value)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError,
+        SourceMapError, BoundsError
 {
     SystemAllocator allocator;
     StringBuilder(SystemAllocator) output(allocator);
-    output.append("error\tio\t");
-    output.append_i64(i64(code));
-    output.append("\n");
-    String(SystemAllocator) line = finish_string(SystemAllocator, output);
-    write_stderr(line.as_str());
+    output.append("I/O operation failed with code ");
+    output.append_i64(i64(value));
+    String(SystemAllocator) message = finish_string(SystemAllocator, output);
+    write_locationless(format, "io.operation", message.as_str());
 }
 
-void report_lex(usize line_number, usize column_number)
-    raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError
-{
-    SystemAllocator allocator;
-    StringBuilder(SystemAllocator) output(allocator);
-    output.append("error\tlex\t");
-    output.append_usize(line_number);
-    output.append("\t");
-    output.append_usize(column_number);
-    output.append("\n");
-    String(SystemAllocator) line = finish_string(SystemAllocator, output);
-    write_stderr(line.as_str());
+void fallback(str message) {
+    try { write_stderr(message); }
+    catch IoError { }
 }
 
-i32 run(str path)
+void report_locationless(DiagnosticFormat format, str code, str message) {
+    try { write_locationless(format, code, message); }
+    catch CapacityError { fallback("error\tdiagnostic\n"); }
+    catch LayoutError { fallback("error\tdiagnostic\n"); }
+    catch AllocationError { fallback("error\tdiagnostic\n"); }
+    catch Utf8Error { fallback("error\tdiagnostic\n"); }
+    catch IoError { fallback("error\tdiagnostic\n"); }
+    catch SourceMapError { fallback("error\tdiagnostic\n"); }
+    catch BoundsError { fallback("error\tdiagnostic\n"); }
+}
+
+void report_numbered(
+    DiagnosticFormat format, str code, str prefix, usize value
+) {
+    try { write_numbered_locationless(format, code, prefix, value); }
+    catch CapacityError { fallback("error\tdiagnostic\n"); }
+    catch LayoutError { fallback("error\tdiagnostic\n"); }
+    catch AllocationError { fallback("error\tdiagnostic\n"); }
+    catch Utf8Error { fallback("error\tdiagnostic\n"); }
+    catch IoError { fallback("error\tdiagnostic\n"); }
+    catch SourceMapError { fallback("error\tdiagnostic\n"); }
+    catch BoundsError { fallback("error\tdiagnostic\n"); }
+}
+
+void report_io(DiagnosticFormat format, i32 value) {
+    try { write_io_locationless(format, value); }
+    catch CapacityError { fallback("error\tdiagnostic\n"); }
+    catch LayoutError { fallback("error\tdiagnostic\n"); }
+    catch AllocationError { fallback("error\tdiagnostic\n"); }
+    catch Utf8Error { fallback("error\tdiagnostic\n"); }
+    catch IoError { fallback("error\tdiagnostic\n"); }
+    catch SourceMapError { fallback("error\tdiagnostic\n"); }
+    catch BoundsError { fallback("error\tdiagnostic\n"); }
+}
+
+i32 run(str path, DiagnosticFormat format)
     raises IoError, Utf8Error, CapacityError, LayoutError, AllocationError,
-        BoundsError
+        BoundsError, SourceMapError
 {
     File file = open_read(path);
     SystemAllocator source_allocator;
@@ -110,48 +159,66 @@ i32 run(str path)
         read_to_string(SystemAllocator, file, source_allocator);
     close(file);
 
-    &in u8[] source_bytes = source.bytes();
+    SourceMap sources;
+    SourceId source_id = sources.add(path, source);
+    &in u8[] source_bytes = sources.bytes(source_id);
     SystemAllocator token_allocator;
     Vector(Token, SystemAllocator) tokens =
-        lex(SystemAllocator, source_bytes, token_allocator);
-    DumpResult result = dump_tokens(tokens);
-    if (result.invalid) {
-        report_lex(result.line, result.column);
+        lex(SystemAllocator, source_id, source_bytes, token_allocator);
+    DiagnosticBag diagnostics(usize(20));
+    bool invalid = dump_tokens(tokens, diagnostics);
+    if (invalid) {
+        String(SystemAllocator) rendered = render_diagnostics(
+            sources, diagnostics, format
+        );
+        write_stderr(rendered.as_str());
         return 1;
     }
     return 0;
 }
 
 i32 main(&in str[] arguments) {
-    if (len(arguments) != 2) {
-        try { write_stderr("usage: jack-bootstrap <source>\n"); }
+    DiagnosticFormat format = DiagnosticFormat.human;
+    str path = "";
+    if (len(arguments) == 2) {
+        path = arguments[1];
+    } elif (len(arguments) == 4) {
+        if (arguments[1] != "--diagnostic-format") {
+            try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] <source>\n"); }
+            catch IoError { }
+            return 2;
+        }
+        if (arguments[2] == "stable") { format = DiagnosticFormat.stable; }
+        elif (arguments[2] != "human") {
+            try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] <source>\n"); }
+            catch IoError { }
+            return 2;
+        }
+        path = arguments[3];
+    } else {
+        try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] <source>\n"); }
         catch IoError { }
         return 2;
     }
     try {
-        return run(arguments[1]);
+        return run(path, format);
     } catch IoError error {
-        try { report_io(error.error_code()); }
-        catch CapacityError { }
-        catch LayoutError { }
-        catch AllocationError { }
-        catch Utf8Error { }
-        catch IoError { }
+        report_io(format, error.error_code());
     } catch Utf8Error error {
-        try { report_number("utf8", error.position()); }
-        catch CapacityError { }
-        catch LayoutError { }
-        catch AllocationError { }
-        catch Utf8Error { }
-        catch IoError { }
+        report_numbered(
+            format, "source.invalid-utf8", "invalid UTF-8 at byte offset ",
+            error.position()
+        );
     } catch CapacityError {
-        try { write_stderr("error\tcapacity\n"); } catch IoError { }
+        report_locationless(format, "memory.capacity", "capacity exhausted");
     } catch LayoutError {
-        try { write_stderr("error\tlayout\n"); } catch IoError { }
+        report_locationless(format, "memory.layout", "invalid memory layout");
     } catch AllocationError {
-        try { write_stderr("error\tallocation\n"); } catch IoError { }
+        report_locationless(format, "memory.allocation", "allocation failed");
     } catch BoundsError {
-        try { write_stderr("error\tbounds\n"); } catch IoError { }
+        report_locationless(format, "collections.bounds", "index out of bounds");
+    } catch SourceMapError {
+        report_locationless(format, "source.invalid-span", "invalid source location");
     }
     return 1;
 }

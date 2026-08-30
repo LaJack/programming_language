@@ -1,0 +1,473 @@
+module bootstrap.diagnostics;
+
+import bootstrap.source;
+import std.collections.vector;
+import std.memory;
+import std.string;
+
+pub union DiagnosticSeverity {
+    error;
+    warning;
+    note;
+    help;
+}
+
+pub union DiagnosticOrigin {
+    none;
+    source(SourceSpan span);
+
+    bool has_source(&in self) {
+        return match (&in self) {
+            .none => false,
+            .source(_) => true,
+        };
+    }
+
+    SourceSpan source_or(&in self, SourceSpan fallback) {
+        return match (&in self) {
+            .none => fallback,
+            .source(span) => span,
+        };
+    }
+}
+
+pub union DiagnosticFormat {
+    human;
+    stable;
+
+    bool is_human(&in self) {
+        return match (&in self) {
+            .human => true,
+            .stable => false,
+        };
+    }
+}
+
+pub struct DiagnosticLabel {
+    SourceSpan span;
+    bool primary;
+    String(SystemAllocator) message;
+}
+
+pub struct Diagnostic {
+    DiagnosticSeverity severity;
+    DiagnosticOrigin origin;
+    String(SystemAllocator) code;
+    String(SystemAllocator) message;
+    Vector(DiagnosticLabel, SystemAllocator) labels;
+    Vector(String(SystemAllocator), SystemAllocator) notes;
+
+    str code_text(&in self) { return self.code.as_str(); }
+    str message_text(&in self) { return self.message.as_str(); }
+
+    void add_primary(&inout self, SourceSpan span, str message)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.add_label(span, true, message);
+    }
+
+    void add_secondary(&inout self, SourceSpan span, str message)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.add_label(span, false, message);
+    }
+
+    void add_label(&inout self, SourceSpan span, bool primary, str message)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        SystemAllocator message_allocator;
+        String(SystemAllocator) owned_message(message_allocator, message);
+        self.labels.push(DiagnosticLabel {
+            span = span;
+            primary = primary;
+            message = move owned_message;
+        });
+    }
+
+    void add_note(&inout self, str message)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        SystemAllocator allocator;
+        String(SystemAllocator) owned_message(allocator, message);
+        self.notes.push(owned_message);
+    }
+
+    bool same_identity(&in self, &in Diagnostic other) {
+        if (self.code.as_str() != other.code.as_str()) { return false; }
+        return match (&in self.origin) {
+            .none => match (&in other.origin) {
+                .none => true,
+                .source(_) => false,
+            },
+            .source(left) => match (&in other.origin) {
+                .none => false,
+                .source(right) => left.same_range(right),
+            },
+        };
+    }
+}
+
+pub Diagnostic source_diagnostic(
+    DiagnosticSeverity severity,
+    str code,
+    SourceSpan span,
+    str message
+) raises CapacityError, LayoutError, AllocationError {
+    return make_diagnostic(
+        severity, DiagnosticOrigin.source(span), code, message
+    );
+}
+
+pub Diagnostic locationless_diagnostic(
+    DiagnosticSeverity severity,
+    str code,
+    str message
+) raises CapacityError, LayoutError, AllocationError {
+    return make_diagnostic(
+        severity, DiagnosticOrigin.none, code, message
+    );
+}
+
+Diagnostic make_diagnostic(
+    DiagnosticSeverity severity,
+    DiagnosticOrigin origin,
+    str code,
+    str message
+) raises CapacityError, LayoutError, AllocationError {
+    SystemAllocator code_allocator;
+    String(SystemAllocator) owned_code(code_allocator, code);
+    SystemAllocator message_allocator;
+    String(SystemAllocator) owned_message(message_allocator, message);
+    SystemAllocator label_allocator;
+    Vector(DiagnosticLabel, SystemAllocator) labels(label_allocator, usize(0));
+    SystemAllocator note_allocator;
+    Vector(String(SystemAllocator), SystemAllocator) notes(note_allocator, usize(0));
+    return Diagnostic {
+        severity = severity;
+        origin = origin;
+        code = move owned_code;
+        message = move owned_message;
+        labels = move labels;
+        notes = move notes;
+    };
+}
+
+pub struct DiagnosticBag {
+    Vector(Diagnostic, SystemAllocator) diagnostics;
+    usize maximum;
+    usize omitted_count;
+
+    init(&inout self, usize maximum)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        SystemAllocator allocator;
+        Vector(Diagnostic, SystemAllocator) diagnostics(allocator, usize(0));
+        self.diagnostics = move diagnostics;
+        if (maximum == usize(0)) { self.maximum = usize(1); }
+        else { self.maximum = maximum; }
+        self.omitted_count = usize(0);
+    }
+
+    void add(&inout self, move Diagnostic diagnostic)
+        raises CapacityError, LayoutError, AllocationError, BoundsError
+    {
+        usize index = usize(0);
+        while (index < self.diagnostics.len()) {
+            &in Diagnostic existing = self.diagnostics.get(index);
+            if (existing.same_identity(diagnostic)) { return; }
+            index = index + usize(1);
+        }
+        if (self.diagnostics.len() < self.maximum) {
+            self.diagnostics.push(diagnostic);
+        } else {
+            self.omitted_count = self.omitted_count + usize(1);
+        }
+    }
+
+    usize len(&in self) { return self.diagnostics.len(); }
+    bool is_empty(&in self) { return self.diagnostics.is_empty(); }
+    usize omitted(&in self) { return self.omitted_count; }
+
+    &in Diagnostic get(&in self, usize index) raises BoundsError {
+        return self.diagnostics.get(index);
+    }
+}
+
+str severity_text(&in DiagnosticSeverity severity) {
+    return match (severity) {
+        .error => "error",
+        .warning => "warning",
+        .note => "note",
+        .help => "help",
+    };
+}
+
+void append_repeated(
+    &inout StringBuilder(SystemAllocator) output,
+    u8 value,
+    usize count
+) raises CapacityError, LayoutError, AllocationError {
+    usize index = usize(0);
+    while (index < count) {
+        output.append_byte(value);
+        index = index + usize(1);
+    }
+}
+
+void append_escaped(
+    &inout StringBuilder(SystemAllocator) output,
+    str value
+) raises CapacityError, LayoutError, AllocationError {
+    usize index = usize(0);
+    while (index < len(value)) {
+        u8 byte = jack_str_byte(value, index);
+        if (byte == u8(92)) { output.append("\\\\"); }
+        elif (byte == u8(9)) { output.append("\\t"); }
+        elif (byte == u8(10)) { output.append("\\n"); }
+        elif (byte == u8(13)) { output.append("\\r"); }
+        else { output.append_byte(byte); }
+        index = index + usize(1);
+    }
+}
+
+void append_source_line(
+    &inout StringBuilder(SystemAllocator) output,
+    &in SourceMap sources,
+    SourceId source,
+    usize line
+) raises CapacityError, LayoutError, AllocationError, SourceMapError {
+    usize start = sources.line_start(source, line);
+    usize end = sources.line_end(source, line);
+    usize index = start;
+    while (index < end) {
+        u8 byte = sources.byte_at(source, index);
+        if (byte == u8(9)) { output.append("    "); }
+        else { output.append_byte(byte); }
+        index = index + usize(1);
+    }
+}
+
+usize display_width(
+    &in SourceMap sources,
+    SourceId source,
+    usize start,
+    usize end
+) raises SourceMapError {
+    usize width = usize(0);
+    usize index = start;
+    while (index < end) {
+        if (sources.byte_at(source, index) == u8(9)) {
+            width = width + usize(4);
+        } else {
+            width = width + usize(1);
+        }
+        index = index + usize(1);
+    }
+    return width;
+}
+
+void render_span_line(
+    &inout StringBuilder(SystemAllocator) output,
+    &in SourceMap sources,
+    &in SourceSpan span,
+    usize line,
+    usize highlight_start,
+    usize highlight_end,
+    bool primary,
+    str label
+) raises CapacityError, LayoutError, AllocationError, SourceMapError {
+    SourceId source = span.source_id();
+    usize line_start = sources.line_start(source, line);
+    usize line_end = sources.line_end(source, line);
+    output.append_usize(line);
+    output.append(" | ");
+    append_source_line(output, sources, source, line);
+    output.append("\n  | ");
+    usize prefix = display_width(sources, source, line_start, highlight_start);
+    append_repeated(output, u8(32), prefix);
+    usize end = highlight_end;
+    if (end > line_end) { end = line_end; }
+    usize width = display_width(sources, source, highlight_start, end);
+    if (width == usize(0)) { width = usize(1); }
+    u8 marker = u8(45);
+    if (primary) { marker = u8(94); }
+    append_repeated(output, marker, width);
+    if (len(label) != usize(0)) {
+        output.append(" ");
+        output.append(label);
+    }
+    output.append("\n");
+}
+
+void render_span(
+    &inout StringBuilder(SystemAllocator) output,
+    &in SourceMap sources,
+    &in SourceSpan span,
+    bool primary,
+    str label
+) raises CapacityError, LayoutError, AllocationError, SourceMapError {
+    sources.validate(span);
+    SourceId source = span.source_id();
+    output.append(" --> ");
+    output.append(sources.path(source));
+    output.append(":");
+    output.append_usize(span.line_number());
+    output.append(":");
+    output.append_usize(span.column_number());
+    output.append("\n  |\n");
+    usize final_offset = span.end_offset();
+    if (final_offset > span.start_offset()) {
+        final_offset = final_offset - usize(1);
+    }
+    usize final_line = sources.line_for_offset(source, final_offset);
+    usize first_end = span.end_offset();
+    if (final_line != span.line_number()) {
+        first_end = sources.line_end(source, span.line_number());
+    }
+    render_span_line(
+        output, sources, span, span.line_number(),
+        span.start_offset(), first_end, primary, label
+    );
+    if (final_line != span.line_number()) {
+        if (final_line > span.line_number() + usize(1)) {
+            output.append("...\n");
+        }
+        render_span_line(
+            output, sources, span, final_line,
+            sources.line_start(source, final_line), span.end_offset(),
+            primary, label
+        );
+    }
+}
+
+void render_human_diagnostic(
+    &inout StringBuilder(SystemAllocator) output,
+    &in SourceMap sources,
+    &in Diagnostic diagnostic
+) raises CapacityError, LayoutError, AllocationError, SourceMapError,
+         BoundsError {
+    output.append(severity_text(diagnostic.severity));
+    output.append("[");
+    output.append(diagnostic.code.as_str());
+    output.append("]: ");
+    output.append(diagnostic.message.as_str());
+    output.append("\n");
+    if (diagnostic.origin.has_source()) {
+        SourceSpan span = diagnostic.origin.source_or(empty_source_span());
+        render_span(output, sources, span, true, "");
+    }
+    usize index = usize(0);
+    while (index < diagnostic.labels.len()) {
+        &in DiagnosticLabel label = diagnostic.labels.get(index);
+        render_span(
+            output, sources, label.span, label.primary, label.message.as_str()
+        );
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < diagnostic.notes.len()) {
+        &in String(SystemAllocator) note = diagnostic.notes.get(index);
+        output.append(" = note: ");
+        output.append(note.as_str());
+        output.append("\n");
+        index = index + usize(1);
+    }
+}
+
+void append_stable_span(
+    &inout StringBuilder(SystemAllocator) output,
+    &in SourceMap sources,
+    &in SourceSpan span
+) raises CapacityError, LayoutError, AllocationError, SourceMapError {
+    sources.validate(span);
+    append_escaped(output, sources.path(span.source_id()));
+    output.append("\t");
+    output.append_usize(span.start_offset());
+    output.append("\t");
+    output.append_usize(span.end_offset());
+    output.append("\t");
+    output.append_usize(span.line_number());
+    output.append("\t");
+    output.append_usize(span.column_number());
+}
+
+void render_stable_diagnostic(
+    &inout StringBuilder(SystemAllocator) output,
+    &in SourceMap sources,
+    &in Diagnostic diagnostic,
+    usize diagnostic_index
+) raises CapacityError, LayoutError, AllocationError, SourceMapError,
+         BoundsError {
+    output.append("diagnostic\t");
+    output.append_usize(diagnostic_index);
+    output.append("\t");
+    output.append(severity_text(diagnostic.severity));
+    output.append("\t");
+    append_escaped(output, diagnostic.code.as_str());
+    output.append("\t");
+    if (diagnostic.origin.has_source()) {
+        SourceSpan span = diagnostic.origin.source_or(empty_source_span());
+        append_stable_span(output, sources, span);
+    } else {
+        output.append("\t0\t0\t0\t0");
+    }
+    output.append("\t");
+    append_escaped(output, diagnostic.message.as_str());
+    output.append("\n");
+    usize index = usize(0);
+    while (index < diagnostic.labels.len()) {
+        &in DiagnosticLabel label = diagnostic.labels.get(index);
+        output.append("label\t");
+        output.append_usize(diagnostic_index);
+        output.append("\t");
+        if (label.primary) { output.append("primary\t"); }
+        else { output.append("secondary\t"); }
+        append_stable_span(output, sources, label.span);
+        output.append("\t");
+        append_escaped(output, label.message.as_str());
+        output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < diagnostic.notes.len()) {
+        &in String(SystemAllocator) note = diagnostic.notes.get(index);
+        output.append("note\t");
+        output.append_usize(diagnostic_index);
+        output.append("\t");
+        append_escaped(output, note.as_str());
+        output.append("\n");
+        index = index + usize(1);
+    }
+}
+
+pub String(SystemAllocator) render_diagnostics(
+    &in SourceMap sources,
+    &in DiagnosticBag diagnostics,
+    DiagnosticFormat format
+) raises CapacityError, LayoutError, AllocationError, Utf8Error,
+         SourceMapError, BoundsError {
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    usize index = usize(0);
+    while (index < diagnostics.len()) {
+        &in Diagnostic diagnostic = diagnostics.get(index);
+        if (format.is_human()) {
+            render_human_diagnostic(output, sources, diagnostic);
+        } else {
+            render_stable_diagnostic(output, sources, diagnostic, index);
+        }
+        index = index + usize(1);
+    }
+    if (diagnostics.omitted() != usize(0)) {
+        if (format.is_human()) {
+            output.append(" = note: ");
+            output.append_usize(diagnostics.omitted());
+            output.append(" additional diagnostics omitted\n");
+        } else {
+            output.append("omitted\t");
+            output.append_usize(diagnostics.omitted());
+            output.append("\n");
+        }
+    }
+    return finish_string(SystemAllocator, output);
+}

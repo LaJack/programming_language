@@ -117,10 +117,12 @@ def jack_io_write_str(file: object, value: object, count: object) -> int:
     try:
         stream = _unwrap_file_pointer(file)
         if hasattr(stream, 'buffer'):
-            written = stream.buffer.write(payload)
+            stream.buffer.write(payload)
         else:
-            written = stream.write(payload.decode('utf-8'))
-        _set_out(count, len(payload) if written is None else written)
+            stream.write(payload.decode('utf-8'))
+        # Jack str lengths and the native IO ABI count UTF-8 bytes. Python
+        # text streams return a character count, which differs for non-ASCII.
+        _set_out(count, len(payload))
         return 0
     except OSError as error:
         return error.errno or 5

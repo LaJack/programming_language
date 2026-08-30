@@ -32,6 +32,8 @@ pub struct CompiledLexer {
     Vector(LexerRule, SystemAllocator) rules;
     usize states;
     usize rule_count;
+    usize nfa_states;
+    usize nfa_edges;
 }
 
 pub struct FrozenRule {
@@ -465,39 +467,50 @@ void set_bool(&inout Vector(bool, SystemAllocator) values, usize index, bool val
     bool previous = values.replace(index, value);
 }
 
-void epsilon_closure(
-    &in Vector(NfaEdge, SystemAllocator) edges,
-    &inout Vector(bool, SystemAllocator) set
+usize state_word_count(usize bit_count) {
+    return (bit_count + usize(63)) / usize(64);
+}
+
+void state_set_clear(
+    &inout Vector(u64, SystemAllocator) values,
+    usize start,
+    usize word_count
 ) raises BoundsError {
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        usize edge_index = usize(0);
-        while (edge_index < edges.len()) {
-            &in NfaEdge edge = edges.get(edge_index);
-            if (edge.byte == u16(256) && set.get(edge.from)) {
-                if (set.get(edge.to) == false) {
-                    set_bool(set, edge.to, true);
-                    changed = true;
-                }
-            }
-            edge_index = edge_index + usize(1);
-        }
+    usize word = usize(0);
+    while (word < word_count) {
+        u64 previous = values.replace(start + word, u64(0));
+        word = word + usize(1);
     }
 }
 
-bool subset_equal(
-    &in Vector(bool, SystemAllocator) subsets,
-    usize left,
-    &in Vector(bool, SystemAllocator) right,
-    usize count
+void state_set_insert(
+    &inout Vector(u64, SystemAllocator) values,
+    usize start,
+    usize state
 ) raises BoundsError {
-    usize index = usize(0);
-    while (index < count) {
-        if (subsets.get(left * count + index) != right.get(index)) { return false; }
-        index = index + usize(1);
+    usize word = state / usize(64);
+    usize bit = state % usize(64);
+    u64 current = values.get(start + word);
+    u64 previous = values.replace(
+        start + word,
+        current | (u64(1) << bit)
+    );
+}
+
+void state_set_union(
+    &inout Vector(u64, SystemAllocator) destination,
+    usize destination_start,
+    &in Vector(u64, SystemAllocator) source,
+    usize source_start,
+    usize word_count
+) raises BoundsError {
+    usize word = usize(0);
+    while (word < word_count) {
+        u64 combined = destination.get(destination_start + word)
+            | source.get(source_start + word);
+        u64 previous = destination.replace(destination_start + word, combined);
+        word = word + usize(1);
     }
-    return true;
 }
 
 pub CompiledLexer compile_lexer(
@@ -515,6 +528,8 @@ pub CompiledLexer compile_lexer(
     Vector(NfaState, SystemAllocator) states(state_allocator, usize(0));
     SystemAllocator edge_allocator;
     Vector(NfaEdge, SystemAllocator) edges(edge_allocator, usize(0));
+    SystemAllocator fragment_allocator;
+    Vector(Fragment, SystemAllocator) fragments(fragment_allocator, usize(0));
     usize root = add_state(states);
     usize rule_index = usize(0);
     while (rule_index < rules.len()) {
@@ -527,45 +542,112 @@ pub CompiledLexer compile_lexer(
             if (position != rule.pattern_end) {
                 raise LexerSpecError { line = usize(1), column = position + usize(1) };
             }
-            SystemAllocator nullable_allocator;
-            Vector(bool, SystemAllocator) nullable(
-                nullable_allocator, states.len()
-            );
-            usize nullable_index = usize(0);
-            while (nullable_index < states.len()) {
-                nullable.push(false);
-                nullable_index = nullable_index + usize(1);
-            }
-            set_bool(nullable, fragment.start, true);
-            epsilon_closure(edges, nullable);
-            if (nullable.get(fragment.end)) {
-                raise LexerSpecError {
-                    line = rule.line,
-                    column = rule.pattern_column,
-                };
-            }
+            fragments.push(fragment);
             add_edge(edges, root, fragment.start, u16(256));
             NfaState accepted = states.get(fragment.end);
             accepted.accept = i32(rule_index);
             NfaState old = states.replace(fragment.end, accepted);
+        } else {
+            fragments.push(Fragment { start = usize(0), end = usize(0) });
         }
         rule_index = rule_index + usize(1);
     }
 
     usize nfa_count = states.len();
-    SystemAllocator subset_allocator;
-    Vector(bool, SystemAllocator) subsets(subset_allocator, nfa_count);
-    SystemAllocator work_allocator;
-    Vector(bool, SystemAllocator) work(work_allocator, nfa_count);
+    if (nfa_count >= usize(65535)) {
+        raise LexerSpecError { line = usize(1), column = usize(1) };
+    }
+    usize word_count = state_word_count(nfa_count);
+
+    SystemAllocator closure_allocator;
+    Vector(u64, SystemAllocator) closures(
+        closure_allocator, nfa_count * word_count
+    );
     usize index = usize(0);
-    while (index < nfa_count) {
-        bool active = index == root;
-        work.push(active);
+    while (index < nfa_count * word_count) {
+        closures.push(u64(0));
         index = index + usize(1);
     }
-    epsilon_closure(edges, work);
+    usize closure_state = usize(0);
+    while (closure_state < nfa_count) {
+        state_set_insert(
+            closures, closure_state * word_count, closure_state
+        );
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            usize edge_index = usize(0);
+            while (edge_index < edges.len()) {
+                &in NfaEdge edge = edges.get(edge_index);
+                if (edge.byte == u16(256)) {
+                    usize closure_start = closure_state * word_count;
+                    bool from_active = (
+                        closures.get(closure_start + edge.from / usize(64))
+                        & (u64(1) << (edge.from % usize(64)))
+                    ) != u64(0);
+                    if (from_active) {
+                        bool to_active = (
+                            closures.get(closure_start + edge.to / usize(64))
+                            & (u64(1) << (edge.to % usize(64)))
+                        ) != u64(0);
+                        if (to_active == false) {
+                            state_set_insert(
+                                closures, closure_state * word_count, edge.to
+                            );
+                            changed = true;
+                        }
+                    }
+                }
+                edge_index = edge_index + usize(1);
+            }
+        }
+        closure_state = closure_state + usize(1);
+    }
+
+    rule_index = usize(0);
+    while (rule_index < rules.len()) {
+        &in LexerRule rule = rules.get(rule_index);
+        if (rule.special == u8(0)) {
+            Fragment fragment = fragments.get(rule_index);
+            usize nullable_start = fragment.start * word_count;
+            bool nullable = (
+                closures.get(nullable_start + fragment.end / usize(64))
+                & (u64(1) << (fragment.end % usize(64)))
+            ) != u64(0);
+            if (nullable) {
+                raise LexerSpecError {
+                    line = rule.line,
+                    column = rule.pattern_column,
+                };
+            }
+        }
+        rule_index = rule_index + usize(1);
+    }
+
+    SystemAllocator subset_allocator;
+    Vector(u64, SystemAllocator) subsets(subset_allocator, word_count);
+    SystemAllocator work_allocator;
+    Vector(u64, SystemAllocator) work(work_allocator, word_count);
     index = usize(0);
-    while (index < nfa_count) { subsets.push(work.get(index)); index = index + usize(1); }
+    while (index < word_count) {
+        work.push(u64(0));
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < word_count) {
+        subsets.push(closures.get(root * word_count + index));
+        index = index + usize(1);
+    }
+
+    SystemAllocator target_allocator;
+    Vector(u64, SystemAllocator) targets(
+        target_allocator, usize(256) * word_count
+    );
+    index = usize(0);
+    while (index < usize(256) * word_count) {
+        targets.push(u64(0));
+        index = index + usize(1);
+    }
 
     SystemAllocator transition_allocator;
     Vector(u16, SystemAllocator) transitions(transition_allocator, usize(0));
@@ -576,11 +658,16 @@ pub CompiledLexer compile_lexer(
     index = usize(0);
     while (index < rules.len()) { winning.push(false); index = index + usize(1); }
     usize dfa_state = usize(0);
-    while (dfa_state * nfa_count < subsets.len()) {
+    while (dfa_state * word_count < subsets.len()) {
         i32 accepted_rule = i32(0) - i32(1);
         index = usize(0);
         while (index < nfa_count) {
-            if (subsets.get(dfa_state * nfa_count + index)) {
+            usize subset_start = dfa_state * word_count;
+            bool state_active = (
+                subsets.get(subset_start + index / usize(64))
+                & (u64(1) << (index % usize(64)))
+            ) != u64(0);
+            if (state_active) {
                 &in NfaState candidate_state = states.get(index);
                 i32 candidate = candidate_state.accept;
                 if (candidate >= 0) {
@@ -597,64 +684,85 @@ pub CompiledLexer compile_lexer(
             set_bool(winning, usize(accepted_rule), true);
         }
 
-        bool[256] active_bytes;
+        state_set_clear(targets, usize(0), usize(256) * word_count);
         usize active_edge_index = usize(0);
         while (active_edge_index < edges.len()) {
             &in NfaEdge active_edge = edges.get(active_edge_index);
             if (active_edge.byte < u16(256)) {
-                if (subsets.get(dfa_state * nfa_count + active_edge.from)) {
-                    active_bytes[usize(active_edge.byte)] = true;
+                usize active_start = dfa_state * word_count;
+                bool edge_active = (
+                    subsets.get(active_start + active_edge.from / usize(64))
+                    & (u64(1) << (active_edge.from % usize(64)))
+                ) != u64(0);
+                if (edge_active) {
+                    state_set_insert(
+                        targets,
+                        usize(active_edge.byte) * word_count,
+                        active_edge.to
+                    );
                 }
             }
             active_edge_index = active_edge_index + usize(1);
         }
         usize byte = usize(0);
         while (byte < usize(256)) {
-            if (active_bytes[byte] == false) {
+            bool target_empty = true;
+            usize target_word = usize(0);
+            while (target_word < word_count) {
+                if (targets.get(byte * word_count + target_word) != u64(0)) {
+                    target_empty = false;
+                }
+                target_word = target_word + usize(1);
+            }
+            if (target_empty) {
                 transitions.push(u16(65535));
             } else {
-                work.clear();
-                index = usize(0);
-                while (index < nfa_count) { work.push(false); index = index + usize(1); }
-                usize edge_index = usize(0);
-                while (edge_index < edges.len()) {
-                    &in NfaEdge edge = edges.get(edge_index);
-                    if (edge.byte == u16(byte)) {
-                        if (subsets.get(dfa_state * nfa_count + edge.from)) {
-                            set_bool(work, edge.to, true);
-                        }
-                    }
-                    edge_index = edge_index + usize(1);
-                }
-                epsilon_closure(edges, work);
-                bool empty = true;
+                state_set_clear(work, usize(0), word_count);
                 index = usize(0);
                 while (index < nfa_count) {
-                    if (work.get(index)) { empty = false; }
+                    usize target_start = byte * word_count;
+                    bool target_active = (
+                        targets.get(target_start + index / usize(64))
+                        & (u64(1) << (index % usize(64)))
+                    ) != u64(0);
+                    if (target_active) {
+                        state_set_union(
+                            work,
+                            usize(0),
+                            closures,
+                            index * word_count,
+                            word_count
+                        );
+                    }
                     index = index + usize(1);
                 }
-                if (empty) {
-                    transitions.push(u16(65535));
-                } else {
-                    usize existing = usize(0);
-                    bool found = false;
-                    usize dfa_count = subsets.len() / nfa_count;
-                    while (existing < dfa_count && found == false) {
-                        if (subset_equal(subsets, existing, work, nfa_count)) { found = true; }
-                        else { existing = existing + usize(1); }
-                    }
-                    if (found == false) {
-                        if (existing >= usize(65535)) {
-                            raise LexerSpecError { line = usize(1), column = usize(1) };
+                usize existing = usize(0);
+                bool found = false;
+                usize dfa_count = subsets.len() / word_count;
+                while (existing < dfa_count && found == false) {
+                    bool equal = true;
+                    usize compare_word = usize(0);
+                    while (compare_word < word_count) {
+                        if (subsets.get(existing * word_count + compare_word)
+                            != work.get(compare_word)) {
+                            equal = false;
                         }
-                        index = usize(0);
-                        while (index < nfa_count) {
-                            subsets.push(work.get(index));
-                            index = index + usize(1);
-                        }
+                        compare_word = compare_word + usize(1);
                     }
-                    transitions.push(u16(existing));
+                    if (equal) { found = true; }
+                    else { existing = existing + usize(1); }
                 }
+                if (found == false) {
+                    if (existing >= usize(65535)) {
+                        raise LexerSpecError { line = usize(1), column = usize(1) };
+                    }
+                    index = usize(0);
+                    while (index < word_count) {
+                        subsets.push(work.get(index));
+                        index = index + usize(1);
+                    }
+                }
+                transitions.push(u16(existing));
             }
             byte = byte + usize(1);
         }
@@ -678,6 +786,8 @@ pub CompiledLexer compile_lexer(
         rules = move rules,
         states = dfa_state,
         rule_count = rule_count,
+        nfa_states = nfa_count,
+        nfa_edges = edges.len(),
     };
 }
 

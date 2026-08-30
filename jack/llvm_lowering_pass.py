@@ -14,6 +14,7 @@ from .hir_nodes import (
     HIRBorrowExpression,
     HIRCallExpression,
     HIRCompositeExpression,
+    HIRUnaryExpression,
     HIRDereferenceExpression,
     HIRDeclaration,
     HIREnumConstructExpression,
@@ -1130,6 +1131,11 @@ class LLVMLoweringPass:
             return LLVMValue(slice_type, result, expression.type_ref)
         if isinstance(expression, HIRCompositeExpression):
             return self._composite(expression, env)
+        if isinstance(expression, HIRUnaryExpression):
+            value = self._expression(expression.expr, env)
+            result = self._b.temp('bit.not')
+            self._b.emit(f'{result} = xor {value.type_name} {value.operand}, -1')
+            return LLVMValue(value.type_name, result, expression.type_ref)
         if isinstance(expression, HIRCallExpression):
             return self._call(expression, env)
         if isinstance(expression, HIRStructLiteralExpression):
@@ -1295,6 +1301,35 @@ class LLVMLoweringPass:
             ops = ({'+': 'fadd', '-': 'fsub', '*': 'fmul', '/': 'fdiv', '%': 'frem'} if float_op
                    else {'+': 'add', '-': 'sub', '*': 'mul', '/': 'sdiv' if left_name.startswith('i') else 'udiv', '%': 'srem' if left_name.startswith('i') else 'urem'})
             instruction = ops[operator]
+        elif operator in {'&', '|', '^'}:
+            instruction = {'&': 'and', '|': 'or', '^': 'xor'}[operator]
+        elif operator in {'<<', '>>'}:
+            bits = BUILTIN_TYPE_SPECS[left_name].bits
+            right = self._coerce(right, expression.left.type_ref)
+            too_large = self._b.temp('shift.large')
+            safe_count = self._b.temp('shift.count')
+            shifted = self._b.temp('shifted')
+            value = self._b.temp('shift')
+            self._b.emit(
+                f'{too_large} = icmp uge {right.type_name} {right.operand}, {bits}'
+            )
+            self._b.emit(
+                f'{safe_count} = select i1 {too_large}, {right.type_name} 0, '
+                f'{right.type_name} {right.operand}'
+            )
+            instruction = (
+                'shl' if operator == '<<'
+                else 'ashr' if BUILTIN_TYPE_SPECS[left_name].family in {'signed', 'endian_signed'}
+                else 'lshr'
+            )
+            self._b.emit(
+                f'{shifted} = {instruction} {left.type_name} {left.operand}, {safe_count}'
+            )
+            self._b.emit(
+                f'{value} = select i1 {too_large}, {left.type_name} 0, '
+                f'{left.type_name} {shifted}'
+            )
+            return LLVMValue(result_type, value, expression.type_ref)
         else:
             if float_op:
                 instruction = {'==': 'fcmp oeq', '!=': 'fcmp une', '<': 'fcmp olt', '<=': 'fcmp ole', '>': 'fcmp ogt', '>=': 'fcmp oge'}[operator]

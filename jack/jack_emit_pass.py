@@ -6,6 +6,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         DereferenceExpression,
         EnumDeclaration,
         EnumVariantExpression,
@@ -46,6 +47,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         DereferenceExpression,
         EnumDeclaration,
         EnumVariantExpression,
@@ -464,6 +466,8 @@ class JackEmitPass:
                 f'{expression.operator} '
                 f'{self._expression(expression.right, precedence + 1)}'
             )
+        elif type(expression) is UnaryExpression:
+            source = expression.operator + self._expression(expression.expr, precedence)
         elif type(expression) is FormattedStringExpression:
             source = self._formatted_string(expression)
         elif type(expression) is StructLiteralExpression:
@@ -563,14 +567,19 @@ class JackEmitPass:
 
     def _precedence(self, expression: Expression) -> int:
         if type(expression) is CompositeExpression:
-            if expression.operator == '+':
-                return 2
-            return 1
-        if type(expression) in {BorrowExpression, MoveExpression, DereferenceExpression}:
-            return 3
+            return {
+                '||': 1, '&&': 2, '|': 3, '^': 4, '&': 5,
+                '==': 6, '!=': 6, '<': 6, '<=': 6, '>': 6, '>=': 6,
+                '<<': 7, '>>': 7, '+': 8, '-': 8,
+                '*': 9, '/': 9, '%': 9,
+            }.get(expression.operator, 1)
+        if type(expression) in {
+            BorrowExpression, MoveExpression, DereferenceExpression, UnaryExpression
+        }:
+            return 10
         if type(expression) in {FunctionCall, IndexExpression, SliceExpression}:
-            return 4
-        return 5
+            return 11
+        return 12
 
     def _line(self, level: int, source: str) -> str:
         return self.INDENT * level + source

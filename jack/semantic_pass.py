@@ -13,6 +13,7 @@ try:
         builtin_conversion_allowed,
         cast_builtin_value,
         is_bool_type,
+        is_bitwise_type,
         is_builtin_type,
         is_integer_type,
         is_numeric_type,
@@ -23,6 +24,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         DereferenceExpression,
         EnumDeclaration,
         EnumVariantExpression,
@@ -72,6 +74,7 @@ except ImportError:
         builtin_conversion_allowed,
         cast_builtin_value,
         is_bool_type,
+        is_bitwise_type,
         is_builtin_type,
         is_integer_type,
         is_numeric_type,
@@ -82,6 +85,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         DereferenceExpression,
         EnumDeclaration,
         EnumVariantExpression,
@@ -1688,6 +1692,14 @@ class SemanticPass:
             return TypeReference('str')
         if type(expression) is StructLiteralExpression:
             return self._struct_literal_type(expression, scope)
+        if type(expression) is UnaryExpression:
+            inner_type = self._expression_value_type(expression.expr, scope)
+            inner_name = self._type_name(inner_type)
+            if expression.operator != '~' or not is_bitwise_type(inner_name):
+                raise SemanticError(
+                    f'Unary operator "{expression.operator}" requires an integer operand.'
+                )
+            return inner_type
         if type(expression) is CompositeExpression:
             return self._composite_type(expression, scope)
         if type(expression) is IndexExpression:
@@ -1906,6 +1918,21 @@ class SemanticPass:
                     f'Logical operator "{expression.operator}" requires bool operands.'
                 )
             return TypeReference('bool')
+
+        if expression.operator in {'&', '|', '^'}:
+            if left_name != right_name or not is_bitwise_type(left_name):
+                raise SemanticError(
+                    f'Bitwise operator "{expression.operator}" requires operands of the same integer type.'
+                )
+            return left_type
+
+        if expression.operator in {'<<', '>>'}:
+            right_spec = BUILTIN_TYPE_SPECS.get(right_name)
+            if not is_bitwise_type(left_name) or right_spec is None or right_spec.family != 'unsigned':
+                raise SemanticError(
+                    f'Shift operator "{expression.operator}" requires an integer value and an unsigned count.'
+                )
+            return left_type
 
         if expression.operator in {'==', '!='} and (
             left_name == 'null' or right_name == 'null'
@@ -3250,4 +3277,6 @@ class SemanticPass:
             return expression.name
         if type(expression) is CompositeExpression:
             return f'({self._array_size_key(expression.left)}{expression.operator}{self._array_size_key(expression.right)})'
+        if type(expression) is UnaryExpression:
+            return f'({expression.operator}{self._array_size_key(expression.expr)})'
         return type(expression).__name__

@@ -6,6 +6,7 @@ try:
         Assignment,
         BorrowExpression,
         CompositeExpression,
+        UnaryExpression,
         EnumVariantExpression,
         Expression,
         FormattedStringExpression,
@@ -37,6 +38,7 @@ except ImportError:
         Assignment,
         BorrowExpression,
         CompositeExpression,
+        UnaryExpression,
         EnumVariantExpression,
         Expression,
         FormattedStringExpression,
@@ -191,6 +193,10 @@ class ExecutionEngine(Generic[Value, Scope]):
                 return left
             right = self._eval_expression(expression.right, scope)
             return self._eval_composite_operator(expression.operator, left, right)
+        if type(expression) is UnaryExpression:
+            return self._eval_unary_operator(
+                expression.operator, self._eval_expression(expression.expr, scope)
+            )
         if type(expression) is VariableExpression:
             return self._eval_variable(expression, scope)
         if type(expression) is FunctionCall:
@@ -285,6 +291,9 @@ class ExecutionEngine(Generic[Value, Scope]):
         raise NotImplementedError
 
     def _eval_composite_operator(self, operator: str, left: Value, right: Value) -> Value:
+        raise NotImplementedError
+
+    def _eval_unary_operator(self, operator: str, value: Value) -> Value:
         raise NotImplementedError
 
     def _is_truthy(self, value: Value) -> bool:

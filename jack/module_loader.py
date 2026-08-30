@@ -33,6 +33,7 @@ try:
         StructLiteralExpression,
         Statement,
         Try,
+        UnaryExpression,
         UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
@@ -74,6 +75,7 @@ except ImportError:
         StructLiteralExpression,
         Statement,
         Try,
+        UnaryExpression,
         UnsafeBlock,
         TypeDeclaration,
         TypeExpression,
@@ -684,7 +686,9 @@ class ModuleResolver:
         elif type(expression) is CompositeExpression:
             self._rewrite_expression_names(expression.left, context, scope, used_aliases)
             self._rewrite_expression_names(expression.right, context, scope, used_aliases)
-        elif type(expression) in {BorrowExpression, MoveExpression, DereferenceExpression}:
+        elif type(expression) in {
+            BorrowExpression, MoveExpression, DereferenceExpression, UnaryExpression
+        }:
             self._rewrite_expression_names(expression.expr, context, scope, used_aliases)
         elif type(expression) is IndexExpression:
             self._rewrite_expression_names(expression.target, context, scope, used_aliases)

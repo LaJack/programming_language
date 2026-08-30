@@ -261,6 +261,12 @@ class HIRCompositeExpression(HIRExpression):
 
 
 @dataclass(frozen=True, kw_only=True)
+class HIRUnaryExpression(HIRExpression):
+    operator: str
+    expr: HIRExpression
+
+
+@dataclass(frozen=True, kw_only=True)
 class HIRFormattedStringExpression(HIRExpression):
     parts: list[str | HIRExpression]
 

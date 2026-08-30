@@ -6,10 +6,12 @@ try:
     from .borrow_modes import borrow_mode_can_read, borrow_mode_can_write, borrow_mode_compatible
     from .builtin_types import (
         BUILTIN_TYPE_SPECS,
+        bitwise_value,
         BuiltinType,
         JackPrimitiveValue,
         is_bool_type,
         is_builtin_type,
+        is_bitwise_type,
         is_numeric_type,
         is_raw_byte_type,
         runtime_builtin_types,
@@ -27,6 +29,7 @@ try:
         HIRCallExpression,
         HIRCallTarget,
         HIRCompositeExpression,
+        HIRUnaryExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
         HIREnumConstructExpression,
@@ -73,10 +76,12 @@ except ImportError:
     from borrow_modes import borrow_mode_can_read, borrow_mode_can_write, borrow_mode_compatible
     from builtin_types import (
         BUILTIN_TYPE_SPECS,
+        bitwise_value,
         BuiltinType,
         JackPrimitiveValue,
         is_bool_type,
         is_builtin_type,
+        is_bitwise_type,
         is_numeric_type,
         is_raw_byte_type,
         runtime_builtin_types,
@@ -94,6 +99,7 @@ except ImportError:
         HIRCallExpression,
         HIRCallTarget,
         HIRCompositeExpression,
+        HIRUnaryExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
         HIREnumConstructExpression,
@@ -1038,6 +1044,11 @@ class Interpreter:
             left = self._eval_hir_expression(expression.left, scope)
             right = self._eval_hir_expression(expression.right, scope)
             return self._eval_composite_operator(expression.operator, left, right)
+        if isinstance(expression, HIRUnaryExpression):
+            return self._eval_primitive_unary_operator(
+                expression.operator,
+                self._eval_hir_expression(expression.expr, scope),
+            )
         if isinstance(expression, HIRFormattedStringExpression):
             return self._eval_hir_formatted_string(expression, scope)
         if isinstance(expression, HIRCallExpression):
@@ -1612,7 +1623,7 @@ class Interpreter:
     ) -> object:
         if not isinstance(left, JackPrimitiveValue) or not isinstance(right, JackPrimitiveValue):
             raise EvaluationError('Cannot combine primitive values with non-primitive values.')
-        if left.type_name != right.type_name:
+        if left.type_name != right.type_name and operator not in {'<<', '>>'}:
             raise EvaluationError(
                 f'Cannot combine values of type "{left.type_name}" and "{right.type_name}".'
             )
@@ -1627,6 +1638,21 @@ class Interpreter:
                 else bool(left.value) or bool(right.value)
             )
             return self.global_scope.get('bool')(result)
+        if operator in {'&', '|', '^', '<<', '>>'}:
+            if not is_bitwise_type(left.type_name):
+                raise EvaluationError(
+                    f'Bitwise operator "{operator}" requires integer operands.'
+                )
+            if operator in {'<<', '>>'}:
+                right_spec = BUILTIN_TYPE_SPECS.get(right.type_name)
+                if right_spec is None or right_spec.family != 'unsigned':
+                    raise EvaluationError(
+                        f'Shift operator "{operator}" requires an unsigned count.'
+                    )
+            result = bitwise_value(
+                operator, int(left.value), left.type_name, int(right.value)
+            )
+            return self.global_scope.get(left.type_name)(result)
         if is_raw_byte_type(left.type_name) and operator not in {'==', '!='}:
             raise EvaluationError(f'Operator "{operator}" is not implemented for raw byte types.')
         if not is_numeric_type(left.type_name) and operator not in {'==', '!='}:
@@ -1662,6 +1688,18 @@ class Interpreter:
         if operator == '>=':
             return self.global_scope.get('bool')(left.value >= right.value)
         self._unknown_operator(operator)
+
+    def _eval_primitive_unary_operator(self, operator: str, value: object) -> object:
+        value = self._read_value(value)
+        if not isinstance(value, JackPrimitiveValue):
+            raise EvaluationError('Unary bitwise operators require primitive values.')
+        if operator != '~' or not is_bitwise_type(value.type_name):
+            raise EvaluationError(
+                f'Unary operator "{operator}" requires an integer operand.'
+            )
+        return self.global_scope.get(value.type_name)(
+            bitwise_value(operator, int(value.value), value.type_name)
+        )
 
     def _is_truthy(self, value: object) -> bool:
         value = self._read_value(value)

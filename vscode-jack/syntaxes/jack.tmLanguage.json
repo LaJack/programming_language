@@ -448,7 +448,7 @@
         },
         {
           "name": "keyword.operator.arithmetic.jack",
-          "match": "\\+|-|\\*|/|%"
+          "match": "<<|>>|\\+|-|\\*|/|%|&|\\||\\^|~"
         },
         {
           "name": "keyword.operator.borrow.jack",

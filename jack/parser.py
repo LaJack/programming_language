@@ -8,6 +8,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         EnumDeclaration,
         EnumVariant,
         EnumVariantExpression,
@@ -59,6 +60,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         EnumDeclaration,
         EnumVariant,
         EnumVariantExpression,
@@ -156,8 +158,10 @@ class ParseResult:
 
 
 class Lexer:
-    SYMBOLS = set('{}();,:+-.=<>![]&|*?/%')
-    TWO_CHAR_SYMBOLS = {'==', '!=', '<=', '>=', '..', '=>', '&&', '||'}
+    SYMBOLS = set('{}();,:+-.=<>![]&|^~*?/%')
+    TWO_CHAR_SYMBOLS = {
+        '==', '!=', '<=', '>=', '..', '=>', '&&', '||', '<<', '>>'
+    }
 
     def __init__(self, source: str, source_path: str | Path | None = None) -> None:
         self.source = source
@@ -1418,19 +1422,44 @@ class Parser:
         return expr
 
     def _logical_and(self) -> Expression:
-        expr = self._comparison()
+        expr = self._bitwise_or()
         while self._match('&&'):
-            expr = CompositeExpression(expr, self._comparison(), '&&')
+            expr = CompositeExpression(expr, self._bitwise_or(), '&&')
+        return expr
+
+    def _bitwise_or(self) -> Expression:
+        expr = self._bitwise_xor()
+        while self._match('|'):
+            expr = CompositeExpression(expr, self._bitwise_xor(), '|')
+        return expr
+
+    def _bitwise_xor(self) -> Expression:
+        expr = self._bitwise_and()
+        while self._match('^'):
+            expr = CompositeExpression(expr, self._bitwise_and(), '^')
+        return expr
+
+    def _bitwise_and(self) -> Expression:
+        expr = self._comparison()
+        while self._match('&'):
+            expr = CompositeExpression(expr, self._comparison(), '&')
         return expr
 
     def _comparison(self) -> Expression:
-        expr = self._addition()
+        expr = self._shift()
 
         while self._match('==', '!=', '<', '>', '<=', '>='):
             operator = self._previous().value
-            right = self._addition()
+            right = self._shift()
             expr = CompositeExpression(expr, right, operator)
 
+        return expr
+
+    def _shift(self) -> Expression:
+        expr = self._addition()
+        while self._match('<<', '>>'):
+            operator = self._previous().value
+            expr = CompositeExpression(expr, self._addition(), operator)
         return expr
 
     def _addition(self) -> Expression:
@@ -1452,6 +1481,8 @@ class Parser:
         return expr
 
     def _borrow(self) -> Expression:
+        if self._match('~'):
+            return UnaryExpression('~', self._borrow())
         if self._match_keyword('move'):
             return MoveExpression(self._postfix())
         if self._match('&'):
@@ -1740,6 +1771,8 @@ class Parser:
                 f'{expression.operator} '
                 f'{self._print_label(expression.right)}'
             )
+        if type(expression) is UnaryExpression:
+            return f'{expression.operator}{self._print_label(expression.expr)}'
         if type(expression) is FunctionCall:
             arguments = ', '.join(self._print_label(argument) for argument in expression.parameters)
             return f'{expression.function_name}({arguments})'

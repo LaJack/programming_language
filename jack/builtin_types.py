@@ -58,6 +58,46 @@ def is_integer_type(type_name: str) -> bool:
     return type_name in INTEGER_TYPES
 
 
+def is_bitwise_type(type_name: str) -> bool:
+    return type_name in INTEGER_TYPES or type_name in RAW_BYTE_TYPES
+
+
+def bitwise_value(
+    operator: str, left: int, type_name: str, right: int | None = None
+) -> int:
+    spec = BUILTIN_TYPE_SPECS[type_name]
+    bits = spec.bits
+    mask = (1 << bits) - 1
+    unsigned_left = left & mask
+    if operator == '~':
+        result = (~unsigned_left) & mask
+    elif operator in {'&', '|', '^'}:
+        if right is None:
+            raise ValueError(f'Operator {operator} requires a right operand.')
+        unsigned_right = right & mask
+        result = {
+            '&': unsigned_left & unsigned_right,
+            '|': unsigned_left | unsigned_right,
+            '^': unsigned_left ^ unsigned_right,
+        }[operator]
+    elif operator in {'<<', '>>'}:
+        if right is None or right < 0:
+            raise ValueError('Shift count must be unsigned.')
+        if right >= bits:
+            return 0
+        if operator == '<<':
+            result = (unsigned_left << right) & mask
+        elif spec.family in {'signed', 'endian_signed'}:
+            return left >> right
+        else:
+            result = unsigned_left >> right
+    else:
+        raise ValueError(f'Unknown bitwise operator {operator}.')
+    if spec.family in {'signed', 'endian_signed'} and result >= (1 << (bits - 1)):
+        return result - (1 << bits)
+    return result
+
+
 def is_raw_byte_type(type_name: str) -> bool:
     return type_name in RAW_BYTE_TYPES
 

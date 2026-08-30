@@ -14,6 +14,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         DereferenceExpression,
         EnumDeclaration,
         EnumVariantExpression,
@@ -54,6 +55,7 @@ try:
         HIRCallTarget,
         HIRCatchClause,
         HIRCompositeExpression,
+        HIRUnaryExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
         HIREnumConstructExpression,
@@ -112,6 +114,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         DereferenceExpression,
         EnumDeclaration,
         EnumVariantExpression,
@@ -152,6 +155,7 @@ except ImportError:
         HIRCallTarget,
         HIRCatchClause,
         HIRCompositeExpression,
+        HIRUnaryExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
         HIREnumConstructExpression,
@@ -1210,6 +1214,19 @@ class HIRLoweringPass(SemanticPass):
             )
         if type(expression) is Match:
             return self._record_expression(expression, self._match(expression, scope))
+        if type(expression) is UnaryExpression:
+            inner = self._expression(expression.expr, scope)
+            type_ref = self._copy_type(inner.read_type or inner.type_ref)
+            return self._record_expression(
+                expression,
+                HIRUnaryExpression(
+                    operator=expression.operator,
+                    expr=inner,
+                    type_ref=type_ref,
+                    read_type=self._read_type(type_ref),
+                    span=expression.span,
+                ),
+            )
         if type(expression) is CompositeExpression:
             left = self._expression(expression.left, scope)
             right = self._expression(expression.right, scope)
@@ -1625,7 +1642,7 @@ class HIRLoweringPass(SemanticPass):
     def _composite_result_type(
         self, left: HIRExpression, operator: str
     ) -> TypeReference:
-        if operator in {'+', '-', '*', '/', '%'}:
+        if operator in {'+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>'}:
             return self._copy_type(left.read_type or left.type_ref)
         return TypeReference('bool')
 

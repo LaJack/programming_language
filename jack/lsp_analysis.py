@@ -38,6 +38,7 @@ from .ast_nodes import (
     Try,
     TypeDeclaration,
     TypeExpression,
+    UnaryExpression,
     VariableDeclaration,
     VariableExpression,
     ViewDeclaration,
@@ -860,6 +861,8 @@ class _GraphIndexBuilder:
             left = self._expression(node.left, env)
             self._expression(node.right, env)
             return TypeReference('bool') if node.operator in {'==', '!=', '<', '<=', '>', '>='} else left
+        if isinstance(node, UnaryExpression):
+            return self._expression(node.expr, env)
         if isinstance(node, BorrowExpression):
             value = self._expression(node.expr, env)
             if value is not None:

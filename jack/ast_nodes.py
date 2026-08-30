@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import copy
 from typing import List
 
 try:
@@ -31,9 +32,27 @@ class CompositeExpression(Expression):
 
 
 @dataclass
+class UnaryExpression(Expression):
+    operator: str
+    expr: Expression
+
+
+@dataclass
 class LiteralExpression(Expression):
     value: object
     type: str
+
+    def __deepcopy__(self, memo):
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        if self.value is None or type(self.value) in {bool, int, float, str, bytes}:
+            value = self.value
+        else:
+            value = copy.deepcopy(self.value, memo)
+        cloned = LiteralExpression(value, self.type, span=self.span)
+        memo[id(self)] = cloned
+        return cloned
 
 
 @dataclass

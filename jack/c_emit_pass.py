@@ -31,6 +31,7 @@ try:
         HIRCallExpression,
         HIRCatchClause,
         HIRCompositeExpression,
+        HIRUnaryExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
         HIREnumConstructExpression,
@@ -100,6 +101,7 @@ except ImportError:
         HIRCallExpression,
         HIRCatchClause,
         HIRCompositeExpression,
+        HIRUnaryExpression,
         HIRDereferenceExpression,
         HIRDeclaration,
         HIREnumConstructExpression,
@@ -2147,6 +2149,8 @@ class CEmitPass:
             return self._emit_hir_field_access(expression, env)
         if isinstance(expression, HIRCompositeExpression):
             return self._emit_hir_composite_expression(expression, env)
+        if isinstance(expression, HIRUnaryExpression):
+            return f'(~{self._emit_hir_value_expression(expression.expr, env)})'
         if isinstance(expression, HIRFormattedStringExpression):
             raise CEmitError('Runtime formatted string values are only supported directly in print statements.')
         if isinstance(expression, HIRCallExpression):
@@ -2362,12 +2366,25 @@ class CEmitPass:
                 f'({right}).jack_tag)'
             )
         if is_builtin_type(left_name) or is_builtin_type(right_name):
-            if left_name != right_name:
+            if left_name != right_name and expression.operator not in {'<<', '>>'}:
                 raise CEmitError(f'Cannot combine values of type "{left_name}" and "{right_name}".')
             if is_bool_type(left_name) and expression.operator not in {'==', '!=', '&&', '||'}:
                 raise CEmitError(f'Operator "{expression.operator}" is not implemented for bool values.')
             if is_raw_byte_type(left_name) and expression.operator not in {'==', '!='}:
-                raise CEmitError(f'Operator "{expression.operator}" is not implemented for raw byte types.')
+                if expression.operator not in {'&', '|', '^', '<<', '>>'}:
+                    raise CEmitError(f'Operator "{expression.operator}" is not implemented for raw byte types.')
+
+        if expression.operator in {'<<', '>>'}:
+            bits = BUILTIN_TYPE_SPECS[left_name].bits
+            c_type = self._emit_type(left_type)
+            if expression.operator == '<<':
+                unsigned_type = {
+                    8: 'uint8_t', 16: 'uint16_t', 32: 'uint32_t', 64: 'uint64_t'
+                }[bits]
+                shifted = f'(({unsigned_type})({left}) << ({right}))'
+            else:
+                shifted = f'(({left}) >> ({right}))'
+            return f'(({right}) >= {bits} ? ({c_type})0 : ({c_type})({shifted}))'
 
         return f'({left} {expression.operator} {right})'
 

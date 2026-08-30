@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import copy
 from typing import List
 
 
@@ -43,6 +44,25 @@ class TypeReference:
     pointer_mode: str | None = None
     nullable: bool = False
     span: SourceSpan | None = field(default=None, compare=False, kw_only=True)
+
+    def __deepcopy__(self, memo):
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        cloned = TypeReference(
+            self.name,
+            [],
+            array_size=None,
+            is_slice=self.is_slice,
+            borrow=self.borrow,
+            pointer_mode=self.pointer_mode,
+            nullable=self.nullable,
+            span=self.span,
+        )
+        memo[id(self)] = cloned
+        cloned.arguments = [copy.deepcopy(argument, memo) for argument in self.arguments]
+        cloned.array_size = copy.deepcopy(self.array_size, memo)
+        return cloned
 
 
 def is_maybe_uninit_type(type_ref: TypeReference) -> bool:

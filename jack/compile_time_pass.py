@@ -8,11 +8,13 @@ try:
     from .borrow_modes import borrow_mode_can_write, borrow_mode_compatible
     from .builtin_types import (
         BUILTIN_TYPE_SPECS,
+        bitwise_value,
         cast_builtin_value,
         default_builtin_value,
         format_builtin_value,
         is_bool_type,
         is_builtin_type,
+        is_bitwise_type,
         is_numeric_type,
         is_raw_byte_type,
     )
@@ -21,6 +23,7 @@ try:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         DereferenceExpression,
         EnumDeclaration,
         EnumVariant,
@@ -67,11 +70,13 @@ except ImportError:
     from borrow_modes import borrow_mode_can_write, borrow_mode_compatible
     from builtin_types import (
         BUILTIN_TYPE_SPECS,
+        bitwise_value,
         cast_builtin_value,
         default_builtin_value,
         format_builtin_value,
         is_bool_type,
         is_builtin_type,
+        is_bitwise_type,
         is_numeric_type,
         is_raw_byte_type,
     )
@@ -80,6 +85,7 @@ except ImportError:
         BorrowExpression,
         CatchClause,
         CompositeExpression,
+        UnaryExpression,
         DereferenceExpression,
         EnumDeclaration,
         EnumVariant,
@@ -290,6 +296,39 @@ class ComptimeBorrowValue:
         )
 
 
+def _clone_comptime_literal(literal: LiteralExpression) -> LiteralExpression:
+    value = literal.value
+    if value is None or type(value) in {bool, int, float, str, bytes}:
+        cloned_value = value
+    elif type(value) is TypeReference:
+        cloned_value = value.__deepcopy__({})
+    elif type(value) is ComptimeBorrowValue:
+        cloned_value = ComptimeBorrowValue(
+            value.type_ref.__deepcopy__({}),
+            value.mutable,
+            value.cell,
+            value.array,
+            value.start,
+            value.length,
+        )
+    elif type(value) is ComptimeOpaqueValue:
+        cloned_value = ComptimeOpaqueValue(
+            value.type_ref.__deepcopy__({}), value.value
+        )
+    elif type(value) in {
+        ComptimeVectorValue,
+        ComptimeFileValue,
+        ComptimeStringValue,
+        ComptimeStringBuilderValue,
+    }:
+        cloned_value = value
+    elif type(value) in {ComptimeUnionField, ComptimeUnionVariant, ComptimeUnionType}:
+        cloned_value = value
+    else:
+        cloned_value = copy.deepcopy(value)
+    return LiteralExpression(cloned_value, literal.type, span=literal.span)
+
+
 class CompileTimeScope:
     def __init__(self, parent: "CompileTimeScope | None" = None) -> None:
         self.parent = parent
@@ -425,6 +464,7 @@ class CompileTimePass:
         self.generated_types: list[TypeDeclaration] = []
         self.active_interface_dispatch: dict[str, set[str]] = {}
         self.prospective_computed_types: set[str] = set()
+        self.literal_conversion_cache: dict[tuple[str, str, object], object] = {}
 
     def apply(self, ast: list[Statement]) -> list[Statement]:
         self._register_declarations(ast)
@@ -1461,6 +1501,11 @@ class CompileTimePass:
                     )
                 return [], copy.deepcopy(value)
             return [], copy.deepcopy(expression)
+        if type(expression) is UnaryExpression:
+            if self._expression_has_comptime_root(expression.expr, scope):
+                return [], self._eval_comptime_expression(expression, scope)
+            prelude, inner = self._apply_expression(expression.expr, scope)
+            return prelude, UnaryExpression(expression.operator, inner)
         if type(expression) is CompositeExpression:
             left_prelude, left = self._apply_expression(expression.left, scope)
             right_prelude, right = self._apply_expression(expression.right, scope)
@@ -1850,6 +1895,20 @@ class CompileTimePass:
         return [copy.deepcopy(error) for error in raises]
 
     def _apply_type_reference(self, type_ref: TypeReference, scope: CompileTimeScope) -> TypeReference:
+        if not type_ref.arguments and type_ref.array_size is None:
+            value = scope.get(type_ref.name)
+            declaration = self.types.get(type_ref.name)
+            if value is None and (
+                declaration is None or not declaration.parameters
+            ):
+                return TypeReference(
+                    type_ref.name,
+                    is_slice=type_ref.is_slice,
+                    borrow=type_ref.borrow,
+                    pointer_mode=type_ref.pointer_mode,
+                    nullable=type_ref.nullable,
+                    span=type_ref.span,
+                )
         base_ref = TypeReference(type_ref.name, copy.deepcopy(type_ref.arguments))
         if base_ref.arguments:
             lowered = self._apply_generic_type_reference(base_ref, scope)
@@ -2598,7 +2657,28 @@ class CompileTimePass:
                 f'got {len(call.parameters)}.'
             )
 
-        value = self._eval_comptime_expression(call.parameters[0], scope)
+        parameter = call.parameters[0]
+        if (
+            type(parameter) is LiteralExpression
+            and (
+                parameter.value is None
+                or type(parameter.value) in {bool, int, float, str, bytes}
+            )
+        ):
+            key = (call.function_name, parameter.type, parameter.value)
+            if key in self.literal_conversion_cache:
+                cached = self.literal_conversion_cache[key]
+            else:
+                cached = self._cast_comptime(
+                    parameter.value,
+                    TypeReference(call.function_name),
+                    source_type=parameter.type,
+                    memory_raw=True,
+                )
+                self.literal_conversion_cache[key] = cached
+            return LiteralExpression(cached, call.function_name)
+
+        value = self._eval_comptime_expression(parameter, scope)
         target_type = TypeReference(call.function_name)
         return LiteralExpression(
             self._cast_comptime(
@@ -3585,6 +3665,8 @@ class CompileTimePass:
             return self._expression_has_comptime_root(expression.expr, scope)
         if type(expression) is MoveExpression:
             return self._expression_has_comptime_root(expression.expr, scope)
+        if type(expression) is UnaryExpression:
+            return self._expression_has_comptime_root(expression.expr, scope)
         if type(expression) is CompositeExpression:
             return (
                 self._expression_has_comptime_root(expression.left, scope)
@@ -3839,6 +3921,8 @@ class CompileTimePass:
             return borrowed
         if type(expression) is MoveExpression:
             return self._infer_expression_type(expression.expr, env, functions, types)
+        if type(expression) is UnaryExpression:
+            return self._infer_expression_type(expression.expr, env, functions, types)
         if type(expression) is CompositeExpression:
             if expression.operator in {'==', '!=', '<', '>', '<=', '>='}:
                 return TypeReference('bool')
@@ -3872,6 +3956,8 @@ class CompileTimePass:
         elif type(expression) is BorrowExpression:
             self._infer_raises_from_expression(expression.expr, env, functions, types, errors)
         elif type(expression) is MoveExpression:
+            self._infer_raises_from_expression(expression.expr, env, functions, types, errors)
+        elif type(expression) is UnaryExpression:
             self._infer_raises_from_expression(expression.expr, env, functions, types, errors)
         elif type(expression) is IndexExpression:
             self._infer_raises_from_expression(expression.target, env, functions, types, errors)
@@ -4324,7 +4410,7 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
     def _eval_literal(
         self, literal: LiteralExpression, scope: CompileTimeScope
     ) -> LiteralExpression:
-        return copy.deepcopy(literal)
+        return _clone_comptime_literal(literal)
 
     def _eval_variable(
         self, variable: VariableExpression, scope: CompileTimeScope
@@ -4338,8 +4424,8 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
                 and value.value.array is None
                 and value.value.cell is not None
             ):
-                return copy.deepcopy(value.value.cell)
-            return copy.deepcopy(value)
+                return _clone_comptime_literal(value.value.cell)
+            return _clone_comptime_literal(value)
         if scope.contains_root(variable.name):
             raise CompileTimeError(
                 f'Cannot read comptime value "{variable.name}" as a value.'
@@ -4368,6 +4454,10 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
     ) -> LiteralExpression:
         if function_call.function_name == 'len':
             return self.compile_time_pass._eval_comptime_len_function_call(function_call, scope)
+        if is_builtin_type(function_call.function_name):
+            return self.compile_time_pass._eval_comptime_builtin_conversion(
+                function_call, scope
+            )
         return self.compile_time_pass._eval_comptime_method_call(function_call, scope)
 
     def _eval_formatted_string(
@@ -4664,13 +4754,13 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
             and left.value.array is None
             and left.value.cell is not None
         ):
-            left = copy.deepcopy(left.value.cell)
+            left = _clone_comptime_literal(left.value.cell)
         if (
             isinstance(right.value, ComptimeBorrowValue)
             and right.value.array is None
             and right.value.cell is not None
         ):
-            right = copy.deepcopy(right.value.cell)
+            right = _clone_comptime_literal(right.value.cell)
         if operator in {'&&', '||'}:
             if left.type != 'bool' or right.type != 'bool':
                 raise CompileTimeError(
@@ -4682,6 +4772,22 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
                 else (bool(left.value) or bool(right.value)),
                 'bool',
             )
+        if operator in {'&', '|', '^', '<<', '>>'}:
+            if not is_bitwise_type(left.type):
+                raise CompileTimeError(
+                    f'Bitwise operator "{operator}" requires integer operands.'
+                )
+            if operator in {'&', '|', '^'} and left.type != right.type:
+                raise CompileTimeError(
+                    f'Bitwise operator "{operator}" requires matching operand types.'
+                )
+            try:
+                result = bitwise_value(
+                    operator, int(left.value), left.type, int(right.value)
+                )
+            except (TypeError, ValueError) as err:
+                raise CompileTimeError(str(err)) from err
+            return LiteralExpression(result, left.type)
         if operator in {'+', '-', '*', '/', '%'}:
             merged_type = self.compile_time_pass._merge_types(left, right)
             if not is_numeric_type(merged_type) or is_raw_byte_type(merged_type):
@@ -4710,6 +4816,17 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
                 'bool',
             )
         self._unknown_operator(operator)
+
+    def _eval_unary_operator(
+        self, operator: str, value: LiteralExpression
+    ) -> LiteralExpression:
+        if operator != '~' or not is_bitwise_type(value.type):
+            raise CompileTimeError(
+                f'Unary operator "{operator}" requires an integer operand.'
+            )
+        return LiteralExpression(
+            bitwise_value(operator, int(value.value), value.type), value.type
+        )
 
     def _is_truthy(self, value: LiteralExpression) -> bool:
         if (

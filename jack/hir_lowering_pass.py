@@ -894,11 +894,10 @@ class HIRLoweringPass(SemanticPass):
         scrutinee = self._expression(statement.scrutinee, scope)
         enum_name = self._type_name(self._element_type(scrutinee.type_ref))
         declaration = self.types[enum_name]
-        ownership = (
-            statement.scrutinee.mode
-            if type(statement.scrutinee) is BorrowExpression
-            else 'move'
-        )
+        ownership = scrutinee.type_ref.borrow or 'move'
+        if scrutinee.type_ref.borrow is not None:
+            # Matching an existing borrow needs its address, not a payload copy.
+            scrutinee = replace(scrutinee, read_type=None)
         arms: list[HIRMatchArm] = []
         variants = {variant.name: (index, variant) for index, variant in enumerate(declaration.variants)}
         for arm in statement.arms:
@@ -947,7 +946,13 @@ class HIRLoweringPass(SemanticPass):
                 expression=None if arm.expr is None else self._expression(arm.expr, arm_scope),
                 span=arm.span,
             ))
-        result_type = self._match_type(statement, scope, allow_return=True)
+        # Arms were validated before lowering. Revalidating statement arms here
+        # would run returns outside their semantic function context.
+        result_type = (
+            arms[0].expression.read_type
+            if arms and arms[0].expression is not None
+            else TypeReference('void')
+        )
         return HIRMatch(
             scrutinee=scrutinee,
             ownership=ownership,

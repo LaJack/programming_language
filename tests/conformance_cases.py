@@ -13,6 +13,56 @@ class ConformanceCase:
 
 CONFORMANCE_CASES = (
     ConformanceCase(
+        name='assignment_through_scalar_and_match_borrows',
+        source='''
+            union Value { item(i32 number); }
+            void update(&inout i32 number) { number = 9; }
+            i32 number = 1;
+            update(number);
+            i32[2] values;
+            &inout i32 slot = &inout values[1];
+            slot = 7;
+            Value value = Value.item(3);
+            match (&inout value) { .item(item) { item = 5; } }
+            print(number);
+            print(slot);
+            match (&in value) { .item(item) { print(item); } }
+        ''',
+        expected_stdout='number = 9\nslot = 7\nitem = 5\n',
+    ),
+    ConformanceCase(
+        name='nested_borrowed_matches_return_and_ignore_resources',
+        source='''
+            struct Resource {
+                i32 value;
+                deinit(move self) { print(f"drop {self.value}"); }
+            }
+            union Inner { empty; some(move Resource value); }
+            union Outer { item(move Inner inner); }
+            i32 inspect(&in Outer outer) {
+                match (outer) {
+                    .item(inner) {
+                        match (inner) {
+                            .empty { return 0; }
+                            .some(resource) { return resource.value; }
+                        }
+                    }
+                }
+                return 0;
+            }
+            void ignore(&in Outer outer) { match (outer) { .item(_) { } } }
+            void run() {
+                Resource resource = Resource { value = 7 };
+                Inner inner = Inner.some(resource);
+                Outer outer = Outer.item(inner);
+                ignore(outer);
+                print(inspect(outer));
+            }
+            run();
+        ''',
+        expected_stdout='inspect(outer) = 7\ndrop 7\n',
+    ),
+    ConformanceCase(
         name='interfaces_and_custom_copyable',
         source='''
             interface Tagged {

@@ -1,0 +1,142 @@
+module bootstrap.frontend;
+
+import bootstrap.source;
+import bootstrap.syntax;
+import bootstrap.parser;
+import bootstrap.lexer;
+import bootstrap.diagnostics;
+import std.collections.arena;
+import std.collections.vector;
+import std.memory;
+import std.string;
+
+pub struct FrontendReferenceError { }
+
+pub struct ParsedFileId {
+    usize context;
+    usize index;
+
+    bool equals(&in self, ParsedFileId other) {
+        return self.context == other.context && self.index == other.index;
+    }
+}
+
+pub struct NodeRef {
+    ParsedFileId file;
+    ArenaHandle(SyntaxNode) node;
+}
+
+pub struct FrontendContext {
+    SourceMap sources;
+    Vector(ParsedFile, SystemAllocator) files;
+
+    init(&inout self) raises CapacityError, LayoutError, AllocationError,
+        SourceMapError {
+        if (self.sources.identity_value() != usize(0)) { raise SourceMapError { }; }
+        SourceMap sources = source_map();
+        self.sources = move sources;
+        SystemAllocator allocator;
+        Vector(ParsedFile, SystemAllocator) files(allocator, usize(0));
+        self.files = move files;
+    }
+
+    SourceId add_source(&inout self, str path, move String(SystemAllocator) text)
+        raises CapacityError, LayoutError, AllocationError, SourceMapError {
+        return self.sources.add(path, text);
+    }
+
+    &in SourceMap source_map(&in self) { return &in self.sources; }
+    usize file_count(&in self) { return self.files.len(); }
+
+    &in ParsedFile file(&in self, ParsedFileId id) raises FrontendReferenceError {
+        if (id.context != self.sources.identity_value()) {
+            raise FrontendReferenceError { };
+        }
+        try { return self.files.get(id.index); }
+        catch BoundsError { raise FrontendReferenceError { }; }
+    }
+
+    NodeRef root(&in self, ParsedFileId id, usize index)
+        raises FrontendReferenceError {
+        &in ParsedFile file = self.file(id);
+        try { return NodeRef { file = id, node = file.root(index) }; }
+        catch BoundsError { raise FrontendReferenceError { }; }
+    }
+
+    &in SyntaxNode node(&in self, NodeRef reference) raises FrontendReferenceError {
+        &in ParsedFile file = self.file(reference.file);
+        try { return file.node(reference.node); }
+        catch ArenaHandleError { raise FrontendReferenceError { }; }
+    }
+
+    NodeRef child(&in self, NodeRef reference, usize index)
+        raises FrontendReferenceError {
+        &in ParsedFile file = self.file(reference.file);
+        &in SyntaxNode node = self.node(reference);
+        try {
+            return NodeRef {
+                file = reference.file,
+                node = syntax_child(file, node, index),
+            };
+        } catch BoundsError { raise FrontendReferenceError { }; }
+    }
+}
+
+pub FrontendContext frontend_context()
+    raises CapacityError, LayoutError, AllocationError, SourceMapError {
+    FrontendContext result;
+    result.init();
+    return result;
+}
+
+ParsedFileId register_file(&inout FrontendContext context, move ParsedFile file)
+    raises CapacityError, LayoutError, AllocationError {
+    ParsedFileId id = ParsedFileId {
+        context = context.sources.identity_value(), index = context.files.len()
+    };
+    context.files.push(file);
+    return id;
+}
+
+pub ParsedFileId parse_recovering(
+    &inout FrontendContext context, SourceId source,
+    move Vector(Token, SystemAllocator) tokens, &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+    SourceMapError, ArenaHandleError, SyntaxValidationError {
+    ParsedFile file = build_recovering(context.sources, source, tokens, diagnostics);
+    validate_syntax(context.sources, file);
+    return register_file(context, file);
+}
+
+pub ParsedFileId parse_strict(
+    &inout FrontendContext context, SourceId source,
+    move Vector(Token, SystemAllocator) tokens, &inout DiagnosticBag diagnostics
+) raises ParseFailed, CapacityError, LayoutError, AllocationError, BoundsError,
+    SourceMapError, ArenaHandleError, SyntaxValidationError {
+    ParsedFile file = build_strict(context.sources, source, tokens, diagnostics);
+    validate_syntax(context.sources, file);
+    return register_file(context, file);
+}
+
+pub ParsedFileId parse_recovering_with_options(
+    &inout FrontendContext context, SourceId source,
+    move Vector(Token, SystemAllocator) tokens, &inout DiagnosticBag diagnostics,
+    ParserOptions options
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+    SourceMapError, ArenaHandleError, SyntaxValidationError {
+    ParsedFile file = build_recovering_with_options(context.sources, source, tokens, diagnostics, options);
+    validate_syntax(context.sources, file);
+    return register_file(context, file);
+}
+
+pub ParsedFileId parse_strict_with_options(
+    &inout FrontendContext context, SourceId source,
+    move Vector(Token, SystemAllocator) tokens, &inout DiagnosticBag diagnostics,
+    ParserOptions options
+) raises ParseFailed, CapacityError, LayoutError, AllocationError, BoundsError,
+    SourceMapError, ArenaHandleError, SyntaxValidationError {
+    ParsedFile file = build_recovering_with_options(context.sources, source, tokens, diagnostics, options);
+    if (file.has_errors()) { raise ParseFailed { }; }
+    validate_syntax(context.sources, file);
+    return register_file(context, file);
+}

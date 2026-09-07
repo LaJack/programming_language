@@ -2,7 +2,12 @@ module bootstrap.main;
 
 import bootstrap.diagnostics;
 import bootstrap.lexer;
+import bootstrap.parser;
+import bootstrap.frontend;
 import bootstrap.source;
+import bootstrap.syntax;
+import bootstrap.syntax_dump;
+import std.collections.arena;
 import std.collections.vector;
 import std.io;
 import std.memory;
@@ -70,7 +75,7 @@ void write_locationless(
     raises CapacityError, LayoutError, AllocationError, Utf8Error, IoError,
         SourceMapError, BoundsError
 {
-    SourceMap sources;
+    SourceMap sources = source_map();
     DiagnosticBag diagnostics(usize(1));
     Diagnostic diagnostic = locationless_diagnostic(
         DiagnosticSeverity.error, code, message
@@ -149,9 +154,17 @@ void report_io(DiagnosticFormat format, i32 value) {
     catch BoundsError { fallback("error\tdiagnostic\n"); }
 }
 
-i32 run(str path, DiagnosticFormat format)
+Vector(Token, SystemAllocator) lex_source(&in FrontendContext context, SourceId source_id)
+    raises SourceMapError, CapacityError, LayoutError, AllocationError {
+    &in SourceMap sources = context.source_map();
+    &in u8[] bytes = sources.bytes(source_id);
+    SystemAllocator allocator;
+    return lex(SystemAllocator, source_id, bytes, allocator);
+}
+
+i32 run(str path, DiagnosticFormat format, bool syntax_mode)
     raises IoError, Utf8Error, CapacityError, LayoutError, AllocationError,
-        BoundsError, SourceMapError
+        BoundsError, SourceMapError, ArenaHandleError, FrontendReferenceError, SyntaxValidationError
 {
     File file = open_read(path);
     SystemAllocator source_allocator;
@@ -159,49 +172,82 @@ i32 run(str path, DiagnosticFormat format)
         read_to_string(SystemAllocator, file, source_allocator);
     close(file);
 
-    SourceMap sources;
-    SourceId source_id = sources.add(path, source);
-    &in u8[] source_bytes = sources.bytes(source_id);
-    SystemAllocator token_allocator;
-    Vector(Token, SystemAllocator) tokens =
-        lex(SystemAllocator, source_id, source_bytes, token_allocator);
+    FrontendContext context = frontend_context();
+    SourceId source_id = context.add_source(path, source);
+    Vector(Token, SystemAllocator) tokens = lex_source(context, source_id);
     DiagnosticBag diagnostics(usize(20));
-    bool invalid = dump_tokens(tokens, diagnostics);
-    if (invalid) {
-        String(SystemAllocator) rendered = render_diagnostics(
-            sources, diagnostics, format
+    if (syntax_mode) {
+        ParsedFileId parsed_id = parse_recovering(
+            context, source_id, tokens, diagnostics
         );
-        write_stderr(rendered.as_str());
-        return 1;
+        &in ParsedFile parsed = context.file(parsed_id);
+        String(SystemAllocator) syntax = dump_syntax(parsed);
+        write_stdout(syntax.as_str());
+        if (diagnostics.is_empty() == false) {
+            &in SourceMap sources = context.source_map();
+            String(SystemAllocator) rendered = render_diagnostics(
+                sources, diagnostics, format
+            );
+            write_stderr(rendered.as_str());
+            return 1;
+        }
+        return 0;
+    } else {
+        bool invalid = dump_tokens(tokens, diagnostics);
+        if (invalid) {
+            &in SourceMap sources = context.source_map();
+            String(SystemAllocator) rendered = render_diagnostics(
+                sources, diagnostics, format
+            );
+            write_stderr(rendered.as_str());
+            return 1;
+        }
+        return 0;
     }
-    return 0;
 }
 
 i32 main(&in str[] arguments) {
     DiagnosticFormat format = DiagnosticFormat.human;
     str path = "";
-    if (len(arguments) == 2) {
-        path = arguments[1];
-    } elif (len(arguments) == 4) {
-        if (arguments[1] != "--diagnostic-format") {
-            try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] <source>\n"); }
-            catch IoError { }
-            return 2;
+    bool syntax_mode = false;
+    bool path_set = false;
+    bool format_set = false;
+    bool dump_set = false;
+    bool valid = true;
+    usize index = usize(1);
+    while (index < usize(len(arguments)) && valid) {
+        if (arguments[index] == "--diagnostic-format") {
+            if (format_set || index + usize(1) >= usize(len(arguments))) {
+                valid = false;
+            } else {
+                format_set = true;
+                index = index + usize(1);
+                if (arguments[index] == "stable") { format = DiagnosticFormat.stable; }
+                elif (arguments[index] != "human") { valid = false; }
+            }
+        } elif (arguments[index] == "--dump") {
+            if (dump_set || index + usize(1) >= usize(len(arguments))) {
+                valid = false;
+            } else {
+                dump_set = true;
+                index = index + usize(1);
+                if (arguments[index] == "syntax") { syntax_mode = true; }
+                elif (arguments[index] != "tokens") { valid = false; }
+            }
+        } else {
+            if (path_set || (len(arguments[index]) > usize(0)
+                && jack_str_byte(arguments[index], usize(0)) == u8(45))) { valid = false; }
+            else { path = arguments[index]; path_set = true; }
         }
-        if (arguments[2] == "stable") { format = DiagnosticFormat.stable; }
-        elif (arguments[2] != "human") {
-            try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] <source>\n"); }
-            catch IoError { }
-            return 2;
-        }
-        path = arguments[3];
-    } else {
-        try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] <source>\n"); }
+        index = index + usize(1);
+    }
+    if (valid == false || path_set == false) {
+        try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] [--dump tokens|syntax] <source>\n"); }
         catch IoError { }
         return 2;
     }
     try {
-        return run(path, format);
+        return run(path, format, syntax_mode);
     } catch IoError error {
         report_io(format, error.error_code());
     } catch Utf8Error error {
@@ -219,6 +265,12 @@ i32 main(&in str[] arguments) {
         report_locationless(format, "collections.bounds", "index out of bounds");
     } catch SourceMapError {
         report_locationless(format, "source.invalid-span", "invalid source location");
+    } catch SyntaxValidationError {
+        report_locationless(format, "syntax.invalid-tree", "invalid syntax tree");
+    } catch FrontendReferenceError {
+        report_locationless(format, "syntax.invalid-reference", "invalid syntax reference");
+    } catch ArenaHandleError {
+        report_locationless(format, "syntax.invalid-handle", "invalid syntax node handle");
     }
     return 1;
 }

@@ -33,6 +33,16 @@ pub struct Token {
     TokenKind kind;
     SourceSpan span;
 
+    void rebase(&inout self, usize offset, usize line, usize column) {
+        usize result_column = self.span.column_number();
+        if (self.span.line_number() == usize(1)) {
+            result_column = result_column + column - usize(1);
+        }
+        self.span = source_span(self.span.source_id(), self.span.start_offset() + offset,
+            self.span.end_offset() + offset, self.span.line_number() + line - usize(1),
+            result_column);
+    }
+
     u8 kind_value(&in self) {
         return match (&in self.kind) {
             .eof => u8(0),
@@ -50,6 +60,48 @@ pub struct Token {
     usize line_number(&in self) { return self.span.line_number(); }
     usize column_number(&in self) { return self.span.column_number(); }
     SourceSpan source_location(&in self) { return self.span; }
+    bool is_eof(&in self) {
+        return match (&in self.kind) {
+            .eof => true,
+            _ => false,
+        };
+    }
+    bool is_identifier(&in self) {
+        return match (&in self.kind) {
+            .identifier => true,
+            _ => false,
+        };
+    }
+    bool is_integer(&in self) {
+        return match (&in self.kind) {
+            .integer => true,
+            _ => false,
+        };
+    }
+    bool is_floating(&in self) {
+        return match (&in self.kind) {
+            .floating => true,
+            _ => false,
+        };
+    }
+    bool is_string(&in self) {
+        return match (&in self.kind) {
+            .string => true,
+            _ => false,
+        };
+    }
+    bool is_formatted_string(&in self) {
+        return match (&in self.kind) {
+            .formatted_string => true,
+            _ => false,
+        };
+    }
+    bool is_invalid(&in self) {
+        return match (&in self.kind) {
+            .invalid => true,
+            _ => false,
+        };
+    }
 }
 
 pub TokenKind token_eof() { return TokenKind.eof; }
@@ -151,6 +203,8 @@ HandlerResult scan_handler(
         }
         if (valid == false) { emit_token = true; }
     } else {
+        usize expression_depth = usize(0);
+        bool quoted_expression = false;
         while (index < usize(len(source)) && scanning) {
             u8 value = source[index];
             if (value == u8(10)) {
@@ -159,7 +213,9 @@ HandlerResult scan_handler(
             } elif (value == u8(34)) {
                 index = index + usize(1);
                 current_column = current_column + usize(1);
-                scanning = false;
+                if (handler != u8(2) || expression_depth == usize(0)) {
+                    scanning = false;
+                } else { quoted_expression = quoted_expression == false; }
             } elif (value == u8(92)) {
                 index = index + usize(1);
                 current_column = current_column + usize(1);
@@ -174,6 +230,17 @@ HandlerResult scan_handler(
                     current_column = current_column + usize(1);
                 }
             } else {
+                if (handler == u8(2) && quoted_expression == false) {
+                    if (value == u8(123)) {
+                        if (expression_depth == usize(0) && index + usize(1) < usize(len(source))
+                            && source[index + usize(1)] == u8(123)) {
+                            index = index + usize(1);
+                            current_column = current_column + usize(1);
+                        } else { expression_depth = expression_depth + usize(1); }
+                    } elif (value == u8(125) && expression_depth > usize(0)) {
+                        expression_depth = expression_depth - usize(1);
+                    }
+                }
                 index = index + usize(1);
                 current_column = current_column + usize(1);
             }
@@ -272,5 +339,24 @@ pub Vector(Token, A) lex(
         }
     }
     emit(A, tokens, token_eof(), index, index, line, column, source_id);
+    return tokens;
+}
+
+pub Vector(Token, SystemAllocator) lex_range(
+    &in SourceMap sources, SourceId source, usize start, usize end
+) raises SourceMapError, CapacityError, LayoutError, AllocationError, BoundsError {
+    if (start > end || end > sources.source_len(source)) { raise SourceMapError { }; }
+    &in u8[] bytes = sources.bytes(source);
+    &in u8[] range = &in bytes[start..end];
+    SystemAllocator allocator;
+    Vector(Token, SystemAllocator) tokens = lex(SystemAllocator, source, range, allocator);
+    usize line = sources.line_for_offset(source, start);
+    usize column = start - sources.line_start(source, line) + usize(1);
+    usize index = usize(0);
+    while (index < tokens.len()) {
+        &inout Token token = tokens.get_mut(index);
+        token.rebase(start, line, column);
+        index = index + usize(1);
+    }
     return tokens;
 }

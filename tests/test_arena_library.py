@@ -142,10 +142,10 @@ import std.collections.arena;
 import std.memory;
 import std.string;
 
-void run() raises CapacityError, LayoutError, AllocationError {
+void run() raises CapacityError, LayoutError, AllocationError, SourceMapError {
     SystemAllocator source_allocator;
     String(SystemAllocator) text(source_allocator, "abc");
-    SourceMap sources;
+    SourceMap sources = source_map();
     SourceId source = sources.add("fixture.jack", text);
     SourceSpan[2] spans;
     spans[0] = source_span(source, usize(0), usize(1), usize(1), usize(1));
@@ -159,6 +159,7 @@ try { run(); }
 catch CapacityError { }
 catch LayoutError { }
 catch AllocationError { }
+catch SourceMapError { }
 '''
         temporary, _entry, program = self._program(
             source, module_roots=(SELFHOST_ROOT,)

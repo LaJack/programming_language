@@ -241,9 +241,12 @@ source-visible locals are supported.
 
 `selfhost/bootstrap/` contains the growing Jack frontend. Its lexer reads real
 files through `std.io`, stores tokens dynamically, and uses a tagged
-`TokenKind` union while preserving deterministic source spans. The Python
-compiler remains stage 0 while parsing and semantic infrastructure are moved
-into Jack.
+`TokenKind` union while preserving deterministic source spans. Its recovering
+parser builds typed, arena-backed syntax trees owned by a multi-file frontend
+context. Structural differential tests compare these trees with the Python
+parser; semantic analysis in Jack remains deferred. See the
+[self-hosting documentation](selfhost/README.md) for APIs, syntax dumps, and
+measurements. The Python compiler remains stage 0.
 
 ## Development
 

@@ -1,0 +1,821 @@
+module bootstrap.syntax_dump;
+
+import bootstrap.source;
+import bootstrap.syntax;
+import std.collections.arena;
+import std.collections.vector;
+import std.memory;
+import std.string;
+
+void append_node_record(
+    &inout StringBuilder(SystemAllocator) output,
+    usize id,
+    &in SyntaxNode node
+) raises CapacityError, LayoutError, AllocationError {
+    SourceSpan span = node.source_span();
+    output.append("node\t");
+    output.append_usize(id);
+    output.append("\t");
+    output.append(node.kind_name());
+    output.append("\t");
+    output.append_usize(span.start_offset());
+    output.append("\t");
+    output.append_usize(span.end_offset());
+    output.append("\n");
+    &in SyntaxData data = node.payload();
+    match (data) {
+        .invalid_declaration {
+        }
+        .invalid_statement {
+        }
+        .invalid_type {
+        }
+        .invalid_pattern {
+        }
+        .invalid_expression {
+        }
+        .module_declaration(path) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tpath\t"); output.append_usize(path.start_offset());
+            output.append("\t"); output.append_usize(path.end_offset()); output.append("\n");
+        }
+        .import_declaration(path, alias, symbols) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tpath\t"); output.append_usize(path.start_offset());
+            output.append("\t"); output.append_usize(path.end_offset()); output.append("\n");
+            output.append("field\t"); output.append_usize(id);
+            output.append("\talias\t"); output.append_usize(alias.start_offset());
+            output.append("\t"); output.append_usize(alias.end_offset()); output.append("\n");
+        }
+        .import_path(name) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .import_symbol(name) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .struct_declaration(name, modifiers, parameters, body) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .union_declaration(name, modifiers, parameters, body) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .interface_declaration(name, modifiers, body) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .implementation_declaration(target, interface_type, body) {
+        }
+        .implementation_use(name) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .view_declaration(name, modifiers, body) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .view_field(name, mode, declared_type) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tmode\t"); output.append_usize(mode.start_offset());
+            output.append("\t"); output.append_usize(mode.end_offset()); output.append("\n");
+        }
+        .extern_type_declaration(name, modifiers) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .function_declaration(name, modifiers, return_type, parameters, error_types, body) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .parameter(name, modifiers, declared_type, constraints) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .field_declaration(name, modifiers, declared_type, initializer) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .variable_declaration(name, modifiers, declared_type, initializer, arguments) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .constant_declaration(name, modifiers, declared_type, initializer) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .comptime_type_declaration(name, modifiers, initializer) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+            SourceSpan abi = modifiers.abi_span();
+            if (abi.end_offset() > abi.start_offset()) {
+                output.append("field\t"); output.append_usize(id);
+                output.append("\tabi\t"); output.append_usize(abi.start_offset());
+                output.append("\t"); output.append_usize(abi.end_offset()); output.append("\n");
+            }
+            if (modifiers.public_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tpublic\ttrue\n");
+            }
+            if (modifiers.comptime_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime\ttrue\n");
+            }
+            if (modifiers.constant_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstant\ttrue\n");
+            }
+            if (modifiers.unsafe_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tunsafe\ttrue\n");
+            }
+            if (modifiers.extern_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\textern\ttrue\n");
+            }
+            if (modifiers.consuming_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconsuming\ttrue\n");
+            }
+            if (modifiers.constructor_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tconstructor\ttrue\n");
+            }
+            if (modifiers.comptime_initializer_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\tcomptime_initializer\ttrue\n");
+            }
+            if (modifiers.raises_inferred_flag()) {
+                output.append("value\t"); output.append_usize(id);
+                output.append("\traises_inferred\ttrue\n");
+            }
+        }
+        .union_variant(name, parameters) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .block_statement(statements) {
+        }
+        .unsafe_block(body) {
+        }
+        .comptime_statement(statement) {
+        }
+        .expression_statement(expression) {
+        }
+        .assignment_statement(target, value) {
+        }
+        .if_statement(branches) {
+        }
+        .if_branch(condition, body) {
+        }
+        .else_branch(body) {
+        }
+        .while_statement(condition, body) {
+        }
+        .for_statement(initializer, condition, update, body) {
+        }
+        .try_statement(body, catches) {
+        }
+        .catch_clause(name, error_type, body) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .return_statement(value) {
+        }
+        .raise_statement(error) {
+        }
+        .rethrow_statement {
+        }
+        .print_statement(value) {
+        }
+        .match_statement(scrutinee, arms) {
+        }
+        .match_expression(scrutinee, arms) {
+        }
+        .match_arm(pattern, body) {
+        }
+        .variant_pattern(name, bindings) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .wildcard_pattern {
+        }
+        .binding_pattern(name) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .named_type(name) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .generic_type(name, arguments) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .array_type(element, extent) {
+        }
+        .slice_type(element) {
+        }
+        .borrow_type(mode, target) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tmode\t"); output.append_usize(mode.start_offset());
+            output.append("\t"); output.append_usize(mode.end_offset()); output.append("\n");
+        }
+        .raw_pointer_type(mode, target) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tmode\t"); output.append_usize(mode.start_offset());
+            output.append("\t"); output.append_usize(mode.end_offset()); output.append("\n");
+        }
+        .nullable_pointer_type(mode, target) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tmode\t"); output.append_usize(mode.start_offset());
+            output.append("\t"); output.append_usize(mode.end_offset()); output.append("\n");
+        }
+        .type_argument(value) {
+        }
+        .name_expression(name) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .integer_literal(spelling) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tspelling\t"); output.append_usize(spelling.start_offset());
+            output.append("\t"); output.append_usize(spelling.end_offset()); output.append("\n");
+        }
+        .floating_literal(spelling) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tspelling\t"); output.append_usize(spelling.start_offset());
+            output.append("\t"); output.append_usize(spelling.end_offset()); output.append("\n");
+        }
+        .string_literal(spelling) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tspelling\t"); output.append_usize(spelling.start_offset());
+            output.append("\t"); output.append_usize(spelling.end_offset()); output.append("\n");
+        }
+        .formatted_string(parts) {
+        }
+        .formatted_text(spelling) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tspelling\t"); output.append_usize(spelling.start_offset());
+            output.append("\t"); output.append_usize(spelling.end_offset()); output.append("\n");
+        }
+        .boolean_literal(spelling) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tspelling\t"); output.append_usize(spelling.start_offset());
+            output.append("\t"); output.append_usize(spelling.end_offset()); output.append("\n");
+        }
+        .null_literal {
+        }
+        .unary_expression(operator, operation, operand) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\toperator\t"); output.append_usize(operator.start_offset());
+            output.append("\t"); output.append_usize(operator.end_offset()); output.append("\n");
+        }
+        .binary_expression(operator, operation, left, right) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\toperator\t"); output.append_usize(operator.start_offset());
+            output.append("\t"); output.append_usize(operator.end_offset()); output.append("\n");
+        }
+        .borrow_expression(mode, operand) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tmode\t"); output.append_usize(mode.start_offset());
+            output.append("\t"); output.append_usize(mode.end_offset()); output.append("\n");
+        }
+        .move_expression(operand) {
+        }
+        .dereference_expression(operand) {
+        }
+        .call_expression(callee, arguments) {
+        }
+        .member_expression(name, receiver) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .index_expression(target, index) {
+        }
+        .slice_expression(target, start, end) {
+        }
+        .struct_literal(declared_type, fields) {
+        }
+        .struct_literal_field(name, value) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .union_variant_expression(name, arguments) {
+            output.append("field\t"); output.append_usize(id);
+            output.append("\tname\t"); output.append_usize(name.start_offset());
+            output.append("\t"); output.append_usize(name.end_offset()); output.append("\n");
+        }
+        .parenthesized_expression(expression) {
+        }
+        .absent {
+        }
+    }
+}
+
+usize append_tree(
+    &inout StringBuilder(SystemAllocator) output,
+    &in ParsedFile file,
+    ArenaHandle(SyntaxNode) handle,
+    usize id,
+    usize next
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         ArenaHandleError {
+    &in SyntaxNode node = file.node(handle);
+    append_node_record(output, id, node);
+    usize count = child_count(node);
+    usize index = usize(0);
+    usize role_index = usize(0);
+    str previous_role = "";
+    while (index < count) {
+        ArenaHandle(SyntaxNode) child = syntax_child(file, node, index);
+        usize child_id = next;
+        next = next + usize(1);
+        output.append("child\t");
+        output.append_usize(id);
+        output.append("\t");
+        str role = child_role(node, index);
+        if (role != previous_role) { role_index = usize(0); }
+        output.append(role);
+        output.append("\t");
+        output.append_usize(role_index);
+        role_index = role_index + usize(1);
+        previous_role = role;
+        output.append("\t");
+        output.append_usize(child_id);
+        output.append("\n");
+        next = append_tree(output, file, child, child_id, next);
+        index = index + usize(1);
+    }
+    return next;
+}
+
+pub String(SystemAllocator) dump_syntax(&in ParsedFile file)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error,
+        BoundsError, ArenaHandleError
+{
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    usize next = usize(0);
+    usize index = usize(0);
+    while (index < file.root_count()) {
+        usize id = next;
+        next = next + usize(1);
+        output.append("root\t");
+        output.append_usize(index);
+        output.append("\t");
+        output.append_usize(id);
+        output.append("\n");
+        next = append_tree(output, file, file.root(index), id, next);
+        index = index + usize(1);
+    }
+    return finish_string(SystemAllocator, output);
+}

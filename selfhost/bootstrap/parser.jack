@@ -1,0 +1,1849 @@
+module bootstrap.parser;
+
+import bootstrap.diagnostics;
+import bootstrap.lexer;
+import bootstrap.source;
+import bootstrap.syntax;
+import std.collections.arena;
+import std.collections.vector;
+import std.memory;
+
+pub struct ParseFailed { }
+
+pub struct ParserOptions {
+    usize limit;
+    init(&inout self, usize maximum_nesting) {
+        self.limit = maximum_nesting;
+        if (self.limit == usize(0)) { self.limit = usize(1); }
+    }
+    usize maximum_nesting(&in self) { return self.limit; }
+}
+
+struct ParserState {
+    SyntaxBuilder file;
+    Vector(ArenaHandle(SyntaxNode), SystemAllocator) scratch;
+    usize current;
+    bool stopped;
+    bool had_errors;
+    usize nesting;
+    usize maximum_nesting;
+    usize scratch_peak;
+
+    init(
+        &inout self,
+        SourceId source,
+        move Vector(Token, SystemAllocator) tokens
+    ) raises CapacityError, LayoutError, AllocationError {
+        SyntaxBuilder file(source, tokens);
+        SystemAllocator scratch_allocator;
+        Vector(ArenaHandle(SyntaxNode), SystemAllocator) scratch(scratch_allocator, usize(0));
+        self.scratch = move scratch;
+        self.file = move file;
+        self.current = usize(0);
+        self.stopped = false;
+        self.had_errors = false;
+        self.nesting = usize(0);
+        self.maximum_nesting = usize(128);
+        self.scratch_peak = usize(0);
+    }
+}
+
+usize child_list(&in ParserState parser) { return parser.scratch.len(); }
+
+void push_child(&inout ParserState parser, usize checkpoint, ArenaHandle(SyntaxNode) child)
+    raises CapacityError, LayoutError, AllocationError {
+    parser.scratch.push(child);
+    if (parser.scratch.len() > parser.scratch_peak) { parser.scratch_peak = parser.scratch.len(); }
+}
+
+ChildRange finish_list(&inout ParserState parser, usize checkpoint)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    usize start = parser.file.begin_children();
+    usize index = checkpoint;
+    while (index < parser.scratch.len()) {
+        parser.file.append_child(parser.scratch.get(index));
+        index = index + usize(1);
+    }
+    while (parser.scratch.len() > checkpoint) { parser.scratch.pop(); }
+    return parser.file.finish_children(start);
+}
+
+&in Token peek(&in ParserState parser) raises BoundsError {
+    return parser.file.token(parser.current);
+}
+
+&in Token previous(&in ParserState parser) raises BoundsError {
+    if (parser.current == usize(0)) { return parser.file.token(usize(0)); }
+    return parser.file.token(parser.current - usize(1));
+}
+
+bool at_end(&in ParserState parser) raises BoundsError {
+    &in Token token = peek(parser);
+    return token.is_eof();
+}
+
+SourceSpan current_span(&in ParserState parser) raises BoundsError {
+    &in Token token = peek(parser);
+    return token.source_location();
+}
+
+bool current_is_identifier(&in ParserState parser) raises BoundsError {
+    &in Token token = peek(parser);
+    return token.is_identifier();
+}
+
+bool current_is_invalid(&in ParserState parser) raises BoundsError {
+    &in Token token = peek(parser);
+    return token.is_invalid();
+}
+
+u8 current_token_kind(&in ParserState parser) raises BoundsError {
+    &in Token token = peek(parser);
+    return token.kind_value();
+}
+
+SourceSpan previous_span(&in ParserState parser) raises BoundsError {
+    &in Token token = previous(parser);
+    return token.source_location();
+}
+
+SourceSpan node_span(
+    &in ParserState parser, ArenaHandle(SyntaxNode) handle
+) raises ArenaHandleError {
+    &in SyntaxNode node = parser.file.node(handle);
+    return node.source_span();
+}
+
+bool token_is(
+    &in ParserState parser, &in SourceMap context, str text
+) raises BoundsError, SourceMapError {
+    &in Token token = peek(parser);
+    SourceSpan span = token.source_location();
+    return context.text_equals(span, text);
+}
+
+bool advance_if(
+    &inout ParserState parser, &in SourceMap context, str text
+) raises BoundsError, SourceMapError {
+    if (token_is(parser, context, text)) {
+        if (at_end(parser) == false) {
+            parser.current = parser.current + usize(1);
+        }
+        return true;
+    }
+    return false;
+}
+
+SourceSpan cover_spans(SourceSpan start, SourceSpan end) {
+    usize end_offset = end.end_offset();
+    if (end_offset < start.start_offset()) { end_offset = start.start_offset(); }
+    return source_span(
+        start.source_id(), start.start_offset(), end_offset,
+        start.line_number(), start.column_number()
+    );
+}
+
+void record_error(
+    &inout ParserState parser,
+    &inout DiagnosticBag diagnostics,
+    str code,
+    SourceSpan span,
+    str message
+) raises CapacityError, LayoutError, AllocationError, BoundsError {
+    parser.had_errors = true;
+    Diagnostic diagnostic = source_diagnostic(
+        DiagnosticSeverity.error, code, span, message
+    );
+    diagnostics.add(diagnostic);
+}
+
+bool expect(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics,
+    str text,
+    str message
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError {
+    if (advance_if(parser, context, text)) { return true; }
+    record_error(
+        parser, diagnostics, "parse.expected-token", current_span(parser),
+        message
+    );
+    return false;
+}
+
+ArenaHandle(SyntaxNode) insert_node(
+    &inout ParserState parser,
+    SyntaxKind kind,
+    SourceSpan span,
+    NodeDraft data
+) raises CapacityError, LayoutError, AllocationError, BoundsError, ArenaHandleError {
+    SyntaxNode node = materialize_node(parser.file, kind, span, data);
+    return parser.file.insert(node);
+}
+
+ArenaHandle(SyntaxNode) insert_children_node(
+    &inout ParserState parser,
+    SyntaxKind kind,
+    SourceSpan span,
+    usize children
+) raises CapacityError, LayoutError, AllocationError, BoundsError, ArenaHandleError {
+    ChildRange range = finish_list(parser, children);
+    return insert_node(parser, kind, span, NodeDraft.children(range));
+}
+
+ArenaHandle(SyntaxNode) insert_text_children_node(
+    &inout ParserState parser,
+    SyntaxKind kind,
+    SourceSpan span,
+    SourceSpan text,
+    u32 flags,
+    usize children
+) raises CapacityError, LayoutError, AllocationError, BoundsError, ArenaHandleError {
+    ChildRange range = finish_list(parser, children);
+    return insert_node(
+        parser, kind, span,
+        NodeDraft.text_value_children(text, flags, range)
+    );
+}
+
+u32 binary_precedence(
+    &in ParserState parser, &in SourceMap context
+) raises BoundsError, SourceMapError {
+    if (token_is(parser, context, "||")) { return u32(1); }
+    if (token_is(parser, context, "&&")) { return u32(2); }
+    if (token_is(parser, context, "|")) { return u32(3); }
+    if (token_is(parser, context, "^")) { return u32(4); }
+    if (token_is(parser, context, "&")) { return u32(5); }
+    if (token_is(parser, context, "==") || token_is(parser, context, "!=")
+        || token_is(parser, context, "<") || token_is(parser, context, ">")
+        || token_is(parser, context, "<=") || token_is(parser, context, ">=")) {
+        return u32(6);
+    }
+    if (token_is(parser, context, "<<") || token_is(parser, context, ">>")) {
+        return u32(7);
+    }
+    if (token_is(parser, context, "+") || token_is(parser, context, "-")) {
+        return u32(8);
+    }
+    if (token_is(parser, context, "*") || token_is(parser, context, "/")
+        || token_is(parser, context, "%")) { return u32(9); }
+    return u32(0);
+}
+
+ArenaHandle(SyntaxNode) invalid_expression(
+    &inout ParserState parser, &in SourceMap context, &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError, ArenaHandleError, SourceMapError {
+    SourceSpan span = current_span(parser);
+    if (expression_boundary(parser, context) || at_end(parser)) {
+        span = source_span(span.source_id(), span.start_offset(), span.start_offset(),
+            span.line_number(), span.column_number());
+    }
+    record_error(
+        parser, diagnostics, "parse.expected-expression", span, "expected expression"
+    );
+    if (at_end(parser) == false && expression_boundary(parser, context) == false) {
+        parser.current = parser.current + usize(1);
+    }
+    return insert_node(
+        parser, SyntaxKind.invalid_expression, span, NodeDraft.none
+    );
+}
+
+ArenaHandle(SyntaxNode) absent_node(&inout ParserState parser)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, ArenaHandleError {
+    SourceSpan span = current_span(parser);
+    span = source_span(span.source_id(), span.start_offset(), span.start_offset(),
+        span.line_number(), span.column_number());
+    return insert_node(parser, SyntaxKind.absent, span, NodeDraft.none);
+}
+
+ArenaHandle(SyntaxNode) parse_pattern(
+    &inout ParserState parser, &in SourceMap context, &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError, ArenaHandleError {
+    SourceSpan first = current_span(parser);
+    if (advance_if(parser, context, "_")) {
+        return insert_node(parser, SyntaxKind.wildcard_pattern, first, NodeDraft.none);
+    }
+    bool valid = expect(parser, context, diagnostics, ".", "expected .variant or _ pattern");
+    SourceSpan name = current_span(parser);
+    if (current_is_identifier(parser)) { parser.current = parser.current + usize(1); }
+    else {
+        record_error(parser, diagnostics, "parse.expected-token", name, "expected variant name");
+        valid = false;
+    }
+    usize bindings = child_list(parser);
+    if (advance_if(parser, context, "(")) {
+        bool more = token_is(parser, context, ")") == false;
+        while (more && at_end(parser) == false) {
+            SourceSpan binding = current_span(parser);
+            if (current_is_identifier(parser)) {
+                parser.current = parser.current + usize(1);
+                SyntaxKind binding_kind = SyntaxKind.binding_pattern;
+                if (context.text_equals(binding, "_")) { binding_kind = SyntaxKind.wildcard_pattern; }
+                push_child(parser, bindings, insert_node(parser, binding_kind, binding, NodeDraft.text(binding)));
+            } else {
+                record_error(parser, diagnostics, "parse.invalid-pattern", binding, "expected binding name or _");
+                valid = false;
+                synchronize_list(parser, context, ")");
+            }
+            more = advance_if(parser, context, ",");
+        }
+        expect(parser, context, diagnostics, ")", "expected ) after pattern bindings");
+    }
+    SyntaxKind kind = SyntaxKind.variant_pattern;
+    if (valid == false) { kind = SyntaxKind.invalid_pattern; }
+    return insert_text_children_node(parser, kind, cover_spans(first, previous_span(parser)),
+        name, u32(0), bindings);
+}
+
+ArenaHandle(SyntaxNode) parse_match_construct(
+    &inout ParserState parser, &in SourceMap context,
+    &inout DiagnosticBag diagnostics, SyntaxKind kind
+) raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError, ArenaHandleError {
+    SourceSpan first = current_span(parser);
+    expect(parser, context, diagnostics, "match", "expected match");
+    expect(parser, context, diagnostics, "(", "expected ( after match");
+    usize children = child_list(parser);
+    push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+    expect(parser, context, diagnostics, ")", "expected ) after match value");
+    expect(parser, context, diagnostics, "{", "expected { before match arms");
+    u8 form = u8(0);
+    while (at_end(parser) == false && token_is(parser, context, "}") == false) {
+        usize before = parser.current;
+        SourceSpan arm_start = current_span(parser);
+        usize arm = child_list(parser);
+        push_child(parser, arm, parse_pattern(parser, context, diagnostics));
+        if (advance_if(parser, context, "=>")) {
+            if (form == u8(2)) {
+                record_error(parser, diagnostics, "parse.mixed-match-arms", arm_start,
+                    "cannot mix statement and expression match arms");
+            }
+            form = u8(1);
+            push_child(parser, arm, parse_expression(parser, context, diagnostics, u32(1)));
+            expect(parser, context, diagnostics, ",", "expected , after match arm");
+        } else {
+            if (form == u8(1)) {
+                record_error(parser, diagnostics, "parse.mixed-match-arms", arm_start,
+                    "cannot mix statement and expression match arms");
+            }
+            form = u8(2);
+            push_child(parser, arm, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+        }
+        push_child(parser, children, insert_children_node(parser, SyntaxKind.match_arm,
+            cover_spans(arm_start, previous_span(parser)), arm));
+        if (parser.current == before) {
+            if (token_is(parser, context, "}")) { }
+            else { parser.current = parser.current + usize(1); }
+        }
+    }
+    expect(parser, context, diagnostics, "}", "expected } after match arms");
+    return insert_children_node(parser, kind, cover_spans(first, previous_span(parser)), children);
+}
+
+ArenaHandle(SyntaxNode) parse_primary(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    SourceSpan span = current_span(parser);
+    u8 token_kind = current_token_kind(parser);
+    if (token_is(parser, context, "match")) {
+        return parse_match_construct(
+            parser, context, diagnostics, SyntaxKind.match_expression
+        );
+    }
+    if (token_kind == u8(2)) {
+        parser.current = parser.current + usize(1);
+        return insert_node(parser, SyntaxKind.integer_literal, span, NodeDraft.text(span));
+    }
+    if (token_kind == u8(3)) {
+        parser.current = parser.current + usize(1);
+        return insert_node(parser, SyntaxKind.floating_literal, span, NodeDraft.text(span));
+    }
+    if (token_kind == u8(4)) {
+        parser.current = parser.current + usize(1);
+        return insert_node(parser, SyntaxKind.string_literal, span, NodeDraft.text(span));
+    }
+    if (token_kind == u8(7)) {
+        parser.current = parser.current + usize(1);
+        return parse_formatted_string(parser, context, diagnostics, span);
+    }
+    if (token_kind == u8(1)) {
+        parser.current = parser.current + usize(1);
+        SyntaxKind kind = SyntaxKind.name_expression;
+        if (context.text_equals(span, "true") || context.text_equals(span, "false")) {
+            kind = SyntaxKind.boolean_literal;
+        } elif (context.text_equals(span, "null")) {
+            kind = SyntaxKind.null_literal;
+        }
+        return insert_node(parser, kind, span, NodeDraft.text(span));
+    }
+    if (advance_if(parser, context, "(")) {
+        SourceSpan first = previous_span(parser);
+        ArenaHandle(SyntaxNode) value = parse_expression(
+            parser, context, diagnostics, u32(1)
+        );
+        expect(parser, context, diagnostics, ")", "expected ) after expression");
+        usize children = child_list(parser);
+        push_child(parser, children, value);
+        return insert_children_node(
+            parser, SyntaxKind.parenthesized_expression,
+            cover_spans(first, previous_span(parser)), children
+        );
+    }
+    return invalid_expression(parser, context, diagnostics);
+}
+
+ArenaHandle(SyntaxNode) parse_prefix(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    SourceSpan first = current_span(parser);
+    SyntaxKind kind = SyntaxKind.unary_expression;
+    bool prefix = false;
+    if (token_is(parser, context, "move")) {
+        kind = SyntaxKind.move_expression; prefix = true;
+    } elif (token_is(parser, context, "&")) {
+        kind = SyntaxKind.borrow_expression; prefix = true;
+    } elif (token_is(parser, context, "*")) {
+        kind = SyntaxKind.dereference_expression; prefix = true;
+    } elif (token_is(parser, context, "~")) {
+        prefix = true;
+    }
+    if (prefix) {
+        SourceSpan operator = first;
+        parser.current = parser.current + usize(1);
+        if (kind == SyntaxKind.borrow_expression && current_is_identifier(parser)) {
+            if (token_is(parser, context, "in") || token_is(parser, context, "out")
+                || token_is(parser, context, "inout")) {
+                parser.current = parser.current + usize(1);
+                operator = cover_spans(operator, previous_span(parser));
+            } else {
+                record_error(parser, diagnostics, "parse.expected-token", current_span(parser), "expected borrow mode");
+            }
+        }
+        ArenaHandle(SyntaxNode) operand = parse_expression(parser, context, diagnostics, u32(10));
+        usize children = child_list(parser);
+        push_child(parser, children, operand);
+        if (kind == SyntaxKind.unary_expression) {
+            return insert_operator_children_node(parser, kind,
+                cover_spans(first, node_span(parser, operand)), operator,
+                syntax_operator(context, operator), children);
+        }
+        return insert_text_children_node(
+            parser, kind, cover_spans(first, previous_span(parser)), operator,
+            u32(0), children
+        );
+    }
+    return parse_primary(parser, context, diagnostics);
+}
+
+ArenaHandle(SyntaxNode) parse_expression_inner(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics,
+    u32 minimum
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    ArenaHandle(SyntaxNode) left = parse_prefix(parser, context, diagnostics);
+    bool scanning = true;
+    while (scanning && at_end(parser) == false) {
+        if (advance_if(parser, context, "(")) {
+            SourceSpan first = node_span(parser, left);
+            usize children = child_list(parser);
+            push_child(parser, children, left);
+            if (token_is(parser, context, ")") == false) {
+                bool arguments = true;
+                while (arguments) {
+                    push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+                    if (advance_if(parser, context, ",") == false) { arguments = false; }
+                }
+            }
+            expect(parser, context, diagnostics, ")", "expected ) after arguments");
+            left = insert_children_node(
+                parser, SyntaxKind.call_expression,
+                cover_spans(first, previous_span(parser)), children
+            );
+        } elif (advance_if(parser, context, ".")) {
+            SourceSpan expression_start = node_span(parser, left);
+            SourceSpan name = current_span(parser);
+            if (current_is_identifier(parser)) { parser.current = parser.current + usize(1); }
+            else { record_error(parser, diagnostics, "parse.expected-token", name, "expected member name"); }
+            usize children = child_list(parser);
+            push_child(parser, children, left);
+            left = insert_text_children_node(
+                parser, SyntaxKind.member_expression,
+                cover_spans(expression_start, previous_span(parser)),
+                name, u32(0), children
+            );
+        } elif (advance_if(parser, context, "[")) {
+            SourceSpan first = node_span(parser, left);
+            usize children = child_list(parser);
+            push_child(parser, children, left);
+            bool slice = false;
+            if (token_is(parser, context, "..") == false && token_is(parser, context, "]") == false) {
+                push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+            } else { push_child(parser, children, absent_node(parser)); }
+            if (advance_if(parser, context, "..")) {
+                slice = true;
+                if (token_is(parser, context, "]") == false) {
+                    push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+                } else { push_child(parser, children, absent_node(parser)); }
+            }
+            expect(parser, context, diagnostics, "]", "expected ] after index");
+            SyntaxKind kind = SyntaxKind.index_expression;
+            if (slice) { kind = SyntaxKind.slice_expression; }
+            left = insert_children_node(
+                parser, kind, cover_spans(first, previous_span(parser)), children
+            );
+        } elif (advance_if(parser, context, "{")) {
+            SourceSpan expression_start = node_span(parser, left);
+            usize fields = child_list(parser);
+            push_child(parser, fields, left);
+            while (at_end(parser) == false && token_is(parser, context, "}") == false) {
+                SourceSpan field_start = current_span(parser);
+                SourceSpan field_name = field_start;
+                if (current_is_identifier(parser)) { parser.current = parser.current + usize(1); }
+                else { record_error(parser, diagnostics, "parse.expected-token", field_name, "expected struct literal field name"); }
+                expect(parser, context, diagnostics, "=", "expected = after field name");
+                usize field_children = child_list(parser);
+                push_child(parser, field_children, parse_expression(parser, context, diagnostics, u32(1)));
+                push_child(parser, fields, insert_text_children_node(
+                    parser, SyntaxKind.struct_literal_field,
+                    cover_spans(field_start, previous_span(parser)), field_name,
+                    u32(0), field_children
+                ));
+                if (advance_if(parser, context, ",") == false) {
+                    advance_if(parser, context, ";");
+                }
+            }
+            expect(parser, context, diagnostics, "}", "expected } after struct literal");
+            left = insert_children_node(
+                parser, SyntaxKind.struct_literal,
+                cover_spans(expression_start, previous_span(parser)), fields
+            );
+        } else {
+            u32 precedence = binary_precedence(parser, context);
+            if (precedence < minimum || precedence == u32(0)) {
+                scanning = false;
+            } else {
+                SourceSpan operator = current_span(parser);
+                SourceSpan expression_start = node_span(parser, left);
+                parser.current = parser.current + usize(1);
+                ArenaHandle(SyntaxNode) right = parse_expression(
+                    parser, context, diagnostics, precedence + u32(1)
+                );
+                usize children = child_list(parser);
+                push_child(parser, children, left); push_child(parser, children, right);
+                left = insert_operator_children_node(
+                    parser, SyntaxKind.binary_expression,
+                    cover_spans(expression_start, node_span(parser, right)),
+                    operator, syntax_operator(context, operator), children
+                );
+            }
+        }
+    }
+    return left;
+}
+
+bool expression_boundary(&in ParserState parser, &in SourceMap context)
+    raises BoundsError, SourceMapError {
+    return token_is(parser, context, ";") || token_is(parser, context, ",")
+        || token_is(parser, context, ")") || token_is(parser, context, "]")
+        || token_is(parser, context, "}") || token_is(parser, context, "=>");
+}
+
+void synchronize_list(&inout ParserState parser, &in SourceMap context, str closing)
+    raises BoundsError, SourceMapError {
+    usize depth = usize(0);
+    bool scanning = true;
+    while (scanning && at_end(parser) == false) {
+        if (depth == usize(0) && (token_is(parser, context, closing)
+            || token_is(parser, context, ",") || token_is(parser, context, "}")
+            || token_is(parser, context, ";") || token_is(parser, context, "=>"))) {
+            scanning = false;
+        } else {
+            if (token_is(parser, context, "(") || token_is(parser, context, "[")
+                || token_is(parser, context, "{")) { depth = depth + usize(1); }
+            elif (token_is(parser, context, ")") || token_is(parser, context, "]")
+                || token_is(parser, context, "}")) {
+                if (depth == usize(0)) { return; }
+                depth = depth - usize(1);
+            }
+            parser.current = parser.current + usize(1);
+        }
+    }
+}
+
+void synchronize(
+    &inout ParserState parser, &in SourceMap context, bool in_block
+) raises BoundsError, SourceMapError {
+    usize start = parser.current;
+    usize parens = usize(0); usize brackets = usize(0); usize braces = usize(0);
+    bool scanning = true;
+    while (scanning && at_end(parser) == false) {
+        if (parens == usize(0) && brackets == usize(0) && braces == usize(0)) {
+            if (advance_if(parser, context, ";")) { scanning = false; }
+            elif (in_block && token_is(parser, context, "}")) { scanning = false; }
+        }
+        if (scanning) {
+            if (token_is(parser, context, "(")) { parens = parens + usize(1); }
+            elif (token_is(parser, context, "[") ) { brackets = brackets + usize(1); }
+            elif (token_is(parser, context, "{")) { braces = braces + usize(1); }
+            elif (token_is(parser, context, ")") && parens > usize(0)) { parens = parens - usize(1); }
+            elif (token_is(parser, context, "]") && brackets > usize(0)) { brackets = brackets - usize(1); }
+            elif (token_is(parser, context, "}") && braces > usize(0)) { braces = braces - usize(1); }
+            parser.current = parser.current + usize(1);
+        }
+    }
+    if (parser.current == start && at_end(parser) == false
+        && (in_block == false || token_is(parser, context, "}") == false)) {
+        parser.current = parser.current + usize(1);
+    }
+}
+
+ArenaHandle(SyntaxNode) parse_statement(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    SourceSpan first = current_span(parser);
+    if (advance_if(parser, context, "{")) {
+        parser.current = parser.current - usize(1);
+        return parse_block(parser, context, diagnostics, SyntaxKind.block_statement);
+    }
+    if (advance_if(parser, context, "unsafe") && token_is(parser, context, "{")) {
+        return parse_block(parser, context, diagnostics, SyntaxKind.unsafe_block);
+    }
+    if (advance_if(parser, context, "if")) {
+        usize branches = child_list(parser);
+        SourceSpan branch_start = first;
+        bool parsing_branches = true;
+        while (parsing_branches) {
+            expect(parser, context, diagnostics, "(", "expected ( after if");
+            usize branch_children = child_list(parser);
+            push_child(parser, branch_children, parse_expression(parser, context, diagnostics, u32(1)));
+            expect(parser, context, diagnostics, ")", "expected ) after condition");
+            push_child(parser, branch_children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+            push_child(parser, branches, insert_children_node(
+                parser, SyntaxKind.if_branch,
+                cover_spans(branch_start, previous_span(parser)), branch_children
+            ));
+            if (advance_if(parser, context, "elif")) { branch_start = previous_span(parser); }
+            else { parsing_branches = false; }
+        }
+        if (advance_if(parser, context, "else")) {
+            SourceSpan else_start = previous_span(parser);
+            usize else_children = child_list(parser);
+            push_child(parser, else_children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+            push_child(parser, branches, insert_children_node(
+                parser, SyntaxKind.else_branch,
+                cover_spans(else_start, previous_span(parser)), else_children
+            ));
+        }
+        return insert_children_node(
+            parser, SyntaxKind.if_statement,
+            cover_spans(first, previous_span(parser)), branches
+        );
+    }
+    if (advance_if(parser, context, "while")) {
+        expect(parser, context, diagnostics, "(", "expected ( after while");
+        usize children = child_list(parser);
+        push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+        expect(parser, context, diagnostics, ")", "expected ) after condition");
+        push_child(parser, children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+        return insert_children_node(
+            parser, SyntaxKind.while_statement,
+            cover_spans(first, previous_span(parser)), children
+        );
+    }
+    if (advance_if(parser, context, "for")) {
+        expect(parser, context, diagnostics, "(", "expected ( after for");
+        usize children = child_list(parser);
+        if (advance_if(parser, context, ";")) {
+            push_child(parser, children, absent_node(parser));
+        } else {
+            push_child(parser, children, parse_declaration(parser, context, diagnostics, true));
+        }
+        if (token_is(parser, context, ";")) {
+            push_child(parser, children, absent_node(parser));
+        } else {
+            push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+        }
+        expect(parser, context, diagnostics, ";", "expected ; after for condition");
+        if (token_is(parser, context, ")")) {
+            push_child(parser, children, absent_node(parser));
+        } else {
+            SourceSpan update_start = current_span(parser);
+            bool update_comptime = advance_if(parser, context, "comptime");
+            usize update = child_list(parser);
+            push_child(parser, update, parse_expression(parser, context, diagnostics, u32(1)));
+            SyntaxKind update_kind = SyntaxKind.expression_statement;
+            if (advance_if(parser, context, "=")) {
+                update_kind = SyntaxKind.assignment_statement;
+                push_child(parser, update, parse_expression(parser, context, diagnostics, u32(1)));
+            }
+            SourceSpan update_span = cover_spans(update_start, previous_span(parser));
+            ArenaHandle(SyntaxNode) update_node = insert_children_node(parser, update_kind, update_span, update);
+            if (update_comptime) {
+                update_node = parser.file.insert(make_syntax_node(update_span,
+                    SyntaxData.comptime_statement(NodeLink.present(update_node))));
+            }
+            push_child(parser, children, update_node);
+        }
+        expect(parser, context, diagnostics, ")", "expected ) after for header");
+        push_child(parser, children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+        return insert_children_node(parser, SyntaxKind.for_statement,
+            cover_spans(first, previous_span(parser)), children);
+    }
+    if (advance_if(parser, context, "try")) {
+        usize children = child_list(parser);
+        push_child(parser, children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+        while (advance_if(parser, context, "catch")) {
+            SourceSpan catch_start = previous_span(parser);
+            usize catch_children = child_list(parser);
+            push_child(parser, catch_children, parse_type_syntax(parser, context, diagnostics));
+            SourceSpan name = byte_span(context, catch_start.source_id(), catch_start.end_offset(),
+                catch_start.end_offset());
+            if (current_is_identifier(parser) && token_is(parser, context, "{") == false) {
+                name = current_span(parser); parser.current = parser.current + usize(1);
+            }
+            push_child(parser, catch_children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+            push_child(parser, children, insert_text_children_node(
+                parser, SyntaxKind.catch_clause, cover_spans(catch_start, previous_span(parser)),
+                name, u32(0), catch_children
+            ));
+        }
+        if (parser.scratch.len() == children + usize(1)) {
+            record_error(parser, diagnostics, "parse.expected-token", current_span(parser), "expected catch after try");
+        }
+        return insert_children_node(
+            parser, SyntaxKind.try_statement,
+            cover_spans(first, previous_span(parser)), children
+        );
+    }
+    if (token_is(parser, context, "match")) {
+        return parse_match_construct(
+            parser, context, diagnostics, SyntaxKind.match_statement
+        );
+    }
+    SyntaxKind simple_kind = SyntaxKind.expression_statement;
+    bool simple = false;
+    if (advance_if(parser, context, "return")) { simple_kind = SyntaxKind.return_statement; simple = true; }
+    elif (advance_if(parser, context, "raise")) { simple_kind = SyntaxKind.raise_statement; simple = true; }
+    elif (advance_if(parser, context, "rethrow")) { simple_kind = SyntaxKind.rethrow_statement; simple = true; }
+    elif (advance_if(parser, context, "print")) { simple_kind = SyntaxKind.print_statement; simple = true; }
+    if (simple) {
+        usize children = child_list(parser);
+        if (simple_kind == SyntaxKind.print_statement) {
+            expect(parser, context, diagnostics, "(", "expected ( after print");
+            push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+            expect(parser, context, diagnostics, ")", "expected ) after print expression");
+        } elif (simple_kind == SyntaxKind.rethrow_statement) {
+            if (token_is(parser, context, ";") == false) {
+                record_error(parser, diagnostics, "parse.expected-token", current_span(parser), "expected ; after rethrow");
+                synchronize(parser, context, true);
+            }
+        } elif (simple_kind == SyntaxKind.raise_statement || token_is(parser, context, ";") == false) {
+            push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+        }
+        expect(parser, context, diagnostics, ";", "expected ; after statement");
+        return insert_children_node(
+            parser, simple_kind, cover_spans(first, previous_span(parser)), children
+        );
+    }
+    ArenaHandle(SyntaxNode) expression = parse_expression(
+        parser, context, diagnostics, u32(1)
+    );
+    usize children = child_list(parser);
+    push_child(parser, children, expression);
+    SyntaxKind kind = SyntaxKind.expression_statement;
+    if (advance_if(parser, context, "=")) {
+        kind = SyntaxKind.assignment_statement;
+        push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+    } else {
+        SyntaxKind expression_kind = node_kind(parser, expression);
+        if (expression_kind != SyntaxKind.call_expression
+            && expression_kind != SyntaxKind.invalid_expression) {
+            record_error(parser, diagnostics, "parse.expected-statement", node_span(parser, expression),
+                "expected assignment or function call");
+        }
+    }
+    expect(parser, context, diagnostics, ";", "expected ; after statement");
+    return insert_children_node(
+        parser, kind, cover_spans(first, previous_span(parser)), children
+    );
+}
+
+SyntaxKind node_kind(&in ParserState parser, ArenaHandle(SyntaxNode) handle)
+    raises ArenaHandleError {
+    &in SyntaxNode node = parser.file.node(handle);
+    return node.kind();
+}
+
+ArenaHandle(SyntaxNode) parse_block_inner(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics,
+    SyntaxKind kind
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    SourceSpan first = current_span(parser);
+    expect(parser, context, diagnostics, "{", "expected { before block");
+    usize children = child_list(parser);
+    while (at_end(parser) == false && token_is(parser, context, "}") == false) {
+        usize before = parser.current;
+        push_child(parser, children, parse_declaration(parser, context, diagnostics, true));
+        if (parser.current == before) { synchronize(parser, context, true); }
+    }
+    expect(parser, context, diagnostics, "}", "expected } after block");
+    return insert_children_node(
+        parser, kind, cover_spans(first, previous_span(parser)), children
+    );
+}
+
+bool token_at_is(
+    &in ParserState parser,
+    &in SourceMap context,
+    usize index,
+    str text
+) raises BoundsError, SourceMapError {
+    &in Token token = parser.file.token(index);
+    SourceSpan span = token.source_location();
+    return context.text_equals(span, text);
+}
+
+bool token_at_is_identifier(
+    &in ParserState parser, usize index
+) raises BoundsError {
+    &in Token token = parser.file.token(index);
+    return token.is_identifier();
+}
+
+bool parenthesized_type_is_followed_by_name(
+    &in ParserState parser, &in SourceMap context
+) raises BoundsError, SourceMapError {
+    usize index = parser.current;
+    usize depth = usize(0);
+    bool result = false;
+    bool scanning = true;
+    while (index < parser.file.token_count() && scanning) {
+        if (token_at_is(parser, context, index, "(")) {
+            depth = depth + usize(1);
+        } elif (token_at_is(parser, context, index, ")")) {
+            if (depth > usize(0)) { depth = depth - usize(1); }
+            if (depth == usize(0)) {
+                scanning = false;
+                usize following = index + usize(1);
+                if (following < parser.file.token_count()
+                    && token_at_is(parser, context, following, "[")) {
+                    following = following + usize(1);
+                    while (following < parser.file.token_count()
+                        && token_at_is(parser, context, following, "]") == false) {
+                        following = following + usize(1);
+                    }
+                    if (following < parser.file.token_count()) {
+                        following = following + usize(1);
+                    }
+                }
+                if (following < parser.file.token_count()) {
+                    result = token_at_is_identifier(parser, following);
+                }
+            }
+        }
+        index = index + usize(1);
+    }
+    return result;
+}
+
+bool dotted_header_is_call(
+    &in ParserState parser, &in SourceMap context
+) raises BoundsError, SourceMapError {
+    usize index = parser.current;
+    bool saw_dot = false;
+    bool scanning = true;
+    bool call = false;
+    while (index < parser.file.token_count() && scanning) {
+        if (token_at_is(parser, context, index, ".")) {
+            saw_dot = true;
+        } elif (token_at_is(parser, context, index, "(")) {
+            call = saw_dot;
+            scanning = false;
+        } elif (token_at_is_identifier(parser, index) == false) {
+            scanning = false;
+        }
+        index = index + usize(1);
+    }
+    return call;
+}
+
+bool parenthesized_header_looks_like_signature(
+    &in ParserState parser, &in SourceMap context
+) raises BoundsError, SourceMapError {
+    if (parser.current + usize(1) >= parser.file.token_count()) { return false; }
+    usize first = parser.current + usize(1);
+    if (token_at_is(parser, context, first, ")")) { return true; }
+    if (token_at_is(parser, context, first, "&")
+        || token_at_is(parser, context, first, "move")
+        || token_at_is(parser, context, first, "comptime")) { return true; }
+    if (token_at_is_identifier(parser, first)
+        && first + usize(1) < parser.file.token_count()
+        && token_at_is_identifier(parser, first + usize(1))) { return true; }
+    return false;
+}
+
+bool parenthesized_header_is_function(
+    &in ParserState parser, &in SourceMap context
+) raises BoundsError, SourceMapError {
+    usize index = parser.current;
+    usize depth = usize(0);
+    bool result = false;
+    bool scanning = true;
+    while (index < parser.file.token_count() && scanning) {
+        if (token_at_is(parser, context, index, "(")) {
+            depth = depth + usize(1);
+        } elif (token_at_is(parser, context, index, ")")) {
+            if (depth > usize(0)) { depth = depth - usize(1); }
+            if (depth == usize(0)) {
+                scanning = false;
+                if (index + usize(1) < parser.file.token_count()) {
+                    if (token_at_is(parser, context, index + usize(1), "{")
+                        || token_at_is(parser, context, index + usize(1), "raises")) {
+                        result = true;
+                    }
+                }
+            }
+        }
+        index = index + usize(1);
+    }
+    return result;
+}
+
+ArenaHandle(SyntaxNode) parse_type_syntax_inner(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    SourceSpan first = current_span(parser);
+    SyntaxKind wrapper = SyntaxKind.named_type;
+    SourceSpan prefix = first;
+    bool wrapped = false;
+    if (advance_if(parser, context, "&")) {
+        wrapper = SyntaxKind.borrow_type; wrapped = true;
+        if (token_is(parser, context, "in") || token_is(parser, context, "out")
+            || token_is(parser, context, "inout")) {
+            parser.current = parser.current + usize(1);
+        } else {
+            record_error(parser, diagnostics, "parse.invalid-type", current_span(parser), "expected borrow mode");
+        }
+    } elif (advance_if(parser, context, "?")) {
+        wrapper = SyntaxKind.nullable_pointer_type; wrapped = true;
+        expect(parser, context, diagnostics, "*", "expected * after ? in pointer type");
+        if (token_is(parser, context, "in") || token_is(parser, context, "inout")) {
+            parser.current = parser.current + usize(1);
+        } else {
+            record_error(parser, diagnostics, "parse.invalid-type", current_span(parser), "expected raw pointer mode");
+        }
+    } elif (advance_if(parser, context, "*")) {
+        wrapper = SyntaxKind.raw_pointer_type; wrapped = true;
+        if (token_is(parser, context, "in") || token_is(parser, context, "inout")) {
+            parser.current = parser.current + usize(1);
+        } else {
+            record_error(parser, diagnostics, "parse.invalid-type", current_span(parser), "expected raw pointer mode");
+        }
+    }
+    if (wrapped) { prefix = cover_spans(first, previous_span(parser)); }
+    SourceSpan name = current_span(parser);
+    if (current_is_identifier(parser)) {
+        parser.current = parser.current + usize(1);
+        while (advance_if(parser, context, ".")) {
+            if (current_is_identifier(parser)) {
+                name = cover_spans(name, current_span(parser));
+                parser.current = parser.current + usize(1);
+            } else {
+                record_error(parser, diagnostics, "parse.invalid-type", current_span(parser), "expected type name after .");
+            }
+        }
+    } else {
+        record_error(parser, diagnostics, "parse.invalid-type", name, "expected type name");
+        if (at_end(parser) == false && expression_boundary(parser, context) == false) {
+            parser.current = parser.current + usize(1);
+        } else {
+            name = source_span(name.source_id(), name.start_offset(), name.start_offset(),
+                name.line_number(), name.column_number());
+        }
+        return insert_node(parser, SyntaxKind.invalid_type, name, NodeDraft.none);
+    }
+    usize arguments = child_list(parser);
+    SyntaxKind base_kind = SyntaxKind.named_type;
+    if (advance_if(parser, context, "(")) {
+        base_kind = SyntaxKind.generic_type;
+        if (token_is(parser, context, ")") == false) {
+            bool more = true;
+            while (more) {
+                ArenaHandle(SyntaxNode) argument;
+                u8 argument_kind = current_token_kind(parser);
+                if (token_is(parser, context, "comptime")
+                    || token_is(parser, context, "move")) {
+                    argument = parse_parameter_syntax(parser, context, diagnostics);
+                } elif (token_is(parser, context, "&") || token_is(parser, context, "*")
+                    || token_is(parser, context, "?")
+                    || (argument_kind == u8(1)
+                        && (token_at_is(parser, context, parser.current + usize(1), ".")
+                            || token_at_is(parser, context, parser.current + usize(1), "(")
+                            || token_at_is(parser, context, parser.current + usize(1), "[")))) {
+                    argument = parse_type_syntax(parser, context, diagnostics);
+                } else {
+                    argument = parse_expression(parser, context, diagnostics, u32(1));
+                }
+                push_child(parser, arguments, argument);
+                if (advance_if(parser, context, ",") == false) { more = false; }
+            }
+        }
+        expect(parser, context, diagnostics, ")", "expected ) after type arguments");
+    }
+    ArenaHandle(SyntaxNode) result = insert_text_children_node(
+        parser, base_kind, cover_spans(name, previous_span(parser)), name,
+        u32(0), arguments
+    );
+    if (advance_if(parser, context, "[")) {
+        usize child = child_list(parser);
+        push_child(parser, child, result);
+        SyntaxKind suffix = SyntaxKind.slice_type;
+        if (token_is(parser, context, "]") == false) {
+            suffix = SyntaxKind.array_type;
+            push_child(parser, child, parse_expression(parser, context, diagnostics, u32(1)));
+        }
+        expect(parser, context, diagnostics, "]", "expected ] after type suffix");
+        result = insert_children_node(
+            parser, suffix, cover_spans(first, previous_span(parser)), child
+        );
+    }
+    if (wrapped) {
+        usize child = child_list(parser);
+        push_child(parser, child, result);
+        result = insert_text_children_node(
+            parser, wrapper, cover_spans(first, previous_span(parser)), prefix,
+            u32(0), child
+        );
+    }
+    return result;
+}
+
+ArenaHandle(SyntaxNode) parse_parameter_syntax(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    SourceSpan first = current_span(parser);
+    u32 flags = u32(0);
+    if (advance_if(parser, context, "comptime")) { flags = flags | u32(1); }
+    if (advance_if(parser, context, "move")) { flags = flags | u32(2); }
+    usize type_start = parser.current;
+    if (token_is(parser, context, "&")) {
+        SourceSpan borrow = current_span(parser);
+        parser.current = parser.current + usize(1);
+        if (token_is(parser, context, "in") || token_is(parser, context, "out")
+            || token_is(parser, context, "inout")) {
+            parser.current = parser.current + usize(1);
+        }
+        if (token_is(parser, context, "self")) {
+            SourceSpan self_name = current_span(parser);
+            parser.current = parser.current + usize(1);
+            usize self_children = child_list(parser);
+            push_child(parser, self_children, insert_node(
+                parser, SyntaxKind.borrow_type,
+                cover_spans(borrow, self_name), NodeDraft.text(cover_spans(borrow, self_name))
+            ));
+            return insert_text_children_node(
+                parser, SyntaxKind.parameter,
+                cover_spans(first, self_name), self_name, flags, self_children
+            );
+        }
+        parser.current = type_start;
+    }
+    if ((flags & u32(2)) != u32(0) && token_is(parser, context, "self")) {
+        SourceSpan self_name = current_span(parser);
+        parser.current = parser.current + usize(1);
+        usize self_children = child_list(parser);
+        return insert_text_children_node(
+            parser, SyntaxKind.parameter,
+            cover_spans(first, self_name), self_name, flags, self_children
+        );
+    }
+    ArenaHandle(SyntaxNode) type_node = parse_type_syntax(parser, context, diagnostics);
+    SourceSpan name = require_name(parser, context, diagnostics);
+    usize children = child_list(parser);
+    push_child(parser, children, type_node);
+    if (advance_if(parser, context, ":")) {
+        bool constraints = true;
+        while (constraints) {
+            push_child(parser, children, parse_type_syntax(parser, context, diagnostics));
+            if (advance_if(parser, context, "+") == false) { constraints = false; }
+        }
+    }
+    return insert_text_children_node(
+        parser, SyntaxKind.parameter, cover_spans(first, previous_span(parser)),
+        name, flags, children
+    );
+}
+
+void parse_parameter_list(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics,
+    usize children
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    expect(parser, context, diagnostics, "(", "expected ( before parameters");
+    if (token_is(parser, context, ")") == false) {
+        bool more = true;
+        while (more) {
+            push_child(parser, children, parse_parameter_syntax(parser, context, diagnostics));
+            if (advance_if(parser, context, ",") == false) { more = false; }
+        }
+    }
+    expect(parser, context, diagnostics, ")", "expected ) after parameters");
+}
+
+ArenaHandle(SyntaxNode) parse_union_body(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    SourceSpan first = current_span(parser);
+    expect(parser, context, diagnostics, "{", "expected { before union variants");
+    usize children = child_list(parser);
+    while (at_end(parser) == false && token_is(parser, context, "}") == false) {
+        bool variant = false;
+        if (current_is_identifier(parser)
+            && parser.current + usize(1) < parser.file.token_count()) {
+            variant = token_at_is(parser, context, parser.current + usize(1), ";")
+                || token_at_is(parser, context, parser.current + usize(1), "(");
+        }
+        if (variant) {
+            SourceSpan name = current_span(parser);
+            parser.current = parser.current + usize(1);
+            usize payload = child_list(parser);
+            if (token_is(parser, context, "(")) {
+                parse_parameter_list(parser, context, diagnostics, payload);
+            }
+            expect(parser, context, diagnostics, ";", "expected ; after union variant");
+            push_child(parser, children, insert_text_children_node(
+                parser, SyntaxKind.union_variant,
+                cover_spans(name, previous_span(parser)), name, u32(0), payload
+            ));
+        } else {
+            push_child(parser, children, parse_declaration(parser, context, diagnostics, true));
+        }
+    }
+    expect(parser, context, diagnostics, "}", "expected } after union declaration");
+    return insert_children_node(
+        parser, SyntaxKind.block_statement,
+        cover_spans(first, previous_span(parser)), children
+    );
+}
+
+ArenaHandle(SyntaxNode) parse_view_body(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    SourceSpan first = current_span(parser);
+    expect(parser, context, diagnostics, "{", "expected { before view fields");
+    usize fields = child_list(parser);
+    while (at_end(parser) == false && token_is(parser, context, "}") == false) {
+        SourceSpan field_start = current_span(parser);
+        SourceSpan mode = field_start;
+        if (token_is(parser, context, "in") || token_is(parser, context, "out")
+            || token_is(parser, context, "inout")) {
+            parser.current = parser.current + usize(1);
+        } else {
+            record_error(parser, diagnostics, "parse.expected-token", mode, "expected view field mode");
+        }
+        ArenaHandle(SyntaxNode) field_type = parse_type_syntax(
+            parser, context, diagnostics
+        );
+        SourceSpan name = current_span(parser);
+        if (current_is_identifier(parser)) { parser.current = parser.current + usize(1); }
+        else { record_error(parser, diagnostics, "parse.expected-token", name, "expected view field name"); }
+        expect(parser, context, diagnostics, ";", "expected ; after view field");
+        usize children = child_list(parser);
+        push_child(parser, children, field_type);
+        push_child(parser, fields, insert_metadata_children_node(
+            parser, SyntaxKind.view_field,
+            cover_spans(field_start, previous_span(parser)), name, u32(0), mode, children
+        ));
+    }
+    expect(parser, context, diagnostics, "}", "expected } after view fields");
+    return insert_children_node(
+        parser, SyntaxKind.block_statement,
+        cover_spans(first, previous_span(parser)), fields
+    );
+}
+
+ArenaHandle(SyntaxNode) parse_declaration_inner(
+    &inout ParserState parser,
+    &in SourceMap context,
+    &inout DiagnosticBag diagnostics,
+    bool in_block
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    usize declaration_start = parser.current;
+    SourceSpan first = current_span(parser);
+    if (current_is_invalid(parser)) {
+        SourceSpan span = current_span(parser);
+        record_error(parser, diagnostics, "lex.invalid-token", span, "invalid token");
+        parser.current = parser.current + usize(1);
+        return insert_node(parser, SyntaxKind.invalid_declaration, span, NodeDraft.none);
+    }
+    u32 flags = u32(0);
+    u32 modifier_order = u32(0);
+    SourceSpan abi = byte_span(context, first.source_id(), first.start_offset(), first.start_offset());
+    bool modifiers = true;
+    while (modifiers) {
+        if (advance_if(parser, context, "pub")) {
+            if (modifier_order >= u32(1)) {
+                record_error(parser, diagnostics, "parse.invalid-modifier", previous_span(parser), "duplicate or misplaced pub");
+            }
+            modifier_order = u32(1);
+            flags = flags | u32(1);
+        }
+        elif (advance_if(parser, context, "comptime")) {
+            if (modifier_order >= u32(3)) {
+                record_error(parser, diagnostics, "parse.invalid-modifier", previous_span(parser), "duplicate or misplaced comptime");
+            }
+            modifier_order = u32(3); flags = flags | u32(2);
+        }
+        elif (advance_if(parser, context, "const")) {
+            if (modifier_order >= u32(2)) {
+                record_error(parser, diagnostics, "parse.invalid-modifier", previous_span(parser), "duplicate or misplaced const");
+            }
+            modifier_order = u32(2); flags = flags | u32(4);
+        }
+        elif (advance_if(parser, context, "unsafe")) {
+            if (modifier_order >= u32(4)) {
+                record_error(parser, diagnostics, "parse.invalid-modifier", previous_span(parser), "duplicate or misplaced unsafe");
+            }
+            modifier_order = u32(4);
+            if (token_is(parser, context, "{")) {
+                if (flags != u32(0)) {
+                    record_error(parser, diagnostics, "parse.invalid-modifier", first, "unsafe blocks cannot have modifiers");
+                }
+                parser.current = parser.current - usize(1);
+                return parse_modified_statement(parser, context, diagnostics, first, flags);
+            }
+            flags = flags | u32(8);
+        }
+        elif (advance_if(parser, context, "extern")) {
+            if (modifier_order >= u32(5)) {
+                record_error(parser, diagnostics, "parse.invalid-modifier", previous_span(parser), "duplicate extern");
+            }
+            modifier_order = u32(5);
+            flags = flags | u32(16);
+            if (current_token_kind(parser) == u8(4)) {
+                abi = current_span(parser);
+                parser.current = parser.current + usize(1);
+            }
+        }
+        else { modifiers = false; }
+    }
+    usize content_start = parser.current;
+    if ((flags & u32(4)) != u32(0) && (flags & u32(26)) != u32(0)) {
+        record_error(parser, diagnostics, "parse.invalid-modifier", first, "invalid const modifier combination");
+    }
+    SyntaxKind kind = SyntaxKind.variable_declaration;
+    if (advance_if(parser, context, "module")) {
+        if (flags != u32(0)) { record_error(parser, diagnostics, "parse.invalid-modifier", first, "module cannot have modifiers"); }
+        SourceSpan name = parse_path(parser, context, diagnostics);
+        expect(parser, context, diagnostics, ";", "expected ; after module declaration");
+        return insert_node(parser, SyntaxKind.module_declaration,
+            cover_spans(first, previous_span(parser)), NodeDraft.text(name));
+    }
+    if (advance_if(parser, context, "import")) {
+        if (flags != u32(0)) { record_error(parser, diagnostics, "parse.invalid-modifier", first, "import cannot have modifiers"); }
+        SourceSpan path = require_name(parser, context, diagnostics);
+        SourceSpan alias = byte_span(context, first.source_id(), path.end_offset(), path.end_offset());
+        usize symbols = child_list(parser);
+        bool selective = false;
+        while (advance_if(parser, context, ".")) {
+            if (advance_if(parser, context, "{")) {
+                selective = true;
+                bool more = token_is(parser, context, "}") == false;
+                while (more && at_end(parser) == false) {
+                    SourceSpan name = require_name(parser, context, diagnostics);
+                    push_child(parser, symbols, insert_node(parser, SyntaxKind.import_symbol,
+                        name, NodeDraft.text(name)));
+                    more = advance_if(parser, context, ",");
+                }
+                expect(parser, context, diagnostics, "}", "expected } after selective imports");
+            } else {
+                SourceSpan name = require_name(parser, context, diagnostics);
+                path = cover_spans(path, name);
+            }
+        }
+        if (advance_if(parser, context, "as")) {
+            if (selective) {
+                record_error(parser, diagnostics, "parse.expected-token", previous_span(parser),
+                    "selective imports cannot have an alias");
+            }
+            alias = require_name(parser, context, diagnostics);
+        }
+        expect(parser, context, diagnostics, ";", "expected ; after import");
+        ChildRange range = finish_list(parser, symbols);
+        return parser.file.insert(make_syntax_node(
+            cover_spans(first, previous_span(parser)),
+            SyntaxData.import_declaration(path, alias, range)
+        ));
+    }
+    bool aggregate = false;
+    if (advance_if(parser, context, "struct")) {
+        kind = SyntaxKind.struct_declaration; aggregate = true;
+    } elif (advance_if(parser, context, "union")) {
+        kind = SyntaxKind.union_declaration; aggregate = true;
+    } elif (advance_if(parser, context, "interface")) {
+        kind = SyntaxKind.interface_declaration; aggregate = true;
+    } elif (advance_if(parser, context, "view")) {
+        kind = SyntaxKind.view_declaration; aggregate = true;
+    }
+    if (aggregate) {
+        u32 allowed = u32(1);
+        if (kind == SyntaxKind.struct_declaration) { allowed = u32(3); }
+        if ((flags & ~allowed) != u32(0)) {
+            record_error(parser, diagnostics, "parse.invalid-modifier", first, "invalid declaration modifiers");
+        }
+        SourceSpan name = require_name(parser, context, diagnostics);
+        usize children = child_list(parser);
+        if (token_is(parser, context, "(")) {
+            parse_parameter_list(parser, context, diagnostics, children);
+        }
+        if (kind == SyntaxKind.union_declaration) {
+            push_child(parser, children, parse_union_body(parser, context, diagnostics));
+        } elif (kind == SyntaxKind.view_declaration) {
+            push_child(parser, children, parse_view_body(parser, context, diagnostics));
+        } else {
+            push_child(parser, children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+        }
+        advance_if(parser, context, ";");
+        return insert_metadata_children_node(
+            parser, kind, cover_spans(first, previous_span(parser)), name,
+            flags, abi, children
+        );
+    }
+    if (token_is(parser, context, "if") || token_is(parser, context, "while")
+        || token_is(parser, context, "for") || token_is(parser, context, "try")
+        || token_is(parser, context, "match") || token_is(parser, context, "return")
+        || token_is(parser, context, "raise") || token_is(parser, context, "rethrow")
+        || token_is(parser, context, "print") || token_is(parser, context, "unsafe")
+        || token_is(parser, context, "{")) {
+        return parse_modified_statement(parser, context, diagnostics, first, flags);
+    }
+    if (advance_if(parser, context, "use")) {
+        SourceSpan name = current_span(parser);
+        if (current_is_identifier(parser)) { parser.current = parser.current + usize(1); }
+        else { record_error(parser, diagnostics, "parse.expected-token", name, "expected method name after use"); }
+        expect(parser, context, diagnostics, ";", "expected ; after use declaration");
+        return insert_node(
+            parser, SyntaxKind.implementation_use,
+            cover_spans(first, previous_span(parser)), NodeDraft.text(name)
+        );
+    }
+    if ((flags & u32(2)) != u32(0) && advance_if(parser, context, "type")) {
+        SourceSpan name = current_span(parser);
+        if (current_is_identifier(parser)) { parser.current = parser.current + usize(1); }
+        else { record_error(parser, diagnostics, "parse.expected-token", name, "expected type binding name"); }
+        expect(parser, context, diagnostics, "=", "expected = in computed type declaration");
+        usize children = child_list(parser);
+        push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+        expect(parser, context, diagnostics, ";", "expected ; after computed type declaration");
+        return insert_metadata_children_node(
+            parser, SyntaxKind.comptime_type_declaration,
+            cover_spans(first, previous_span(parser)), name, flags, abi, children
+        );
+    }
+    if ((flags & u32(16)) != u32(0) && advance_if(parser, context, "type")) {
+        SourceSpan name = current_span(parser);
+        if (current_is_identifier(parser)) { parser.current = parser.current + usize(1); }
+        else { record_error(parser, diagnostics, "parse.expected-token", name, "expected extern type name"); }
+        expect(parser, context, diagnostics, ";", "expected ; after extern type declaration");
+        usize children = child_list(parser);
+        return insert_metadata_children_node(
+            parser, SyntaxKind.extern_type_declaration,
+            cover_spans(first, previous_span(parser)), name, flags, abi, children
+        );
+    }
+    if (token_is(parser, context, "init") || token_is(parser, context, "deinit")) {
+        SourceSpan name = current_span(parser);
+        parser.current = parser.current + usize(1);
+        usize children = child_list(parser);
+        parse_parameter_list(parser, context, diagnostics, children);
+        if (advance_if(parser, context, "raises")) {
+            if (token_is(parser, context, "{")) { flags = flags | u32(128); }
+            else {
+                bool more_raises = true;
+                while (more_raises) {
+                    push_child(parser, children, parse_type_syntax(parser, context, diagnostics));
+                    if (advance_if(parser, context, ",") == false) { more_raises = false; }
+                }
+            }
+        }
+        if (advance_if(parser, context, ";") == false) {
+            push_child(parser, children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+        }
+        return insert_metadata_children_node(
+            parser, SyntaxKind.function_declaration,
+            cover_spans(first, previous_span(parser)), name, flags, abi, children
+        );
+    }
+    if ((flags == u32(0) || flags == u32(2))
+        && current_is_identifier(parser)
+        && parser.current + usize(1) < parser.file.token_count()
+        && token_at_is(parser, context, parser.current + usize(1), "(")
+        && parenthesized_type_is_followed_by_name(parser, context) == false) {
+        parser.current = content_start;
+        return parse_modified_statement(parser, context, diagnostics, first, flags);
+    }
+    if ((flags == u32(0) || flags == u32(2))
+        && dotted_header_is_call(parser, context)) {
+        parser.current = content_start;
+        return parse_modified_statement(parser, context, diagnostics, first, flags);
+    }
+    if ((flags == u32(0) || flags == u32(2)) && token_is(parser, context, "*")
+        && token_at_is(parser, context, parser.current + usize(1), "in") == false
+        && token_at_is(parser, context, parser.current + usize(1), "inout") == false) {
+        return parse_modified_statement(parser, context, diagnostics, first, flags);
+    }
+    ArenaHandle(SyntaxNode) declared_type = parse_type_syntax(
+        parser, context, diagnostics
+    );
+    if (advance_if(parser, context, "implements")) {
+        if (flags != u32(0)) { record_error(parser, diagnostics, "parse.invalid-modifier", first, "implementation cannot have modifiers"); }
+        usize children = child_list(parser);
+        ArenaHandle(SyntaxNode) implementation_type = declared_type;
+        push_child(parser, children, implementation_type);
+        push_child(parser, children, parse_type_syntax(parser, context, diagnostics));
+        push_child(parser, children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+        return insert_children_node(
+            parser, SyntaxKind.implementation_declaration,
+            cover_spans(first, previous_span(parser)), children
+        );
+    }
+    SourceSpan name = current_span(parser);
+    if (current_is_identifier(parser) && is_keyword(parser, context) == false) {
+        parser.current = parser.current + usize(1);
+    } else {
+        if (current_is_identifier(parser) && is_keyword(parser, context)) {
+            record_error(parser, diagnostics, "parse.expected-token", name, "expected declaration name");
+        }
+        if (flags == u32(0) || flags == u32(2)) {
+            parser.current = content_start;
+            return parse_modified_statement(parser, context, diagnostics, first, flags);
+        } else {
+            record_error(parser, diagnostics, "parse.expected-token", name, "expected declaration name");
+            synchronize(parser, context, in_block);
+            return insert_node(
+                parser, SyntaxKind.invalid_declaration,
+                cover_spans(first, previous_span(parser)), NodeDraft.none
+            );
+        }
+    }
+    usize children = child_list(parser);
+    push_child(parser, children, declared_type);
+    if (token_is(parser, context, "(") && (
+        (flags & u32(16)) != u32(0)
+        || parenthesized_header_is_function(parser, context)
+        || parenthesized_header_looks_like_signature(parser, context)
+    )) {
+        parse_parameter_list(parser, context, diagnostics, children);
+        if (advance_if(parser, context, "raises")) {
+            if (advance_if(parser, context, "{")) {
+                flags = flags | u32(128);
+                parser.current = parser.current - usize(1);
+            } else {
+                bool more_raises = true;
+                while (more_raises) {
+                    push_child(parser, children, parse_type_syntax(parser, context, diagnostics));
+                    if (advance_if(parser, context, ",") == false) { more_raises = false; }
+                }
+            }
+        }
+        if (token_is(parser, context, "{")) {
+            push_child(parser, children, parse_block(parser, context, diagnostics, SyntaxKind.block_statement));
+        } else {
+            expect(parser, context, diagnostics, ";", "expected function body or ;");
+        }
+        return insert_metadata_children_node(
+            parser, SyntaxKind.function_declaration,
+            cover_spans(first, previous_span(parser)), name, flags, abi, children
+        );
+    }
+    if (advance_if(parser, context, "(")) {
+        flags = flags | u32(32);
+        if (token_is(parser, context, ")") == false) {
+            bool arguments = true;
+            while (arguments) {
+                push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+                if (advance_if(parser, context, ",") == false) { arguments = false; }
+            }
+        }
+        expect(parser, context, diagnostics, ")", "expected ) after constructor arguments");
+    } elif (advance_if(parser, context, "=")) {
+        if (advance_if(parser, context, "comptime")) { flags = flags | u32(64); }
+        elif ((flags & u32(4)) != u32(0)) {
+            record_error(parser, diagnostics, "parse.expected-token", current_span(parser), "expected comptime initializer");
+        }
+        push_child(parser, children, parse_expression(parser, context, diagnostics, u32(1)));
+    }
+    expect(parser, context, diagnostics, ";", "expected ; after variable declaration");
+    if ((flags & u32(4)) != u32(0)) {
+        kind = SyntaxKind.constant_declaration;
+        if (parser.scratch.len() == children + usize(1)) {
+            record_error(parser, diagnostics, "parse.expected-expression", current_span(parser),
+                "constant requires an initializer");
+            SourceSpan end = previous_span(parser);
+            push_child(parser, children, insert_node(parser, SyntaxKind.invalid_expression,
+                source_span(first.source_id(), end.start_offset(), end.start_offset(),
+                    end.line_number(), end.column_number()), NodeDraft.none));
+        }
+    }
+    return insert_metadata_children_node(
+        parser, kind, cover_spans(first, previous_span(parser)), name, flags, abi, children
+    );
+}
+
+ArenaHandle(SyntaxNode) parse_modified_statement(
+    &inout ParserState parser, &in SourceMap context,
+    &inout DiagnosticBag diagnostics, SourceSpan first, u32 flags
+) raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError, ArenaHandleError {
+    if ((flags & u32(25)) != u32(0)) {
+        record_error(parser, diagnostics, "parse.invalid-modifier", first, "invalid statement modifiers");
+    }
+    ArenaHandle(SyntaxNode) statement = parse_statement(parser, context, diagnostics);
+    if ((flags & u32(2)) != u32(0)) {
+        SourceSpan span = cover_spans(first, node_span(parser, statement));
+        return parser.file.insert(make_syntax_node(span,
+            SyntaxData.comptime_statement(NodeLink.present(statement))));
+    }
+    return statement;
+}
+
+pub ParsedFile build_recovering_with_options(
+    &in SourceMap context,
+    SourceId source,
+    move Vector(Token, SystemAllocator) tokens,
+    &inout DiagnosticBag diagnostics, ParserOptions options
+) raises CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    if (context.contains(source) == false || tokens.is_empty()) { raise SourceMapError { }; }
+    usize token_index = usize(0);
+    usize previous_end = usize(0);
+    while (token_index < tokens.len()) {
+        &in Token token = tokens.get(token_index);
+        SourceSpan span = token.source_location();
+        SourceId token_source = span.source_id();
+        if (token_source.equals(source) == false
+            || span.start_offset() < previous_end
+            || span.start_offset() > span.end_offset()
+            || span.end_offset() > context.source_len(source)) { raise SourceMapError { }; }
+        if (token.is_eof() != (token_index + usize(1) == tokens.len())) { raise SourceMapError { }; }
+        if (token.is_eof() && span.start_offset() != context.source_len(source)) { raise SourceMapError { }; }
+        previous_end = span.end_offset();
+        token_index = token_index + usize(1);
+    }
+    ParserState parser(source, tokens);
+    parser.maximum_nesting = options.maximum_nesting();
+    token_index = usize(0);
+    while (token_index < parser.file.token_count()) {
+        bool invalid = token_at_invalid(parser, token_index);
+        if (invalid) {
+            SourceSpan span = token_span_at(parser, token_index);
+            record_error(parser, diagnostics, "lex.invalid-token", span, "invalid token");
+        }
+        token_index = token_index + usize(1);
+    }
+    while (at_end(parser) == false) {
+        usize before = parser.current;
+        ArenaHandle(SyntaxNode) root = parse_declaration(
+            parser, context, diagnostics, false
+        );
+        parser.file.append_root(root);
+        if (parser.current == before) { synchronize(parser, context, false); }
+    }
+    parser.file.set_errors(parser.had_errors);
+    parser.file.set_scratch_statistics(parser.scratch_peak, parser.scratch.capacity());
+    ParsedFile result(parser.file);
+    return result;
+}
+
+pub ParsedFile build_strict(
+    &in SourceMap context,
+    SourceId source,
+    move Vector(Token, SystemAllocator) tokens,
+    &inout DiagnosticBag diagnostics
+) raises ParseFailed, CapacityError, LayoutError, AllocationError, BoundsError,
+         SourceMapError, ArenaHandleError {
+    ParsedFile file = build_recovering(context, source, tokens, diagnostics);
+    if (file.has_errors()) { raise ParseFailed { }; }
+    return file;
+}
+
+bool token_at_invalid(&in ParserState parser, usize index) raises BoundsError {
+    &in Token token = parser.file.token(index);
+    return token.is_invalid();
+}
+SourceSpan token_span_at(&in ParserState parser, usize index) raises BoundsError {
+    &in Token token = parser.file.token(index);
+    return token.source_location();
+}
+
+SourceSpan byte_span(&in SourceMap context, SourceId source, usize start, usize end)
+    raises SourceMapError {
+    usize line = context.line_for_offset(source, start);
+    return source_span(source, start, end, line,
+        start - context.line_start(source, line) + usize(1));
+}
+
+ArenaHandle(SyntaxNode) parse_formatted_string(
+    &inout ParserState parser, &in SourceMap context,
+    &inout DiagnosticBag diagnostics, SourceSpan span
+) raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError, ArenaHandleError {
+    SourceId source = span.source_id();
+    usize parts = child_list(parser);
+    usize index = span.start_offset() + usize(2);
+    usize end = span.end_offset() - usize(1);
+    usize text_start = index;
+    while (index < end) {
+        u8 byte = context.byte_at(source, index);
+        if (byte == u8(92)) {
+            if (index + usize(1) >= end) {
+                record_error(parser, diagnostics, "parse.invalid-escape",
+                    byte_span(context, source, index, end), "unterminated escape");
+                index = end;
+            } else {
+                u8 escaped = context.byte_at(source, index + usize(1));
+                if (escaped != u8(34) && escaped != u8(92) && escaped != u8(110)
+                    && escaped != u8(114) && escaped != u8(116) && escaped != u8(48)) {
+                    record_error(parser, diagnostics, "parse.invalid-escape",
+                        byte_span(context, source, index, index + usize(2)), "invalid escape");
+                }
+                index = index + usize(2);
+            }
+        } elif ((byte == u8(123) || byte == u8(125)) && index + usize(1) < end
+            && context.byte_at(source, index + usize(1)) == byte) {
+            index = index + usize(2);
+        } elif (byte == u8(123)) {
+            if (text_start < index) {
+                SourceSpan text = byte_span(context, source, text_start, index);
+                push_child(parser, parts, insert_node(parser, SyntaxKind.formatted_text, text, NodeDraft.text(text)));
+            }
+            usize expression_start = index + usize(1);
+            usize braces = usize(0);
+            bool quoted = false;
+            index = expression_start;
+            bool scanning = true;
+            while (index < end && scanning) {
+                u8 current = context.byte_at(source, index);
+                if (quoted) {
+                    if (current == u8(92) && index + usize(1) < end) { index = index + usize(1); }
+                    elif (current == u8(34)) { quoted = false; }
+                } elif (current == u8(34)) { quoted = true; }
+                elif (current == u8(123)) { braces = braces + usize(1); }
+                elif (current == u8(125)) {
+                    if (braces == usize(0)) { scanning = false; }
+                    else { braces = braces - usize(1); }
+                }
+                if (scanning) { index = index + usize(1); }
+            }
+            if (scanning) {
+                record_error(parser, diagnostics, "parse.expected-token",
+                    byte_span(context, source, expression_start, end), "unterminated formatted expression");
+            }
+            Vector(Token, SystemAllocator) embedded = lex_range(context, source, expression_start, index);
+            usize resume = parser.current;
+            parser.current = parser.file.append_tokens(embedded);
+            push_child(parser, parts, parse_expression(parser, context, diagnostics, u32(1)));
+            if (at_end(parser) == false) {
+                record_error(parser, diagnostics, "parse.expected-token", current_span(parser),
+                    "expected end of formatted expression");
+            }
+            parser.current = resume;
+            if (index < end) { index = index + usize(1); }
+            text_start = index;
+        } else {
+            if (byte == u8(125)) {
+                record_error(parser, diagnostics, "parse.expected-token",
+                    byte_span(context, source, index, index + usize(1)), "unmatched } in formatted string");
+            }
+            index = index + usize(1);
+        }
+    }
+    if (text_start < end) {
+        SourceSpan text = byte_span(context, source, text_start, end);
+        push_child(parser, parts, insert_node(parser, SyntaxKind.formatted_text, text, NodeDraft.text(text)));
+    }
+    return insert_children_node(parser, SyntaxKind.formatted_string, span, parts);
+}
+
+ArenaHandle(SyntaxNode) parse_expression(
+    &inout ParserState parser, &in SourceMap context,
+    &inout DiagnosticBag diagnostics, u32 minimum
+) raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError, ArenaHandleError {
+    if (parser.nesting >= parser.maximum_nesting) {
+        SourceSpan span = current_span(parser);
+        record_error(parser, diagnostics, "parse.nesting-limit", span, "parser nesting limit exceeded");
+        while (at_end(parser) == false) { parser.current = parser.current + usize(1); }
+        return insert_node(parser, SyntaxKind.invalid_expression, span, NodeDraft.none);
+    }
+    parser.nesting = parser.nesting + usize(1);
+    ArenaHandle(SyntaxNode) result = parse_expression_inner(parser, context, diagnostics, minimum);
+    parser.nesting = parser.nesting - usize(1);
+    return result;
+}
+
+ArenaHandle(SyntaxNode) parse_type_syntax(
+    &inout ParserState parser, &in SourceMap context,
+    &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError, ArenaHandleError {
+    if (parser.nesting >= parser.maximum_nesting) {
+        SourceSpan span = current_span(parser);
+        record_error(parser, diagnostics, "parse.nesting-limit", span, "parser nesting limit exceeded");
+        while (at_end(parser) == false) { parser.current = parser.current + usize(1); }
+        return insert_node(parser, SyntaxKind.invalid_type, span, NodeDraft.none);
+    }
+    parser.nesting = parser.nesting + usize(1);
+    ArenaHandle(SyntaxNode) result = parse_type_syntax_inner(parser, context, diagnostics);
+    parser.nesting = parser.nesting - usize(1);
+    return result;
+}
+
+ArenaHandle(SyntaxNode) parse_declaration(
+    &inout ParserState parser, &in SourceMap context,
+    &inout DiagnosticBag diagnostics, bool in_block
+) raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError, ArenaHandleError {
+    if (parser.nesting >= parser.maximum_nesting) {
+        SourceSpan span = current_span(parser);
+        record_error(parser, diagnostics, "parse.nesting-limit", span, "parser nesting limit exceeded");
+        while (at_end(parser) == false) { parser.current = parser.current + usize(1); }
+        return insert_node(parser, SyntaxKind.invalid_declaration, span, NodeDraft.none);
+    }
+    parser.nesting = parser.nesting + usize(1);
+    ArenaHandle(SyntaxNode) result = parse_declaration_inner(parser, context, diagnostics, in_block);
+    parser.nesting = parser.nesting - usize(1);
+    return result;
+}
+
+ArenaHandle(SyntaxNode) parse_block(
+    &inout ParserState parser, &in SourceMap context,
+    &inout DiagnosticBag diagnostics, SyntaxKind kind
+) raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError, ArenaHandleError {
+    if (parser.nesting >= parser.maximum_nesting) {
+        SourceSpan span = current_span(parser);
+        record_error(parser, diagnostics, "parse.nesting-limit", span, "parser nesting limit exceeded");
+        while (at_end(parser) == false) { parser.current = parser.current + usize(1); }
+        return insert_node(parser, SyntaxKind.invalid_statement, span, NodeDraft.none);
+    }
+    parser.nesting = parser.nesting + usize(1);
+    ArenaHandle(SyntaxNode) result = parse_block_inner(parser, context, diagnostics, kind);
+    parser.nesting = parser.nesting - usize(1);
+    return result;
+}
+
+bool is_keyword(&in ParserState parser, &in SourceMap context) raises BoundsError, SourceMapError {
+    return token_is(parser, context, "as")
+        || token_is(parser, context, "bool")
+        || token_is(parser, context, "catch")
+        || token_is(parser, context, "comptime")
+        || token_is(parser, context, "const")
+        || token_is(parser, context, "elif")
+        || token_is(parser, context, "else")
+        || token_is(parser, context, "extern")
+        || token_is(parser, context, "false")
+        || token_is(parser, context, "for")
+        || token_is(parser, context, "if")
+        || token_is(parser, context, "import")
+        || token_is(parser, context, "implements")
+        || token_is(parser, context, "interface")
+        || token_is(parser, context, "match")
+        || token_is(parser, context, "module")
+        || token_is(parser, context, "move")
+        || token_is(parser, context, "null")
+        || token_is(parser, context, "in")
+        || token_is(parser, context, "inout")
+        || token_is(parser, context, "out")
+        || token_is(parser, context, "print")
+        || token_is(parser, context, "pub")
+        || token_is(parser, context, "raise")
+        || token_is(parser, context, "raises")
+        || token_is(parser, context, "return")
+        || token_is(parser, context, "rethrow")
+        || token_is(parser, context, "struct")
+        || token_is(parser, context, "true")
+        || token_is(parser, context, "try")
+        || token_is(parser, context, "unsafe")
+        || token_is(parser, context, "union")
+        || token_is(parser, context, "view")
+        || token_is(parser, context, "while");
+}
+
+SourceSpan require_name(&inout ParserState parser, &in SourceMap context,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError {
+    SourceSpan span = current_span(parser);
+    if (current_is_identifier(parser) && is_keyword(parser, context) == false) {
+        parser.current = parser.current + usize(1);
+    } else {
+        record_error(parser, diagnostics, "parse.expected-token", span, "expected identifier");
+        if (at_end(parser) == false && expression_boundary(parser, context) == false) {
+            parser.current = parser.current + usize(1);
+        } else {
+            span = source_span(span.source_id(), span.start_offset(), span.start_offset(),
+                span.line_number(), span.column_number());
+        }
+    }
+    return span;
+}
+
+SourceSpan parse_path(&inout ParserState parser, &in SourceMap context,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError {
+    SourceSpan path = require_name(parser, context, diagnostics);
+    while (advance_if(parser, context, ".")) {
+        SourceSpan name = require_name(parser, context, diagnostics);
+        path = cover_spans(path, name);
+    }
+    return path;
+}
+
+ArenaHandle(SyntaxNode) insert_metadata_children_node(
+    &inout ParserState parser, SyntaxKind kind, SourceSpan span, SourceSpan text,
+    u32 flags, SourceSpan extra, usize children
+) raises CapacityError, LayoutError, AllocationError, BoundsError, ArenaHandleError {
+    ChildRange range = finish_list(parser, children);
+    return insert_node(parser, kind, span, NodeDraft.metadata(text, extra, flags, range));
+}
+
+ArenaHandle(SyntaxNode) insert_operator_children_node(
+    &inout ParserState parser, SyntaxKind kind, SourceSpan span, SourceSpan text,
+    SyntaxOperator operation, usize children
+) raises CapacityError, LayoutError, AllocationError, BoundsError, ArenaHandleError {
+    ChildRange range = finish_list(parser, children);
+    return insert_node(parser, kind, span, NodeDraft.operator(text, operation, range));
+}
+
+pub ParsedFile build_recovering(
+    &in SourceMap context, SourceId source,
+    move Vector(Token, SystemAllocator) tokens, &inout DiagnosticBag diagnostics
+) raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError, ArenaHandleError {
+    ParserOptions options(usize(128));
+    return build_recovering_with_options(context, source, tokens, diagnostics, options);
+}

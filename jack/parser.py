@@ -358,10 +358,14 @@ class Lexer:
         self._advance()
 
         chars: list[str] = []
+        expression_depth = 0
+        quoted_expression = False
         while not self._is_at_end():
             char = self._advance()
             if char == '"':
-                return self._make_token('FSTRING', ''.join(chars), line, column, start)
+                if expression_depth == 0:
+                    return self._make_token('FSTRING', ''.join(chars), line, column, start)
+                quoted_expression = not quoted_expression
             if char == '\n':
                 raise ParseError(f'Unterminated formatted string literal at {line}:{column}.', self._span_from(line, column, start))
             if char == '\\':
@@ -371,6 +375,14 @@ class Lexer:
                 chars.append(self._advance())
             else:
                 chars.append(char)
+                if not quoted_expression:
+                    if char == '{':
+                        if expression_depth == 0 and not self._is_at_end() and self._peek() == '{':
+                            chars.append(self._advance())
+                        else:
+                            expression_depth += 1
+                    elif char == '}' and expression_depth:
+                        expression_depth -= 1
 
         raise ParseError(f'Unterminated formatted string literal at {line}:{column}.', self._span_from(line, column, start))
 

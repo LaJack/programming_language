@@ -14,6 +14,33 @@ from jack.semantic_pass import SemanticError, validate_runtime_ast
 
 
 class SumTypeTests(unittest.TestCase):
+    def test_nested_statement_matches_can_return_from_function(self):
+        source = '''
+            union Inner { absent; present(i32 value); }
+            union Outer { item(Inner inner); }
+            i32 extract(&in Outer outer) {
+                match (outer) {
+                    .item(inner) {
+                        match (inner) {
+                            .absent { return 0; }
+                            .present(value) { return value; }
+                        }
+                    }
+                }
+                return 0 - 1;
+            }
+            Inner inner = Inner.present(42);
+            Outer outer = Outer.item(inner);
+            print(extract(outer));
+        '''
+        program = self.hir(source)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            Interpreter().eval_hir_program(program)
+        self.assertIn('42', output.getvalue())
+        self.assertIn('switch', emit_hir_llvm(program))
+        self.assertIn('switch', emit_hir_c(program))
+
     def runtime_ast(self, source: str):
         return apply_compile_time_pass(parse(source))
 

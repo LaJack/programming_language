@@ -6,10 +6,20 @@ import std.string;
 
 pub struct SourceMapError { }
 
+usize next_source_map_identity = usize(1);
+
+pub SourceMap source_map()
+    raises CapacityError, LayoutError, AllocationError, SourceMapError {
+    SourceMap result;
+    result.init();
+    return result;
+}
+
 pub struct SourceId {
+    usize owner;
     usize value;
 
-    bool equals(&in self, SourceId other) { return self.value == other.value; }
+    bool equals(&in self, SourceId other) { return self.owner == other.owner && self.value == other.value; }
 }
 
 pub struct SourceFile {
@@ -20,10 +30,17 @@ pub struct SourceFile {
 
 pub struct SourceMap {
     Vector(SourceFile, SystemAllocator) files;
+    usize identity;
 
     init(&inout self)
-        raises CapacityError, LayoutError, AllocationError
+        raises CapacityError, LayoutError, AllocationError, SourceMapError
     {
+        if (self.identity != usize(0)
+            || next_source_map_identity == usize(18446744073709551615)) {
+            raise SourceMapError { };
+        }
+        self.identity = next_source_map_identity;
+        next_source_map_identity = next_source_map_identity + usize(1);
         SystemAllocator allocator;
         Vector(SourceFile, SystemAllocator) files(allocator, usize(0));
         self.files = move files;
@@ -33,7 +50,8 @@ pub struct SourceMap {
         &inout self,
         str path,
         move String(SystemAllocator) text
-    ) raises CapacityError, LayoutError, AllocationError {
+    ) raises CapacityError, LayoutError, AllocationError, SourceMapError {
+        if (self.identity == usize(0)) { raise SourceMapError { }; }
         SystemAllocator path_allocator;
         String(SystemAllocator) owned_path(path_allocator, path);
         SystemAllocator line_allocator;
@@ -46,7 +64,7 @@ pub struct SourceMap {
             }
             index = index + usize(1);
         }
-        SourceId id = SourceId { value = self.files.len() };
+        SourceId id = SourceId { owner = self.identity, value = self.files.len() };
         self.files.push(SourceFile {
             path = move owned_path,
             text = move text,
@@ -56,8 +74,13 @@ pub struct SourceMap {
     }
 
     usize len(&in self) { return self.files.len(); }
+    usize identity_value(&in self) { return self.identity; }
+    bool contains(&in self, SourceId id) {
+        return self.identity != usize(0) && id.owner == self.identity && id.value < self.files.len();
+    }
 
     str path(&in self, SourceId id) raises SourceMapError {
+        if (self.contains(id) == false) { raise SourceMapError { }; }
         try {
             &in SourceFile file = self.files.get(id.value);
             return file.path.as_str();
@@ -67,6 +90,7 @@ pub struct SourceMap {
     }
 
     &in u8[] bytes(&in self, SourceId id) raises SourceMapError {
+        if (self.contains(id) == false) { raise SourceMapError { }; }
         try {
             &in SourceFile file = self.files.get(id.value);
             return file.text.bytes();
@@ -76,6 +100,7 @@ pub struct SourceMap {
     }
 
     usize line_count(&in self, SourceId id) raises SourceMapError {
+        if (self.contains(id) == false) { raise SourceMapError { }; }
         try {
             &in SourceFile file = self.files.get(id.value);
             return file.line_starts.len();
@@ -85,6 +110,7 @@ pub struct SourceMap {
     }
 
     usize source_len(&in self, SourceId id) raises SourceMapError {
+        if (self.contains(id) == false) { raise SourceMapError { }; }
         try {
             &in SourceFile file = self.files.get(id.value);
             return file.text.len();
@@ -94,6 +120,7 @@ pub struct SourceMap {
     }
 
     u8 byte_at(&in self, SourceId id, usize offset) raises SourceMapError {
+        if (self.contains(id) == false) { raise SourceMapError { }; }
         try {
             &in SourceFile file = self.files.get(id.value);
             if (offset >= file.text.len()) { raise SourceMapError { }; }
@@ -106,6 +133,7 @@ pub struct SourceMap {
     usize line_for_offset(&in self, SourceId id, usize offset)
         raises SourceMapError
     {
+        if (self.contains(id) == false) { raise SourceMapError { }; }
         try {
             &in SourceFile file = self.files.get(id.value);
             if (offset > file.text.len()) { raise SourceMapError { }; }
@@ -123,6 +151,7 @@ pub struct SourceMap {
 
     usize line_start(&in self, SourceId id, usize line) raises SourceMapError {
         if (line == usize(0)) { raise SourceMapError { }; }
+        if (self.contains(id) == false) { raise SourceMapError { }; }
         try {
             &in SourceFile file = self.files.get(id.value);
             return file.line_starts.get(line - usize(1));
@@ -133,6 +162,7 @@ pub struct SourceMap {
 
     usize line_end(&in self, SourceId id, usize line) raises SourceMapError {
         if (line == usize(0)) { raise SourceMapError { }; }
+        if (self.contains(id) == false) { raise SourceMapError { }; }
         try {
             &in SourceFile file = self.files.get(id.value);
             usize start = file.line_starts.get(line - usize(1));
@@ -151,6 +181,7 @@ pub struct SourceMap {
     }
 
     void validate(&in self, &in SourceSpan span) raises SourceMapError {
+        if (self.contains(span.source) == false) { raise SourceMapError { }; }
         try {
             &in SourceFile file = self.files.get(span.source.value);
             if (span.start > span.end || span.end > file.text.len()) {
@@ -179,6 +210,28 @@ pub struct SourceMap {
         } catch BoundsError {
             raise SourceMapError { };
         }
+    }
+
+    bool text_equals(&in self, &in SourceSpan span, str expected)
+        raises SourceMapError
+    {
+        return self.span_equals(span, expected);
+    }
+
+    bool span_equals(&in self, &in SourceSpan span, str expected)
+        raises SourceMapError
+    {
+        self.validate(span);
+        if (span.end - span.start != len(expected)) { return false; }
+        usize index = usize(0);
+        while (index < len(expected)) {
+            if (
+                self.byte_at(span.source, span.start + index)
+                != jack_str_byte(expected, index)
+            ) { return false; }
+            index = index + usize(1);
+        }
+        return true;
     }
 }
 
@@ -220,7 +273,7 @@ pub SourceSpan source_span(
 
 pub SourceSpan empty_source_span() {
     return SourceSpan {
-        source = SourceId { value = usize(0) };
+        source = SourceId { owner = usize(0), value = usize(0) };
         start = usize(0);
         end = usize(0);
         line = usize(1);

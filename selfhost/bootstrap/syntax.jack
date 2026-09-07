@@ -1,0 +1,2921 @@
+module bootstrap.syntax;
+
+import bootstrap.lexer;
+import bootstrap.source;
+import std.collections.arena;
+import std.collections.vector;
+import std.memory;
+
+pub union SyntaxKind {
+    invalid_declaration;
+    invalid_statement;
+    invalid_type;
+    invalid_pattern;
+    invalid_expression;
+    module_declaration;
+    import_declaration;
+    import_path;
+    import_symbol;
+    struct_declaration;
+    union_declaration;
+    interface_declaration;
+    implementation_declaration;
+    implementation_use;
+    view_declaration;
+    view_field;
+    extern_type_declaration;
+    function_declaration;
+    parameter;
+    field_declaration;
+    variable_declaration;
+    constant_declaration;
+    comptime_type_declaration;
+    union_variant;
+    block_statement;
+    unsafe_block;
+    comptime_statement;
+    expression_statement;
+    assignment_statement;
+    if_statement;
+    if_branch;
+    else_branch;
+    while_statement;
+    for_statement;
+    try_statement;
+    catch_clause;
+    return_statement;
+    raise_statement;
+    rethrow_statement;
+    print_statement;
+    match_statement;
+    match_expression;
+    match_arm;
+    variant_pattern;
+    wildcard_pattern;
+    binding_pattern;
+    named_type;
+    generic_type;
+    array_type;
+    slice_type;
+    borrow_type;
+    raw_pointer_type;
+    nullable_pointer_type;
+    type_argument;
+    name_expression;
+    integer_literal;
+    floating_literal;
+    string_literal;
+    formatted_string;
+    formatted_text;
+    boolean_literal;
+    null_literal;
+    unary_expression;
+    binary_expression;
+    borrow_expression;
+    move_expression;
+    dereference_expression;
+    call_expression;
+    member_expression;
+    index_expression;
+    slice_expression;
+    struct_literal;
+    struct_literal_field;
+    union_variant_expression;
+    parenthesized_expression;
+    absent;
+}
+
+pub union NodeLink {
+    absent;
+    present(ArenaHandle(SyntaxNode) node);
+}
+
+pub struct DeclarationModifiers {
+    SourceSpan abi;
+    SourceSpan abi_span(&in self) { return self.abi; }
+    bool is_public;
+    bool is_comptime;
+    bool is_constant;
+    bool is_unsafe;
+    bool is_extern;
+    bool is_consuming;
+    bool is_constructor;
+    bool is_comptime_initializer;
+    bool is_raises_inferred;
+    bool public_flag(&in self) { return self.is_public; }
+    bool comptime_flag(&in self) { return self.is_comptime; }
+    bool constant_flag(&in self) { return self.is_constant; }
+    bool unsafe_flag(&in self) { return self.is_unsafe; }
+    bool extern_flag(&in self) { return self.is_extern; }
+    bool consuming_flag(&in self) { return self.is_consuming; }
+    bool constructor_flag(&in self) { return self.is_constructor; }
+    bool comptime_initializer_flag(&in self) { return self.is_comptime_initializer; }
+    bool raises_inferred_flag(&in self) { return self.is_raises_inferred; }
+}
+
+pub DeclarationModifiers declaration_modifiers(u32 flags, bool parameter) {
+    return DeclarationModifiers {
+        abi = empty_source_span(),
+        is_public = parameter == false && (flags & u32(1)) != u32(0),
+        is_comptime = (parameter && (flags & u32(1)) != u32(0))
+            || (parameter == false && (flags & u32(2)) != u32(0)),
+        is_constant = parameter == false && (flags & u32(4)) != u32(0),
+        is_unsafe = (flags & u32(8)) != u32(0),
+        is_extern = (flags & u32(16)) != u32(0),
+        is_consuming = parameter && (flags & u32(2)) != u32(0),
+        is_constructor = (flags & u32(32)) != u32(0),
+        is_comptime_initializer = (flags & u32(64)) != u32(0),
+        is_raises_inferred = (flags & u32(128)) != u32(0),
+    };
+}
+
+pub struct ChildRange {
+    usize start;
+    usize length;
+    usize len(&in self) { return self.length; }
+    bool is_empty(&in self) { return self.length == usize(0); }
+}
+
+pub union SyntaxOperator {
+    invalid;
+    add;
+    subtract;
+    multiply;
+    divide;
+    remainder;
+    equal;
+    not_equal;
+    less;
+    less_equal;
+    greater;
+    greater_equal;
+    logical_and;
+    logical_or;
+    bit_and;
+    bit_or;
+    bit_xor;
+    bit_not;
+    shift_left;
+    shift_right;
+
+    str spelling(&in self) {
+        return match (&in self) {
+            .invalid => "",
+            .add => "+",
+            .subtract => "-",
+            .multiply => "*",
+            .divide => "/",
+            .remainder => "%",
+            .equal => "==",
+            .not_equal => "!=",
+            .less => "<",
+            .less_equal => "<=",
+            .greater => ">",
+            .greater_equal => ">=",
+            .logical_and => "&&",
+            .logical_or => "||",
+            .bit_and => "&",
+            .bit_or => "|",
+            .bit_xor => "^",
+            .bit_not => "~",
+            .shift_left => "<<",
+            .shift_right => ">>",
+        };
+    }
+}
+
+pub SyntaxOperator syntax_operator(&in SourceMap sources, SourceSpan span) raises SourceMapError {
+    if (sources.text_equals(span, "+")) { return SyntaxOperator.add; }
+    if (sources.text_equals(span, "-")) { return SyntaxOperator.subtract; }
+    if (sources.text_equals(span, "*")) { return SyntaxOperator.multiply; }
+    if (sources.text_equals(span, "/")) { return SyntaxOperator.divide; }
+    if (sources.text_equals(span, "%")) { return SyntaxOperator.remainder; }
+    if (sources.text_equals(span, "==")) { return SyntaxOperator.equal; }
+    if (sources.text_equals(span, "!=")) { return SyntaxOperator.not_equal; }
+    if (sources.text_equals(span, "<")) { return SyntaxOperator.less; }
+    if (sources.text_equals(span, "<=")) { return SyntaxOperator.less_equal; }
+    if (sources.text_equals(span, ">")) { return SyntaxOperator.greater; }
+    if (sources.text_equals(span, ">=")) { return SyntaxOperator.greater_equal; }
+    if (sources.text_equals(span, "&&")) { return SyntaxOperator.logical_and; }
+    if (sources.text_equals(span, "||")) { return SyntaxOperator.logical_or; }
+    if (sources.text_equals(span, "&")) { return SyntaxOperator.bit_and; }
+    if (sources.text_equals(span, "|")) { return SyntaxOperator.bit_or; }
+    if (sources.text_equals(span, "^")) { return SyntaxOperator.bit_xor; }
+    if (sources.text_equals(span, "~")) { return SyntaxOperator.bit_not; }
+    if (sources.text_equals(span, "<<")) { return SyntaxOperator.shift_left; }
+    if (sources.text_equals(span, ">>")) { return SyntaxOperator.shift_right; }
+    return SyntaxOperator.invalid;
+}
+
+pub union SyntaxData {
+    invalid_declaration;
+    invalid_statement;
+    invalid_type;
+    invalid_pattern;
+    invalid_expression;
+    module_declaration(SourceSpan path);
+    import_declaration(SourceSpan path, SourceSpan alias, ChildRange symbols);
+    import_path(SourceSpan name);
+    import_symbol(SourceSpan name);
+    struct_declaration(SourceSpan name, DeclarationModifiers modifiers, ChildRange parameters, NodeLink body);
+    union_declaration(SourceSpan name, DeclarationModifiers modifiers, ChildRange parameters, NodeLink body);
+    interface_declaration(SourceSpan name, DeclarationModifiers modifiers, NodeLink body);
+    implementation_declaration(NodeLink target, NodeLink interface_type, NodeLink body);
+    implementation_use(SourceSpan name);
+    view_declaration(SourceSpan name, DeclarationModifiers modifiers, NodeLink body);
+    view_field(SourceSpan name, SourceSpan mode, NodeLink declared_type);
+    extern_type_declaration(SourceSpan name, DeclarationModifiers modifiers);
+    function_declaration(SourceSpan name, DeclarationModifiers modifiers, NodeLink return_type, ChildRange parameters, ChildRange error_types, NodeLink body);
+    parameter(SourceSpan name, DeclarationModifiers modifiers, NodeLink declared_type, ChildRange constraints);
+    field_declaration(SourceSpan name, DeclarationModifiers modifiers, NodeLink declared_type, NodeLink initializer);
+    variable_declaration(SourceSpan name, DeclarationModifiers modifiers, NodeLink declared_type, NodeLink initializer, ChildRange arguments);
+    constant_declaration(SourceSpan name, DeclarationModifiers modifiers, NodeLink declared_type, NodeLink initializer);
+    comptime_type_declaration(SourceSpan name, DeclarationModifiers modifiers, NodeLink initializer);
+    union_variant(SourceSpan name, ChildRange parameters);
+    block_statement(ChildRange statements);
+    unsafe_block(ChildRange body);
+    comptime_statement(NodeLink statement);
+    expression_statement(NodeLink expression);
+    assignment_statement(NodeLink target, NodeLink value);
+    if_statement(ChildRange branches);
+    if_branch(NodeLink condition, NodeLink body);
+    else_branch(NodeLink body);
+    while_statement(NodeLink condition, NodeLink body);
+    for_statement(NodeLink initializer, NodeLink condition, NodeLink update, NodeLink body);
+    try_statement(NodeLink body, ChildRange catches);
+    catch_clause(SourceSpan name, NodeLink error_type, NodeLink body);
+    return_statement(NodeLink value);
+    raise_statement(NodeLink error);
+    rethrow_statement;
+    print_statement(NodeLink value);
+    match_statement(NodeLink scrutinee, ChildRange arms);
+    match_expression(NodeLink scrutinee, ChildRange arms);
+    match_arm(NodeLink pattern, NodeLink body);
+    variant_pattern(SourceSpan name, ChildRange bindings);
+    wildcard_pattern;
+    binding_pattern(SourceSpan name);
+    named_type(SourceSpan name);
+    generic_type(SourceSpan name, ChildRange arguments);
+    array_type(NodeLink element, NodeLink extent);
+    slice_type(NodeLink element);
+    borrow_type(SourceSpan mode, NodeLink target);
+    raw_pointer_type(SourceSpan mode, NodeLink target);
+    nullable_pointer_type(SourceSpan mode, NodeLink target);
+    type_argument(NodeLink value);
+    name_expression(SourceSpan name);
+    integer_literal(SourceSpan spelling);
+    floating_literal(SourceSpan spelling);
+    string_literal(SourceSpan spelling);
+    formatted_string(ChildRange parts);
+    formatted_text(SourceSpan spelling);
+    boolean_literal(SourceSpan spelling);
+    null_literal;
+    unary_expression(SourceSpan operator, SyntaxOperator operation, NodeLink operand);
+    binary_expression(SourceSpan operator, SyntaxOperator operation, NodeLink left, NodeLink right);
+    borrow_expression(SourceSpan mode, NodeLink operand);
+    move_expression(NodeLink operand);
+    dereference_expression(NodeLink operand);
+    call_expression(NodeLink callee, ChildRange arguments);
+    member_expression(SourceSpan name, NodeLink receiver);
+    index_expression(NodeLink target, NodeLink index);
+    slice_expression(NodeLink target, NodeLink start, NodeLink end);
+    struct_literal(NodeLink declared_type, ChildRange fields);
+    struct_literal_field(SourceSpan name, NodeLink value);
+    union_variant_expression(SourceSpan name, ChildRange arguments);
+    parenthesized_expression(NodeLink expression);
+    absent;
+}
+
+// Draft records exist only while the parser constructs a typed node.
+pub union NodeDraft {
+    operator(SourceSpan text, SyntaxOperator operation, ChildRange children);
+    metadata(SourceSpan text, SourceSpan extra, u32 value, ChildRange children);
+    none;
+    text(SourceSpan value);
+    children(ChildRange value);
+    text_value_children(SourceSpan text, u32 value, ChildRange children);
+}
+
+pub struct SyntaxNode {
+    usize ordinal;
+    SourceSpan span;
+    SyntaxData data;
+
+    SourceSpan source_span(&in self) { return self.span; }
+    SyntaxKind kind(&in self) {
+        return match (&in self.data) {
+            .invalid_declaration => SyntaxKind.invalid_declaration,
+            .invalid_statement => SyntaxKind.invalid_statement,
+            .invalid_type => SyntaxKind.invalid_type,
+            .invalid_pattern => SyntaxKind.invalid_pattern,
+            .invalid_expression => SyntaxKind.invalid_expression,
+            .module_declaration(_) => SyntaxKind.module_declaration,
+            .import_declaration(_, _, _) => SyntaxKind.import_declaration,
+            .import_path(_) => SyntaxKind.import_path,
+            .import_symbol(_) => SyntaxKind.import_symbol,
+            .struct_declaration(_, _, _, _) => SyntaxKind.struct_declaration,
+            .union_declaration(_, _, _, _) => SyntaxKind.union_declaration,
+            .interface_declaration(_, _, _) => SyntaxKind.interface_declaration,
+            .implementation_declaration(_, _, _) => SyntaxKind.implementation_declaration,
+            .implementation_use(_) => SyntaxKind.implementation_use,
+            .view_declaration(_, _, _) => SyntaxKind.view_declaration,
+            .view_field(_, _, _) => SyntaxKind.view_field,
+            .extern_type_declaration(_, _) => SyntaxKind.extern_type_declaration,
+            .function_declaration(_, _, _, _, _, _) => SyntaxKind.function_declaration,
+            .parameter(_, _, _, _) => SyntaxKind.parameter,
+            .field_declaration(_, _, _, _) => SyntaxKind.field_declaration,
+            .variable_declaration(_, _, _, _, _) => SyntaxKind.variable_declaration,
+            .constant_declaration(_, _, _, _) => SyntaxKind.constant_declaration,
+            .comptime_type_declaration(_, _, _) => SyntaxKind.comptime_type_declaration,
+            .union_variant(_, _) => SyntaxKind.union_variant,
+            .block_statement(_) => SyntaxKind.block_statement,
+            .unsafe_block(_) => SyntaxKind.unsafe_block,
+            .comptime_statement(_) => SyntaxKind.comptime_statement,
+            .expression_statement(_) => SyntaxKind.expression_statement,
+            .assignment_statement(_, _) => SyntaxKind.assignment_statement,
+            .if_statement(_) => SyntaxKind.if_statement,
+            .if_branch(_, _) => SyntaxKind.if_branch,
+            .else_branch(_) => SyntaxKind.else_branch,
+            .while_statement(_, _) => SyntaxKind.while_statement,
+            .for_statement(_, _, _, _) => SyntaxKind.for_statement,
+            .try_statement(_, _) => SyntaxKind.try_statement,
+            .catch_clause(_, _, _) => SyntaxKind.catch_clause,
+            .return_statement(_) => SyntaxKind.return_statement,
+            .raise_statement(_) => SyntaxKind.raise_statement,
+            .rethrow_statement => SyntaxKind.rethrow_statement,
+            .print_statement(_) => SyntaxKind.print_statement,
+            .match_statement(_, _) => SyntaxKind.match_statement,
+            .match_expression(_, _) => SyntaxKind.match_expression,
+            .match_arm(_, _) => SyntaxKind.match_arm,
+            .variant_pattern(_, _) => SyntaxKind.variant_pattern,
+            .wildcard_pattern => SyntaxKind.wildcard_pattern,
+            .binding_pattern(_) => SyntaxKind.binding_pattern,
+            .named_type(_) => SyntaxKind.named_type,
+            .generic_type(_, _) => SyntaxKind.generic_type,
+            .array_type(_, _) => SyntaxKind.array_type,
+            .slice_type(_) => SyntaxKind.slice_type,
+            .borrow_type(_, _) => SyntaxKind.borrow_type,
+            .raw_pointer_type(_, _) => SyntaxKind.raw_pointer_type,
+            .nullable_pointer_type(_, _) => SyntaxKind.nullable_pointer_type,
+            .type_argument(_) => SyntaxKind.type_argument,
+            .name_expression(_) => SyntaxKind.name_expression,
+            .integer_literal(_) => SyntaxKind.integer_literal,
+            .floating_literal(_) => SyntaxKind.floating_literal,
+            .string_literal(_) => SyntaxKind.string_literal,
+            .formatted_string(_) => SyntaxKind.formatted_string,
+            .formatted_text(_) => SyntaxKind.formatted_text,
+            .boolean_literal(_) => SyntaxKind.boolean_literal,
+            .null_literal => SyntaxKind.null_literal,
+            .unary_expression(_, _, _) => SyntaxKind.unary_expression,
+            .binary_expression(_, _, _, _) => SyntaxKind.binary_expression,
+            .borrow_expression(_, _) => SyntaxKind.borrow_expression,
+            .move_expression(_) => SyntaxKind.move_expression,
+            .dereference_expression(_) => SyntaxKind.dereference_expression,
+            .call_expression(_, _) => SyntaxKind.call_expression,
+            .member_expression(_, _) => SyntaxKind.member_expression,
+            .index_expression(_, _) => SyntaxKind.index_expression,
+            .slice_expression(_, _, _) => SyntaxKind.slice_expression,
+            .struct_literal(_, _) => SyntaxKind.struct_literal,
+            .struct_literal_field(_, _) => SyntaxKind.struct_literal_field,
+            .union_variant_expression(_, _) => SyntaxKind.union_variant_expression,
+            .parenthesized_expression(_) => SyntaxKind.parenthesized_expression,
+            .absent => SyntaxKind.absent,
+        };
+    }
+    str kind_name(&in self) {
+        return match (&in self.data) {
+            .invalid_declaration => "invalid_declaration",
+            .invalid_statement => "invalid_statement",
+            .invalid_type => "invalid_type",
+            .invalid_pattern => "invalid_pattern",
+            .invalid_expression => "invalid_expression",
+            .module_declaration(_) => "module_declaration",
+            .import_declaration(_, _, _) => "import_declaration",
+            .import_path(_) => "import_path",
+            .import_symbol(_) => "import_symbol",
+            .struct_declaration(_, _, _, _) => "struct_declaration",
+            .union_declaration(_, _, _, _) => "union_declaration",
+            .interface_declaration(_, _, _) => "interface_declaration",
+            .implementation_declaration(_, _, _) => "implementation_declaration",
+            .implementation_use(_) => "implementation_use",
+            .view_declaration(_, _, _) => "view_declaration",
+            .view_field(_, _, _) => "view_field",
+            .extern_type_declaration(_, _) => "extern_type_declaration",
+            .function_declaration(_, _, _, _, _, _) => "function_declaration",
+            .parameter(_, _, _, _) => "parameter",
+            .field_declaration(_, _, _, _) => "field_declaration",
+            .variable_declaration(_, _, _, _, _) => "variable_declaration",
+            .constant_declaration(_, _, _, _) => "constant_declaration",
+            .comptime_type_declaration(_, _, _) => "comptime_type_declaration",
+            .union_variant(_, _) => "union_variant",
+            .block_statement(_) => "block_statement",
+            .unsafe_block(_) => "unsafe_block",
+            .comptime_statement(_) => "comptime_statement",
+            .expression_statement(_) => "expression_statement",
+            .assignment_statement(_, _) => "assignment_statement",
+            .if_statement(_) => "if_statement",
+            .if_branch(_, _) => "if_branch",
+            .else_branch(_) => "else_branch",
+            .while_statement(_, _) => "while_statement",
+            .for_statement(_, _, _, _) => "for_statement",
+            .try_statement(_, _) => "try_statement",
+            .catch_clause(_, _, _) => "catch_clause",
+            .return_statement(_) => "return_statement",
+            .raise_statement(_) => "raise_statement",
+            .rethrow_statement => "rethrow_statement",
+            .print_statement(_) => "print_statement",
+            .match_statement(_, _) => "match_statement",
+            .match_expression(_, _) => "match_expression",
+            .match_arm(_, _) => "match_arm",
+            .variant_pattern(_, _) => "variant_pattern",
+            .wildcard_pattern => "wildcard_pattern",
+            .binding_pattern(_) => "binding_pattern",
+            .named_type(_) => "named_type",
+            .generic_type(_, _) => "generic_type",
+            .array_type(_, _) => "array_type",
+            .slice_type(_) => "slice_type",
+            .borrow_type(_, _) => "borrow_type",
+            .raw_pointer_type(_, _) => "raw_pointer_type",
+            .nullable_pointer_type(_, _) => "nullable_pointer_type",
+            .type_argument(_) => "type_argument",
+            .name_expression(_) => "name_expression",
+            .integer_literal(_) => "integer_literal",
+            .floating_literal(_) => "floating_literal",
+            .string_literal(_) => "string_literal",
+            .formatted_string(_) => "formatted_string",
+            .formatted_text(_) => "formatted_text",
+            .boolean_literal(_) => "boolean_literal",
+            .null_literal => "null_literal",
+            .unary_expression(_, _, _) => "unary_expression",
+            .binary_expression(_, _, _, _) => "binary_expression",
+            .borrow_expression(_, _) => "borrow_expression",
+            .move_expression(_) => "move_expression",
+            .dereference_expression(_) => "dereference_expression",
+            .call_expression(_, _) => "call_expression",
+            .member_expression(_, _) => "member_expression",
+            .index_expression(_, _) => "index_expression",
+            .slice_expression(_, _, _) => "slice_expression",
+            .struct_literal(_, _) => "struct_literal",
+            .struct_literal_field(_, _) => "struct_literal_field",
+            .union_variant_expression(_, _) => "union_variant_expression",
+            .parenthesized_expression(_) => "parenthesized_expression",
+            .absent => "absent",
+        };
+    }
+    &in SyntaxData payload(&in self) { return &in self.data; }
+}
+pub struct SyntaxBuilder {
+    SourceId source;
+    bool errors;
+    usize scratch_high_water;
+    usize scratch_capacity;
+    Vector(Token, SystemAllocator) tokens;
+    Arena(SyntaxNode, SystemAllocator) nodes;
+    Vector(ArenaHandle(SyntaxNode), SystemAllocator) links;
+    Vector(ArenaHandle(SyntaxNode), SystemAllocator) roots;
+
+    init(
+        &inout self,
+        SourceId source,
+        move Vector(Token, SystemAllocator) tokens
+    ) raises CapacityError, LayoutError, AllocationError {
+        self.source = source;
+        self.errors = false;
+        self.scratch_high_water = usize(0);
+        self.scratch_capacity = usize(0);
+        self.tokens = move tokens;
+        SystemAllocator node_allocator;
+        Arena(SyntaxNode, SystemAllocator) nodes(
+            node_allocator, self.tokens.len()
+        );
+        self.nodes = move nodes;
+        SystemAllocator link_allocator;
+        Vector(ArenaHandle(SyntaxNode), SystemAllocator) links(
+            link_allocator, self.tokens.len()
+        );
+        self.links = move links;
+        SystemAllocator root_allocator;
+        Vector(ArenaHandle(SyntaxNode), SystemAllocator) roots(
+            root_allocator, usize(0)
+        );
+        self.roots = move roots;
+    }
+
+    bool has_errors(&in self) { return self.errors; }
+    void set_errors(&inout self, bool value) { self.errors = value; }
+    void set_scratch_statistics(&inout self, usize peak, usize capacity) {
+        self.scratch_high_water = peak;
+        self.scratch_capacity = capacity;
+    }
+
+    SourceId source_id(&in self) { return self.source; }
+    usize token_count(&in self) { return self.tokens.len(); }
+    usize append_tokens(&inout self, &in Vector(Token, SystemAllocator) tokens)
+        raises CapacityError, LayoutError, AllocationError, BoundsError {
+        usize start = self.tokens.len();
+        usize index = usize(0);
+        while (index < tokens.len()) {
+            self.tokens.push(tokens.get(index));
+            index = index + usize(1);
+        }
+        return start;
+    }
+    &in Token token(&in self, usize index) raises BoundsError {
+        return self.tokens.get(index);
+    }
+    usize node_count(&in self) { return self.nodes.len(); }
+    &in SyntaxNode node(&in self, ArenaHandle(SyntaxNode) handle)
+        raises ArenaHandleError
+    {
+        return self.nodes.get(handle);
+    }
+    usize root_count(&in self) { return self.roots.len(); }
+    ArenaHandle(SyntaxNode) root(&in self, usize index) raises BoundsError {
+        return self.roots.get(index);
+    }
+    ArenaHandle(SyntaxNode) child(&in self, ChildRange range, usize index)
+        raises BoundsError
+    {
+        if (index >= range.length) { raise BoundsError { }; }
+        return self.links.get(range.start + index);
+    }
+
+    usize begin_children(&in self) { return self.links.len(); }
+    void append_child(&inout self, ArenaHandle(SyntaxNode) child)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.links.push(child);
+    }
+    ChildRange finish_children(&in self, usize start) {
+        return ChildRange { start = start, length = self.links.len() - start };
+    }
+    ArenaHandle(SyntaxNode) insert(&inout self, move SyntaxNode node)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        node.ordinal = self.nodes.len();
+        return self.nodes.insert(node);
+    }
+    void append_root(&inout self, ArenaHandle(SyntaxNode) root)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.roots.push(root);
+    }
+}
+
+pub struct ParsedFile {
+    SyntaxBuilder storage;
+
+    init(&inout self, move SyntaxBuilder storage) { self.storage = move storage; }
+    bool has_errors(&in self) { return self.storage.has_errors(); }
+    usize node_size(&in self) { return sizeof(SyntaxNode); }
+    usize link_count(&in self) { return self.storage.links.len(); }
+    usize scratch_peak(&in self) { return self.storage.scratch_high_water; }
+    usize scratch_capacity(&in self) { return self.storage.scratch_capacity; }
+    usize retained_bytes(&in self) {
+        return self.storage.tokens.capacity() * sizeof(Token)
+            + self.storage.nodes.capacity() * sizeof(SyntaxNode)
+            + self.storage.links.capacity() * sizeof(ArenaHandle(SyntaxNode))
+            + self.storage.roots.capacity() * sizeof(ArenaHandle(SyntaxNode));
+    }
+    SourceId source_id(&in self) { return self.storage.source_id(); }
+    usize token_count(&in self) { return self.storage.token_count(); }
+    &in Token token(&in self, usize index) raises BoundsError {
+        return self.storage.token(index);
+    }
+    usize node_count(&in self) { return self.storage.node_count(); }
+    &in SyntaxNode node(&in self, ArenaHandle(SyntaxNode) handle)
+        raises ArenaHandleError { return self.storage.node(handle); }
+    usize root_count(&in self) { return self.storage.root_count(); }
+    ArenaHandle(SyntaxNode) root(&in self, usize index) raises BoundsError {
+        return self.storage.root(index);
+    }
+    ArenaHandle(SyntaxNode) child(&in self, ChildRange range, usize index)
+        raises BoundsError { return self.storage.child(range, index); }
+}
+
+pub usize child_count(&in SyntaxNode node) {
+    usize count = usize(0);
+    match (&in node.data) {
+        .invalid_declaration {
+
+        }
+        .invalid_statement {
+
+        }
+        .invalid_type {
+
+        }
+        .invalid_pattern {
+
+        }
+        .invalid_expression {
+
+        }
+        .module_declaration(path) {
+
+        }
+        .import_declaration(path, alias, symbols) {
+            count = count + symbols.len();
+        }
+        .import_path(name) {
+
+        }
+        .import_symbol(name) {
+
+        }
+        .struct_declaration(name, modifiers, parameters, body) {
+            count = count + parameters.len();
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .union_declaration(name, modifiers, parameters, body) {
+            count = count + parameters.len();
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .interface_declaration(name, modifiers, body) {
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .implementation_declaration(target, interface_type, body) {
+            match (target) { .absent { } .present(_) { count = count + usize(1); } }
+            match (interface_type) { .absent { } .present(_) { count = count + usize(1); } }
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .implementation_use(name) {
+
+        }
+        .view_declaration(name, modifiers, body) {
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .view_field(name, mode, declared_type) {
+            match (declared_type) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .extern_type_declaration(name, modifiers) {
+
+        }
+        .function_declaration(name, modifiers, return_type, parameters, error_types, body) {
+            match (return_type) { .absent { } .present(_) { count = count + usize(1); } }
+            count = count + parameters.len();
+            count = count + error_types.len();
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .parameter(name, modifiers, declared_type, constraints) {
+            match (declared_type) { .absent { } .present(_) { count = count + usize(1); } }
+            count = count + constraints.len();
+        }
+        .field_declaration(name, modifiers, declared_type, initializer) {
+            match (declared_type) { .absent { } .present(_) { count = count + usize(1); } }
+            match (initializer) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .variable_declaration(name, modifiers, declared_type, initializer, arguments) {
+            match (declared_type) { .absent { } .present(_) { count = count + usize(1); } }
+            match (initializer) { .absent { } .present(_) { count = count + usize(1); } }
+            count = count + arguments.len();
+        }
+        .constant_declaration(name, modifiers, declared_type, initializer) {
+            match (declared_type) { .absent { } .present(_) { count = count + usize(1); } }
+            match (initializer) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .comptime_type_declaration(name, modifiers, initializer) {
+            match (initializer) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .union_variant(name, parameters) {
+            count = count + parameters.len();
+        }
+        .block_statement(statements) {
+            count = count + statements.len();
+        }
+        .unsafe_block(body) {
+            count = count + body.len();
+        }
+        .comptime_statement(statement) {
+            match (statement) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .expression_statement(expression) {
+            match (expression) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .assignment_statement(target, value) {
+            match (target) { .absent { } .present(_) { count = count + usize(1); } }
+            match (value) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .if_statement(branches) {
+            count = count + branches.len();
+        }
+        .if_branch(condition, body) {
+            match (condition) { .absent { } .present(_) { count = count + usize(1); } }
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .else_branch(body) {
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .while_statement(condition, body) {
+            match (condition) { .absent { } .present(_) { count = count + usize(1); } }
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .for_statement(initializer, condition, update, body) {
+            match (initializer) { .absent { } .present(_) { count = count + usize(1); } }
+            match (condition) { .absent { } .present(_) { count = count + usize(1); } }
+            match (update) { .absent { } .present(_) { count = count + usize(1); } }
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .try_statement(body, catches) {
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+            count = count + catches.len();
+        }
+        .catch_clause(name, error_type, body) {
+            match (error_type) { .absent { } .present(_) { count = count + usize(1); } }
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .return_statement(value) {
+            match (value) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .raise_statement(error) {
+            match (error) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .rethrow_statement {
+
+        }
+        .print_statement(value) {
+            match (value) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .match_statement(scrutinee, arms) {
+            match (scrutinee) { .absent { } .present(_) { count = count + usize(1); } }
+            count = count + arms.len();
+        }
+        .match_expression(scrutinee, arms) {
+            match (scrutinee) { .absent { } .present(_) { count = count + usize(1); } }
+            count = count + arms.len();
+        }
+        .match_arm(pattern, body) {
+            match (pattern) { .absent { } .present(_) { count = count + usize(1); } }
+            match (body) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .variant_pattern(name, bindings) {
+            count = count + bindings.len();
+        }
+        .wildcard_pattern {
+
+        }
+        .binding_pattern(name) {
+
+        }
+        .named_type(name) {
+
+        }
+        .generic_type(name, arguments) {
+            count = count + arguments.len();
+        }
+        .array_type(element, extent) {
+            match (element) { .absent { } .present(_) { count = count + usize(1); } }
+            match (extent) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .slice_type(element) {
+            match (element) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .borrow_type(mode, target) {
+            match (target) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .raw_pointer_type(mode, target) {
+            match (target) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .nullable_pointer_type(mode, target) {
+            match (target) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .type_argument(value) {
+            match (value) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .name_expression(name) {
+
+        }
+        .integer_literal(spelling) {
+
+        }
+        .floating_literal(spelling) {
+
+        }
+        .string_literal(spelling) {
+
+        }
+        .formatted_string(parts) {
+            count = count + parts.len();
+        }
+        .formatted_text(spelling) {
+
+        }
+        .boolean_literal(spelling) {
+
+        }
+        .null_literal {
+
+        }
+        .unary_expression(operator, operation, operand) {
+            match (operand) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .binary_expression(operator, operation, left, right) {
+            match (left) { .absent { } .present(_) { count = count + usize(1); } }
+            match (right) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .borrow_expression(mode, operand) {
+            match (operand) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .move_expression(operand) {
+            match (operand) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .dereference_expression(operand) {
+            match (operand) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .call_expression(callee, arguments) {
+            match (callee) { .absent { } .present(_) { count = count + usize(1); } }
+            count = count + arguments.len();
+        }
+        .member_expression(name, receiver) {
+            match (receiver) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .index_expression(target, index) {
+            match (target) { .absent { } .present(_) { count = count + usize(1); } }
+            match (index) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .slice_expression(target, start, end) {
+            match (target) { .absent { } .present(_) { count = count + usize(1); } }
+            match (start) { .absent { } .present(_) { count = count + usize(1); } }
+            match (end) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .struct_literal(declared_type, fields) {
+            match (declared_type) { .absent { } .present(_) { count = count + usize(1); } }
+            count = count + fields.len();
+        }
+        .struct_literal_field(name, value) {
+            match (value) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .union_variant_expression(name, arguments) {
+            count = count + arguments.len();
+        }
+        .parenthesized_expression(expression) {
+            match (expression) { .absent { } .present(_) { count = count + usize(1); } }
+        }
+        .absent {
+
+        }
+    }
+    return count;
+}
+
+pub ArenaHandle(SyntaxNode) syntax_child(
+    &in ParsedFile file, &in SyntaxNode node, usize requested
+) raises BoundsError {
+    usize offset = usize(0);
+    match (&in node.data) {
+        .invalid_declaration {
+
+        }
+        .invalid_statement {
+
+        }
+        .invalid_type {
+
+        }
+        .invalid_pattern {
+
+        }
+        .invalid_expression {
+
+        }
+        .module_declaration(path) {
+
+        }
+        .import_declaration(path, alias, symbols) {
+            if (requested >= offset && requested - offset < symbols.len()) {
+                return file.child(symbols, requested - offset);
+            }
+            offset = offset + symbols.len();
+        }
+        .import_path(name) {
+
+        }
+        .import_symbol(name) {
+
+        }
+        .struct_declaration(name, modifiers, parameters, body) {
+            if (requested >= offset && requested - offset < parameters.len()) {
+                return file.child(parameters, requested - offset);
+            }
+            offset = offset + parameters.len();
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .union_declaration(name, modifiers, parameters, body) {
+            if (requested >= offset && requested - offset < parameters.len()) {
+                return file.child(parameters, requested - offset);
+            }
+            offset = offset + parameters.len();
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .interface_declaration(name, modifiers, body) {
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .implementation_declaration(target, interface_type, body) {
+            match (target) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (interface_type) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .implementation_use(name) {
+
+        }
+        .view_declaration(name, modifiers, body) {
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .view_field(name, mode, declared_type) {
+            match (declared_type) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .extern_type_declaration(name, modifiers) {
+
+        }
+        .function_declaration(name, modifiers, return_type, parameters, error_types, body) {
+            match (return_type) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < parameters.len()) {
+                return file.child(parameters, requested - offset);
+            }
+            offset = offset + parameters.len();
+            if (requested >= offset && requested - offset < error_types.len()) {
+                return file.child(error_types, requested - offset);
+            }
+            offset = offset + error_types.len();
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .parameter(name, modifiers, declared_type, constraints) {
+            match (declared_type) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < constraints.len()) {
+                return file.child(constraints, requested - offset);
+            }
+            offset = offset + constraints.len();
+        }
+        .field_declaration(name, modifiers, declared_type, initializer) {
+            match (declared_type) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (initializer) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .variable_declaration(name, modifiers, declared_type, initializer, arguments) {
+            match (declared_type) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (initializer) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < arguments.len()) {
+                return file.child(arguments, requested - offset);
+            }
+            offset = offset + arguments.len();
+        }
+        .constant_declaration(name, modifiers, declared_type, initializer) {
+            match (declared_type) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (initializer) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .comptime_type_declaration(name, modifiers, initializer) {
+            match (initializer) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .union_variant(name, parameters) {
+            if (requested >= offset && requested - offset < parameters.len()) {
+                return file.child(parameters, requested - offset);
+            }
+            offset = offset + parameters.len();
+        }
+        .block_statement(statements) {
+            if (requested >= offset && requested - offset < statements.len()) {
+                return file.child(statements, requested - offset);
+            }
+            offset = offset + statements.len();
+        }
+        .unsafe_block(body) {
+            if (requested >= offset && requested - offset < body.len()) {
+                return file.child(body, requested - offset);
+            }
+            offset = offset + body.len();
+        }
+        .comptime_statement(statement) {
+            match (statement) {
+                .absent { }
+                .present(handle) { if (requested == offset) { return handle; } }
+            }
+        }
+        .expression_statement(expression) {
+            match (expression) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .assignment_statement(target, value) {
+            match (target) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (value) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .if_statement(branches) {
+            if (requested >= offset && requested - offset < branches.len()) {
+                return file.child(branches, requested - offset);
+            }
+            offset = offset + branches.len();
+        }
+        .if_branch(condition, body) {
+            match (condition) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .else_branch(body) {
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .while_statement(condition, body) {
+            match (condition) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .for_statement(initializer, condition, update, body) {
+            match (initializer) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (condition) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (update) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .try_statement(body, catches) {
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < catches.len()) {
+                return file.child(catches, requested - offset);
+            }
+            offset = offset + catches.len();
+        }
+        .catch_clause(name, error_type, body) {
+            match (error_type) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .return_statement(value) {
+            match (value) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .raise_statement(error) {
+            match (error) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .rethrow_statement {
+
+        }
+        .print_statement(value) {
+            match (value) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .match_statement(scrutinee, arms) {
+            match (scrutinee) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < arms.len()) {
+                return file.child(arms, requested - offset);
+            }
+            offset = offset + arms.len();
+        }
+        .match_expression(scrutinee, arms) {
+            match (scrutinee) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < arms.len()) {
+                return file.child(arms, requested - offset);
+            }
+            offset = offset + arms.len();
+        }
+        .match_arm(pattern, body) {
+            match (pattern) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .variant_pattern(name, bindings) {
+            if (requested >= offset && requested - offset < bindings.len()) {
+                return file.child(bindings, requested - offset);
+            }
+            offset = offset + bindings.len();
+        }
+        .wildcard_pattern {
+
+        }
+        .binding_pattern(name) {
+
+        }
+        .named_type(name) {
+
+        }
+        .generic_type(name, arguments) {
+            if (requested >= offset && requested - offset < arguments.len()) {
+                return file.child(arguments, requested - offset);
+            }
+            offset = offset + arguments.len();
+        }
+        .array_type(element, extent) {
+            match (element) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (extent) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .slice_type(element) {
+            match (element) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .borrow_type(mode, target) {
+            match (target) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .raw_pointer_type(mode, target) {
+            match (target) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .nullable_pointer_type(mode, target) {
+            match (target) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .type_argument(value) {
+            match (value) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .name_expression(name) {
+
+        }
+        .integer_literal(spelling) {
+
+        }
+        .floating_literal(spelling) {
+
+        }
+        .string_literal(spelling) {
+
+        }
+        .formatted_string(parts) {
+            if (requested >= offset && requested - offset < parts.len()) {
+                return file.child(parts, requested - offset);
+            }
+            offset = offset + parts.len();
+        }
+        .formatted_text(spelling) {
+
+        }
+        .boolean_literal(spelling) {
+
+        }
+        .null_literal {
+
+        }
+        .unary_expression(operator, operation, operand) {
+            match (operand) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .binary_expression(operator, operation, left, right) {
+            match (left) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (right) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .borrow_expression(mode, operand) {
+            match (operand) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .move_expression(operand) {
+            match (operand) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .dereference_expression(operand) {
+            match (operand) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .call_expression(callee, arguments) {
+            match (callee) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < arguments.len()) {
+                return file.child(arguments, requested - offset);
+            }
+            offset = offset + arguments.len();
+        }
+        .member_expression(name, receiver) {
+            match (receiver) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .index_expression(target, index) {
+            match (target) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (index) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .slice_expression(target, start, end) {
+            match (target) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (start) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (end) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .struct_literal(declared_type, fields) {
+            match (declared_type) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < fields.len()) {
+                return file.child(fields, requested - offset);
+            }
+            offset = offset + fields.len();
+        }
+        .struct_literal_field(name, value) {
+            match (value) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .union_variant_expression(name, arguments) {
+            if (requested >= offset && requested - offset < arguments.len()) {
+                return file.child(arguments, requested - offset);
+            }
+            offset = offset + arguments.len();
+        }
+        .parenthesized_expression(expression) {
+            match (expression) {
+                .absent { }
+                .present(handle) {
+                    if (requested == offset) { return handle; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .absent {
+
+        }
+    }
+    raise BoundsError { };
+}
+
+pub str child_role(&in SyntaxNode node, usize requested) raises BoundsError {
+    usize offset = usize(0);
+    match (&in node.data) {
+        .invalid_declaration {
+
+        }
+        .invalid_statement {
+
+        }
+        .invalid_type {
+
+        }
+        .invalid_pattern {
+
+        }
+        .invalid_expression {
+
+        }
+        .module_declaration(path) {
+
+        }
+        .import_declaration(path, alias, symbols) {
+            if (requested >= offset && requested - offset < symbols.len()) { return "symbols"; }
+            offset = offset + symbols.len();
+        }
+        .import_path(name) {
+
+        }
+        .import_symbol(name) {
+
+        }
+        .struct_declaration(name, modifiers, parameters, body) {
+            if (requested >= offset && requested - offset < parameters.len()) { return "parameters"; }
+            offset = offset + parameters.len();
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .union_declaration(name, modifiers, parameters, body) {
+            if (requested >= offset && requested - offset < parameters.len()) { return "parameters"; }
+            offset = offset + parameters.len();
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .interface_declaration(name, modifiers, body) {
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .implementation_declaration(target, interface_type, body) {
+            match (target) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "target"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (interface_type) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "interface_type"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .implementation_use(name) {
+
+        }
+        .view_declaration(name, modifiers, body) {
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .view_field(name, mode, declared_type) {
+            match (declared_type) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "type"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .extern_type_declaration(name, modifiers) {
+
+        }
+        .function_declaration(name, modifiers, return_type, parameters, error_types, body) {
+            match (return_type) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "return_type"; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < parameters.len()) { return "parameters"; }
+            offset = offset + parameters.len();
+            if (requested >= offset && requested - offset < error_types.len()) { return "raises"; }
+            offset = offset + error_types.len();
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .parameter(name, modifiers, declared_type, constraints) {
+            match (declared_type) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "type"; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < constraints.len()) { return "constraints"; }
+            offset = offset + constraints.len();
+        }
+        .field_declaration(name, modifiers, declared_type, initializer) {
+            match (declared_type) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "type"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (initializer) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "initializer"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .variable_declaration(name, modifiers, declared_type, initializer, arguments) {
+            match (declared_type) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "type"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (initializer) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "initializer"; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < arguments.len()) { return "arguments"; }
+            offset = offset + arguments.len();
+        }
+        .constant_declaration(name, modifiers, declared_type, initializer) {
+            match (declared_type) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "type"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (initializer) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "initializer"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .comptime_type_declaration(name, modifiers, initializer) {
+            match (initializer) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "initializer"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .union_variant(name, parameters) {
+            if (requested >= offset && requested - offset < parameters.len()) { return "parameters"; }
+            offset = offset + parameters.len();
+        }
+        .block_statement(statements) {
+            if (requested >= offset && requested - offset < statements.len()) { return "statements"; }
+            offset = offset + statements.len();
+        }
+        .unsafe_block(body) {
+            if (requested >= offset && requested - offset < body.len()) { return "body"; }
+            offset = offset + body.len();
+        }
+        .comptime_statement(statement) {
+            match (statement) {
+                .absent { }
+                .present(_) { if (requested == offset) { return "statement"; } }
+            }
+        }
+        .expression_statement(expression) {
+            match (expression) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "expression"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .assignment_statement(target, value) {
+            match (target) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "target"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (value) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "value"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .if_statement(branches) {
+            if (requested >= offset && requested - offset < branches.len()) { return "branches"; }
+            offset = offset + branches.len();
+        }
+        .if_branch(condition, body) {
+            match (condition) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "condition"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .else_branch(body) {
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .while_statement(condition, body) {
+            match (condition) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "condition"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .for_statement(initializer, condition, update, body) {
+            match (initializer) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "initializer"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (condition) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "condition"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (update) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "update"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .try_statement(body, catches) {
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < catches.len()) { return "catches"; }
+            offset = offset + catches.len();
+        }
+        .catch_clause(name, error_type, body) {
+            match (error_type) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "error_type"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .return_statement(value) {
+            match (value) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "value"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .raise_statement(error) {
+            match (error) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "error"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .rethrow_statement {
+
+        }
+        .print_statement(value) {
+            match (value) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "value"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .match_statement(scrutinee, arms) {
+            match (scrutinee) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "scrutinee"; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < arms.len()) { return "arms"; }
+            offset = offset + arms.len();
+        }
+        .match_expression(scrutinee, arms) {
+            match (scrutinee) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "scrutinee"; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < arms.len()) { return "arms"; }
+            offset = offset + arms.len();
+        }
+        .match_arm(pattern, body) {
+            match (pattern) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "pattern"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (body) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "body"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .variant_pattern(name, bindings) {
+            if (requested >= offset && requested - offset < bindings.len()) { return "bindings"; }
+            offset = offset + bindings.len();
+        }
+        .wildcard_pattern {
+
+        }
+        .binding_pattern(name) {
+
+        }
+        .named_type(name) {
+
+        }
+        .generic_type(name, arguments) {
+            if (requested >= offset && requested - offset < arguments.len()) { return "arguments"; }
+            offset = offset + arguments.len();
+        }
+        .array_type(element, extent) {
+            match (element) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "element"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (extent) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "extent"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .slice_type(element) {
+            match (element) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "element"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .borrow_type(mode, target) {
+            match (target) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "target"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .raw_pointer_type(mode, target) {
+            match (target) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "target"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .nullable_pointer_type(mode, target) {
+            match (target) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "target"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .type_argument(value) {
+            match (value) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "value"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .name_expression(name) {
+
+        }
+        .integer_literal(spelling) {
+
+        }
+        .floating_literal(spelling) {
+
+        }
+        .string_literal(spelling) {
+
+        }
+        .formatted_string(parts) {
+            if (requested >= offset && requested - offset < parts.len()) { return "parts"; }
+            offset = offset + parts.len();
+        }
+        .formatted_text(spelling) {
+
+        }
+        .boolean_literal(spelling) {
+
+        }
+        .null_literal {
+
+        }
+        .unary_expression(operator, operation, operand) {
+            match (operand) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "operand"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .binary_expression(operator, operation, left, right) {
+            match (left) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "left"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (right) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "right"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .borrow_expression(mode, operand) {
+            match (operand) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "operand"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .move_expression(operand) {
+            match (operand) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "operand"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .dereference_expression(operand) {
+            match (operand) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "operand"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .call_expression(callee, arguments) {
+            match (callee) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "callee"; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < arguments.len()) { return "arguments"; }
+            offset = offset + arguments.len();
+        }
+        .member_expression(name, receiver) {
+            match (receiver) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "receiver"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .index_expression(target, index) {
+            match (target) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "target"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (index) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "index"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .slice_expression(target, start, end) {
+            match (target) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "target"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (start) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "start"; }
+                    offset = offset + usize(1);
+                }
+            }
+            match (end) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "end"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .struct_literal(declared_type, fields) {
+            match (declared_type) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "type"; }
+                    offset = offset + usize(1);
+                }
+            }
+            if (requested >= offset && requested - offset < fields.len()) { return "fields"; }
+            offset = offset + fields.len();
+        }
+        .struct_literal_field(name, value) {
+            match (value) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "value"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .union_variant_expression(name, arguments) {
+            if (requested >= offset && requested - offset < arguments.len()) { return "arguments"; }
+            offset = offset + arguments.len();
+        }
+        .parenthesized_expression(expression) {
+            match (expression) {
+                .absent { }
+                .present(_) {
+                    if (requested == offset) { return "expression"; }
+                    offset = offset + usize(1);
+                }
+            }
+        }
+        .absent {
+
+        }
+    }
+    raise BoundsError { };
+}
+
+NodeLink draft_child(&in SyntaxBuilder builder, ChildRange range, usize index)
+    raises BoundsError, ArenaHandleError {
+    if (index >= range.len()) { return NodeLink.absent; }
+    ArenaHandle(SyntaxNode) handle = builder.child(range, index);
+    &in SyntaxNode node = builder.node(handle);
+    if (node.kind() == SyntaxKind.absent) { return NodeLink.absent; }
+    return NodeLink.present(handle);
+}
+
+ChildRange subrange(ChildRange range, usize start, usize end) {
+    return ChildRange { start = range.start + start, length = end - start };
+}
+
+pub SyntaxNode materialize_node(
+    &inout SyntaxBuilder builder, SyntaxKind kind, SourceSpan span, NodeDraft draft
+) raises BoundsError, ArenaHandleError {
+    SourceSpan text = span;
+    SourceSpan extra = source_span(span.source_id(), span.start_offset(), span.start_offset(),
+        span.line_number(), span.column_number());
+    u32 flags = u32(0);
+    SyntaxOperator operation = SyntaxOperator.invalid;
+    ChildRange children = ChildRange { start = usize(0), length = usize(0) };
+    match (&in draft) {
+        .operator(value, op, range) { text = value; operation = op; children = range; }
+        .metadata(value, additional, modifiers, range) {
+            text = value; extra = additional; flags = modifiers; children = range;
+        }
+        .none { }
+        .text(value) { text = value; }
+        .children(value) { children = value; }
+        .text_value_children(value, modifiers, range) {
+            text = value; flags = modifiers; children = range;
+        }
+    }
+    usize last = usize(0);
+    if (children.len() > usize(0)) { last = children.len() - usize(1); }
+    usize tail = usize(0);
+    if (children.len() > usize(0)) { tail = usize(1); }
+    usize param_start = usize(0);
+    usize param_end = usize(0);
+    usize raises_end = children.len();
+    bool has_return_type = false;
+    bool has_body = false;
+    if (kind == SyntaxKind.function_declaration) {
+        if (children.len() > usize(0)) {
+            ArenaHandle(SyntaxNode) first_handle = builder.child(children, usize(0));
+            &in SyntaxNode first = builder.node(first_handle);
+            if (first.kind() != SyntaxKind.parameter && first.kind() != SyntaxKind.block_statement) {
+                has_return_type = true; param_start = usize(1);
+            }
+            ArenaHandle(SyntaxNode) last_handle = builder.child(children, last);
+            &in SyntaxNode end = builder.node(last_handle);
+            has_body = end.kind() == SyntaxKind.block_statement;
+            if (has_body) { raises_end = last; }
+        }
+        param_end = param_start;
+        bool scanning = true;
+        while (param_end < raises_end && scanning) {
+            ArenaHandle(SyntaxNode) handle = builder.child(children, param_end);
+            &in SyntaxNode child = builder.node(handle);
+            if (child.kind() == SyntaxKind.parameter) { param_end = param_end + usize(1); }
+            else { scanning = false; }
+        }
+    }
+    NodeLink return_type = NodeLink.absent;
+    NodeLink body = NodeLink.absent;
+    NodeLink initializer = NodeLink.absent;
+    ChildRange arguments = subrange(children, children.len(), children.len());
+    if (has_return_type) { return_type = draft_child(builder, children, usize(0)); }
+    if (has_body) { body = draft_child(builder, children, last); }
+    if ((flags & u32(32)) != u32(0)) { arguments = subrange(children, tail, children.len()); }
+    else { initializer = draft_child(builder, children, usize(1)); }
+    DeclarationModifiers modifiers = declaration_modifiers(flags, false);
+    modifiers.abi = extra;
+    SyntaxData data = match (&in kind) {
+        .invalid_declaration => SyntaxData.invalid_declaration,
+        .invalid_statement => SyntaxData.invalid_statement,
+        .invalid_type => SyntaxData.invalid_type,
+        .invalid_pattern => SyntaxData.invalid_pattern,
+        .invalid_expression => SyntaxData.invalid_expression,
+        .module_declaration => SyntaxData.module_declaration(text),
+        .import_declaration => SyntaxData.import_declaration(text, extra, children),
+        .import_path => SyntaxData.import_path(text),
+        .import_symbol => SyntaxData.import_symbol(text),
+        .struct_declaration => SyntaxData.struct_declaration(text, modifiers, subrange(children, usize(0), last), draft_child(builder, children, last)),
+        .union_declaration => SyntaxData.union_declaration(text, modifiers, subrange(children, usize(0), last), draft_child(builder, children, last)),
+        .interface_declaration => SyntaxData.interface_declaration(text, modifiers, draft_child(builder, children, last)),
+        .implementation_declaration => SyntaxData.implementation_declaration(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1)), draft_child(builder, children, usize(2))),
+        .implementation_use => SyntaxData.implementation_use(text),
+        .view_declaration => SyntaxData.view_declaration(text, modifiers, draft_child(builder, children, last)),
+        .view_field => SyntaxData.view_field(text, extra, draft_child(builder, children, usize(0))),
+        .extern_type_declaration => SyntaxData.extern_type_declaration(text, modifiers),
+        .function_declaration => SyntaxData.function_declaration(text, modifiers, return_type, subrange(children, param_start, param_end), subrange(children, param_end, raises_end), body),
+        .parameter => SyntaxData.parameter(text, declaration_modifiers(flags, true), draft_child(builder, children, usize(0)), subrange(children, tail, children.len())),
+        .field_declaration => SyntaxData.field_declaration(text, modifiers, draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .variable_declaration => SyntaxData.variable_declaration(text, modifiers, draft_child(builder, children, usize(0)), initializer, arguments),
+        .constant_declaration => SyntaxData.constant_declaration(text, modifiers, draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .comptime_type_declaration => SyntaxData.comptime_type_declaration(text, modifiers, draft_child(builder, children, usize(0))),
+        .union_variant => SyntaxData.union_variant(text, children),
+        .block_statement => SyntaxData.block_statement(children),
+        .unsafe_block => SyntaxData.unsafe_block(children),
+        .comptime_statement => SyntaxData.comptime_statement(draft_child(builder, children, usize(0))),
+        .expression_statement => SyntaxData.expression_statement(draft_child(builder, children, usize(0))),
+        .assignment_statement => SyntaxData.assignment_statement(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .if_statement => SyntaxData.if_statement(children),
+        .if_branch => SyntaxData.if_branch(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .else_branch => SyntaxData.else_branch(draft_child(builder, children, usize(0))),
+        .while_statement => SyntaxData.while_statement(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .for_statement => SyntaxData.for_statement(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1)), draft_child(builder, children, usize(2)), draft_child(builder, children, usize(3))),
+        .try_statement => SyntaxData.try_statement(draft_child(builder, children, usize(0)), subrange(children, tail, children.len())),
+        .catch_clause => SyntaxData.catch_clause(text, draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .return_statement => SyntaxData.return_statement(draft_child(builder, children, usize(0))),
+        .raise_statement => SyntaxData.raise_statement(draft_child(builder, children, usize(0))),
+        .rethrow_statement => SyntaxData.rethrow_statement,
+        .print_statement => SyntaxData.print_statement(draft_child(builder, children, usize(0))),
+        .match_statement => SyntaxData.match_statement(draft_child(builder, children, usize(0)), subrange(children, tail, children.len())),
+        .match_expression => SyntaxData.match_expression(draft_child(builder, children, usize(0)), subrange(children, tail, children.len())),
+        .match_arm => SyntaxData.match_arm(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .variant_pattern => SyntaxData.variant_pattern(text, children),
+        .wildcard_pattern => SyntaxData.wildcard_pattern,
+        .binding_pattern => SyntaxData.binding_pattern(text),
+        .named_type => SyntaxData.named_type(text),
+        .generic_type => SyntaxData.generic_type(text, children),
+        .array_type => SyntaxData.array_type(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .slice_type => SyntaxData.slice_type(draft_child(builder, children, usize(0))),
+        .borrow_type => SyntaxData.borrow_type(text, draft_child(builder, children, usize(0))),
+        .raw_pointer_type => SyntaxData.raw_pointer_type(text, draft_child(builder, children, usize(0))),
+        .nullable_pointer_type => SyntaxData.nullable_pointer_type(text, draft_child(builder, children, usize(0))),
+        .type_argument => SyntaxData.type_argument(draft_child(builder, children, usize(0))),
+        .name_expression => SyntaxData.name_expression(text),
+        .integer_literal => SyntaxData.integer_literal(text),
+        .floating_literal => SyntaxData.floating_literal(text),
+        .string_literal => SyntaxData.string_literal(text),
+        .formatted_string => SyntaxData.formatted_string(children),
+        .formatted_text => SyntaxData.formatted_text(text),
+        .boolean_literal => SyntaxData.boolean_literal(text),
+        .null_literal => SyntaxData.null_literal,
+        .unary_expression => SyntaxData.unary_expression(text, operation, draft_child(builder, children, usize(0))),
+        .binary_expression => SyntaxData.binary_expression(text, operation, draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .borrow_expression => SyntaxData.borrow_expression(text, draft_child(builder, children, usize(0))),
+        .move_expression => SyntaxData.move_expression(draft_child(builder, children, usize(0))),
+        .dereference_expression => SyntaxData.dereference_expression(draft_child(builder, children, usize(0))),
+        .call_expression => SyntaxData.call_expression(draft_child(builder, children, usize(0)), subrange(children, tail, children.len())),
+        .member_expression => SyntaxData.member_expression(text, draft_child(builder, children, usize(0))),
+        .index_expression => SyntaxData.index_expression(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
+        .slice_expression => SyntaxData.slice_expression(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1)), draft_child(builder, children, usize(2))),
+        .struct_literal => SyntaxData.struct_literal(draft_child(builder, children, usize(0)), subrange(children, tail, children.len())),
+        .struct_literal_field => SyntaxData.struct_literal_field(text, draft_child(builder, children, usize(0))),
+        .union_variant_expression => SyntaxData.union_variant_expression(text, children),
+        .parenthesized_expression => SyntaxData.parenthesized_expression(draft_child(builder, children, usize(0))),
+        .absent => SyntaxData.absent,
+    };
+    if (children.len() > usize(0)) { compact_draft_links(builder, children, data); }
+    return make_syntax_node(span, data);
+}
+
+// Only the freshly appended draft tail is rewritten. Older nodes keep their ranges.
+void compact_range(&inout SyntaxBuilder builder, &inout ChildRange range, &inout usize write)
+    raises BoundsError {
+    usize start = write;
+    usize index = usize(0);
+    while (index < range.length) {
+        ArenaHandle(SyntaxNode) handle = builder.links.get(range.start + index);
+        &inout ArenaHandle(SyntaxNode) slot = builder.links.get_mut(write);
+        slot = handle;
+        write = write + usize(1);
+        index = index + usize(1);
+    }
+    range.start = start;
+}
+
+void compact_draft_links(&inout SyntaxBuilder builder, ChildRange draft, &inout SyntaxData data)
+    raises BoundsError {
+    if (draft.start + draft.length != builder.links.len()) { raise BoundsError { }; }
+    usize write = draft.start;
+    match (data) {
+        .import_declaration(_, _, symbols) { compact_range(builder, symbols, write); }
+        .struct_declaration(_, _, parameters, _) { compact_range(builder, parameters, write); }
+        .union_declaration(_, _, parameters, _) { compact_range(builder, parameters, write); }
+        .function_declaration(_, _, _, parameters, errors, _) {
+            compact_range(builder, parameters, write);
+            compact_range(builder, errors, write);
+        }
+        .parameter(_, _, _, constraints) { compact_range(builder, constraints, write); }
+        .variable_declaration(_, _, _, _, arguments) { compact_range(builder, arguments, write); }
+        .union_variant(_, parameters) { compact_range(builder, parameters, write); }
+        .block_statement(statements) { compact_range(builder, statements, write); }
+        .unsafe_block(body) { compact_range(builder, body, write); }
+        .if_statement(branches) { compact_range(builder, branches, write); }
+        .try_statement(_, catches) { compact_range(builder, catches, write); }
+        .match_statement(_, arms) { compact_range(builder, arms, write); }
+        .match_expression(_, arms) { compact_range(builder, arms, write); }
+        .variant_pattern(_, bindings) { compact_range(builder, bindings, write); }
+        .generic_type(_, arguments) { compact_range(builder, arguments, write); }
+        .formatted_string(parts) { compact_range(builder, parts, write); }
+        .call_expression(_, arguments) { compact_range(builder, arguments, write); }
+        .struct_literal(_, fields) { compact_range(builder, fields, write); }
+        .union_variant_expression(_, arguments) { compact_range(builder, arguments, write); }
+        _ { }
+    }
+    while (builder.links.len() > write) { builder.links.pop(); }
+}
+
+pub SyntaxNode make_syntax_node(SourceSpan span, SyntaxData data) {
+    return SyntaxNode { ordinal = usize(0), span = span, data = data };
+}
+
+pub struct SyntaxValidationError { }
+
+bool kind_is_type(SyntaxKind kind) {
+    return match (&in kind) {
+        .named_type => true, .generic_type => true, .array_type => true,
+        .slice_type => true, .borrow_type => true, .raw_pointer_type => true,
+        .nullable_pointer_type => true, .invalid_type => true,
+        _ => false,
+    };
+}
+
+bool kind_is_expression(SyntaxKind kind) {
+    return match (&in kind) {
+        .invalid_expression => true,
+        .match_expression => true,
+        .name_expression => true,
+        .integer_literal => true,
+        .floating_literal => true,
+        .string_literal => true,
+        .formatted_string => true,
+        .boolean_literal => true,
+        .null_literal => true,
+        .unary_expression => true,
+        .binary_expression => true,
+        .borrow_expression => true,
+        .move_expression => true,
+        .dereference_expression => true,
+        .call_expression => true,
+        .member_expression => true,
+        .index_expression => true,
+        .slice_expression => true,
+        .struct_literal => true,
+        .union_variant_expression => true,
+        .parenthesized_expression => true,
+        _ => false,
+    };
+}
+
+bool category_matches(SyntaxKind kind, str category) {
+    if (category == "type") { return kind_is_type(kind); }
+    if (category == "expression") { return kind_is_expression(kind); }
+    if (category == "type_or_expression") {
+        return kind_is_type(kind) || kind_is_expression(kind) || kind == SyntaxKind.parameter;
+    }
+    if (category == "block") {
+        return kind == SyntaxKind.block_statement || kind == SyntaxKind.invalid_statement;
+    }
+    if (category == "arm_body") {
+        return kind == SyntaxKind.block_statement || kind == SyntaxKind.invalid_statement
+            || kind_is_expression(kind);
+    }
+    if (category == "parameter") { return kind == SyntaxKind.parameter || kind == SyntaxKind.invalid_declaration; }
+    if (category == "pattern") {
+        return kind == SyntaxKind.variant_pattern || kind == SyntaxKind.wildcard_pattern
+            || kind == SyntaxKind.invalid_pattern;
+    }
+    if (category == "binding") {
+        return kind == SyntaxKind.binding_pattern || kind == SyntaxKind.wildcard_pattern
+            || kind == SyntaxKind.invalid_pattern;
+    }
+    if (category == "arm") { return kind == SyntaxKind.match_arm; }
+    if (category == "branch") { return kind == SyntaxKind.if_branch || kind == SyntaxKind.else_branch; }
+    if (category == "catch") { return kind == SyntaxKind.catch_clause; }
+    if (category == "import_symbol") { return kind == SyntaxKind.import_symbol; }
+    if (category == "field_value") { return kind == SyntaxKind.struct_literal_field; }
+    if (category == "formatted_part") { return kind == SyntaxKind.formatted_text || kind_is_expression(kind); }
+    if (category == "statement") {
+        return match (&in kind) {
+            .invalid_declaration => true,
+            .invalid_statement => true,
+            .module_declaration => true,
+            .import_declaration => true,
+            .struct_declaration => true,
+            .union_declaration => true,
+            .interface_declaration => true,
+            .implementation_declaration => true,
+            .implementation_use => true,
+            .view_declaration => true,
+            .view_field => true,
+            .extern_type_declaration => true,
+            .function_declaration => true,
+            .field_declaration => true,
+            .variable_declaration => true,
+            .constant_declaration => true,
+            .comptime_type_declaration => true,
+            .union_variant => true,
+            .block_statement => true,
+            .unsafe_block => true,
+            .comptime_statement => true,
+            .expression_statement => true,
+            .assignment_statement => true,
+            .if_statement => true,
+            .while_statement => true,
+            .for_statement => true,
+            .try_statement => true,
+            .return_statement => true,
+            .raise_statement => true,
+            .rethrow_statement => true,
+            .print_statement => true,
+            .match_statement => true,
+            _ => false,
+        };
+    }
+    return false;
+}
+
+void validate_edge(&in ParsedFile file, &in SyntaxNode parent,
+    ArenaHandle(SyntaxNode) handle, str category)
+    raises SyntaxValidationError, ArenaHandleError {
+    &in SyntaxNode child = file.node(handle);
+    if (child.ordinal >= parent.ordinal || category_matches(child.kind(), category) == false
+        || child.span.start_offset() < parent.span.start_offset()
+        || child.span.end_offset() > parent.span.end_offset()) {
+        raise SyntaxValidationError { };
+    }
+    SourceSpan span = child.source_span();
+    if (span.start_offset() < parent.span.start_offset()
+        || span.end_offset() > parent.span.end_offset()) { raise SyntaxValidationError { }; }
+}
+
+void validate_link(&in ParsedFile file, &in SyntaxNode parent,
+    &in NodeLink link, str category, bool optional)
+    raises SyntaxValidationError, ArenaHandleError {
+    match (link) {
+        .absent { if (optional == false) { raise SyntaxValidationError { }; } }
+        .present(handle) { validate_edge(file, parent, handle, category); }
+    }
+}
+
+void validate_range(&in ParsedFile file, &in SyntaxNode parent,
+    ChildRange range, str category)
+    raises SyntaxValidationError, BoundsError, ArenaHandleError {
+    if (range.start > file.storage.links.len()
+        || range.length > file.storage.links.len() - range.start) { raise SyntaxValidationError { }; }
+    usize index = usize(0);
+    usize previous_end = parent.span.start_offset();
+    while (index < range.len()) {
+        validate_edge(file, parent, file.child(range, index), category);
+        &in SyntaxNode child = file.node(file.child(range, index));
+        if (child.span.start_offset() < previous_end) { raise SyntaxValidationError { }; }
+        previous_end = child.span.end_offset();
+        index = index + usize(1);
+    }
+}
+
+void validate_text(&in SourceMap sources, &in SyntaxNode parent, SourceSpan text)
+    raises SourceMapError, SyntaxValidationError {
+    SourceId source = text.source_id();
+    SourceId owner = parent.span.source_id();
+    if (source.equals(owner) == false || text.start_offset() < parent.span.start_offset()
+        || text.end_offset() > parent.span.end_offset()) { raise SyntaxValidationError { }; }
+    sources.validate(text);
+}
+
+void validate_payload(&in SourceMap sources, &in ParsedFile file, &in SyntaxNode node)
+    raises SyntaxValidationError, BoundsError, ArenaHandleError, SourceMapError {
+    sources.validate(node.span);
+    SourceId source = node.span.source_id();
+    if (source.equals(file.source_id()) == false) { raise SyntaxValidationError { }; }
+    match (&in node.data) {
+        .invalid_declaration {
+            if (file.has_errors() == false) { raise SyntaxValidationError { }; }
+        }
+        .invalid_statement {
+            if (file.has_errors() == false) { raise SyntaxValidationError { }; }
+        }
+        .invalid_type {
+            if (file.has_errors() == false) { raise SyntaxValidationError { }; }
+        }
+        .invalid_pattern {
+            if (file.has_errors() == false) { raise SyntaxValidationError { }; }
+        }
+        .invalid_expression {
+            if (file.has_errors() == false) { raise SyntaxValidationError { }; }
+        }
+        .module_declaration(path) {
+            validate_text(sources, node, path);
+        }
+        .import_declaration(path, alias, symbols) {
+            validate_text(sources, node, path);
+            validate_text(sources, node, alias);
+            validate_range(file, node, symbols, "import_symbol");
+        }
+        .import_path(name) {
+            validate_text(sources, node, name);
+        }
+        .import_symbol(name) {
+            validate_text(sources, node, name);
+        }
+        .struct_declaration(name, modifiers, parameters, body) {
+            validate_text(sources, node, name);
+            validate_range(file, node, parameters, "parameter");
+            validate_link(file, node, body, "block", false);
+        }
+        .union_declaration(name, modifiers, parameters, body) {
+            validate_text(sources, node, name);
+            validate_range(file, node, parameters, "parameter");
+            validate_link(file, node, body, "block", false);
+        }
+        .interface_declaration(name, modifiers, body) {
+            validate_text(sources, node, name);
+            validate_link(file, node, body, "block", false);
+        }
+        .implementation_declaration(target, interface_type, body) {
+            validate_link(file, node, target, "type", false);
+            validate_link(file, node, interface_type, "type", false);
+            validate_link(file, node, body, "block", false);
+        }
+        .implementation_use(name) {
+            validate_text(sources, node, name);
+        }
+        .view_declaration(name, modifiers, body) {
+            validate_text(sources, node, name);
+            validate_link(file, node, body, "block", false);
+        }
+        .view_field(name, mode, declared_type) {
+            validate_text(sources, node, name);
+            validate_text(sources, node, mode);
+            validate_link(file, node, declared_type, "type", false);
+        }
+        .extern_type_declaration(name, modifiers) {
+            validate_text(sources, node, name);
+        }
+        .function_declaration(name, modifiers, return_type, parameters, error_types, body) {
+            validate_text(sources, node, name);
+            validate_link(file, node, return_type, "type", true);
+            validate_range(file, node, parameters, "parameter");
+            validate_range(file, node, error_types, "type");
+            validate_link(file, node, body, "block", true);
+        }
+        .parameter(name, modifiers, declared_type, constraints) {
+            validate_text(sources, node, name);
+            validate_link(file, node, declared_type, "type", true);
+            validate_range(file, node, constraints, "type");
+        }
+        .field_declaration(name, modifiers, declared_type, initializer) {
+            validate_text(sources, node, name);
+            validate_link(file, node, declared_type, "type", false);
+            validate_link(file, node, initializer, "expression", true);
+        }
+        .variable_declaration(name, modifiers, declared_type, initializer, arguments) {
+            validate_text(sources, node, name);
+            validate_link(file, node, declared_type, "type", false);
+            validate_link(file, node, initializer, "expression", true);
+            validate_range(file, node, arguments, "type_or_expression");
+        }
+        .constant_declaration(name, modifiers, declared_type, initializer) {
+            validate_text(sources, node, name);
+            validate_link(file, node, declared_type, "type", false);
+            validate_link(file, node, initializer, "expression", false);
+        }
+        .comptime_type_declaration(name, modifiers, initializer) {
+            validate_text(sources, node, name);
+            validate_link(file, node, initializer, "expression", false);
+        }
+        .union_variant(name, parameters) {
+            validate_text(sources, node, name);
+            validate_range(file, node, parameters, "parameter");
+        }
+        .block_statement(statements) {
+            validate_range(file, node, statements, "statement");
+        }
+        .unsafe_block(body) {
+            validate_range(file, node, body, "statement");
+        }
+        .comptime_statement(statement) {
+            validate_link(file, node, statement, "statement", false);
+        }
+        .expression_statement(expression) {
+            validate_link(file, node, expression, "expression", false);
+        }
+        .assignment_statement(target, value) {
+            validate_link(file, node, target, "expression", false);
+            validate_link(file, node, value, "expression", false);
+        }
+        .if_statement(branches) {
+            validate_range(file, node, branches, "branch");
+        }
+        .if_branch(condition, body) {
+            validate_link(file, node, condition, "expression", false);
+            validate_link(file, node, body, "block", false);
+        }
+        .else_branch(body) {
+            validate_link(file, node, body, "block", false);
+        }
+        .while_statement(condition, body) {
+            validate_link(file, node, condition, "expression", false);
+            validate_link(file, node, body, "block", false);
+        }
+        .for_statement(initializer, condition, update, body) {
+            validate_link(file, node, initializer, "statement", true);
+            validate_link(file, node, condition, "expression", true);
+            validate_link(file, node, update, "statement", true);
+            validate_link(file, node, body, "block", false);
+        }
+        .try_statement(body, catches) {
+            validate_link(file, node, body, "block", false);
+            validate_range(file, node, catches, "catch");
+        }
+        .catch_clause(name, error_type, body) {
+            validate_text(sources, node, name);
+            validate_link(file, node, error_type, "type", false);
+            validate_link(file, node, body, "block", false);
+        }
+        .return_statement(value) {
+            validate_link(file, node, value, "expression", true);
+        }
+        .raise_statement(error) {
+            validate_link(file, node, error, "expression", false);
+        }
+        .rethrow_statement {
+        }
+        .print_statement(value) {
+            validate_link(file, node, value, "expression", false);
+        }
+        .match_statement(scrutinee, arms) {
+            validate_link(file, node, scrutinee, "expression", false);
+            validate_range(file, node, arms, "arm");
+        }
+        .match_expression(scrutinee, arms) {
+            validate_link(file, node, scrutinee, "expression", false);
+            validate_range(file, node, arms, "arm");
+        }
+        .match_arm(pattern, body) {
+            validate_link(file, node, pattern, "pattern", false);
+            validate_link(file, node, body, "arm_body", false);
+        }
+        .variant_pattern(name, bindings) {
+            validate_text(sources, node, name);
+            validate_range(file, node, bindings, "binding");
+        }
+        .wildcard_pattern {
+        }
+        .binding_pattern(name) {
+            validate_text(sources, node, name);
+        }
+        .named_type(name) {
+            validate_text(sources, node, name);
+        }
+        .generic_type(name, arguments) {
+            validate_text(sources, node, name);
+            validate_range(file, node, arguments, "type_or_expression");
+        }
+        .array_type(element, extent) {
+            validate_link(file, node, element, "type", false);
+            validate_link(file, node, extent, "expression", false);
+        }
+        .slice_type(element) {
+            validate_link(file, node, element, "type", false);
+        }
+        .borrow_type(mode, target) {
+            validate_text(sources, node, mode);
+            validate_link(file, node, target, "type", true);
+        }
+        .raw_pointer_type(mode, target) {
+            validate_text(sources, node, mode);
+            validate_link(file, node, target, "type", false);
+        }
+        .nullable_pointer_type(mode, target) {
+            validate_text(sources, node, mode);
+            validate_link(file, node, target, "type", false);
+        }
+        .type_argument(value) {
+            validate_link(file, node, value, "expression", false);
+        }
+        .name_expression(name) {
+            validate_text(sources, node, name);
+        }
+        .integer_literal(spelling) {
+            validate_text(sources, node, spelling);
+        }
+        .floating_literal(spelling) {
+            validate_text(sources, node, spelling);
+        }
+        .string_literal(spelling) {
+            validate_text(sources, node, spelling);
+        }
+        .formatted_string(parts) {
+            validate_range(file, node, parts, "formatted_part");
+        }
+        .formatted_text(spelling) {
+            validate_text(sources, node, spelling);
+        }
+        .boolean_literal(spelling) {
+            validate_text(sources, node, spelling);
+        }
+        .null_literal {
+        }
+        .unary_expression(operator, operation, operand) {
+            validate_text(sources, node, operator);
+            if (operation == SyntaxOperator.invalid) { raise SyntaxValidationError { }; }
+            validate_link(file, node, operand, "expression", false);
+        }
+        .binary_expression(operator, operation, left, right) {
+            validate_text(sources, node, operator);
+            validate_link(file, node, left, "expression", false);
+            validate_link(file, node, right, "expression", false);
+        }
+        .borrow_expression(mode, operand) {
+            validate_text(sources, node, mode);
+            validate_link(file, node, operand, "expression", false);
+        }
+        .move_expression(operand) {
+            validate_link(file, node, operand, "expression", false);
+        }
+        .dereference_expression(operand) {
+            validate_link(file, node, operand, "expression", false);
+        }
+        .call_expression(callee, arguments) {
+            validate_link(file, node, callee, "expression", false);
+            validate_range(file, node, arguments, "type_or_expression");
+        }
+        .member_expression(name, receiver) {
+            validate_text(sources, node, name);
+            validate_link(file, node, receiver, "expression", false);
+        }
+        .index_expression(target, index) {
+            validate_link(file, node, target, "expression", false);
+            validate_link(file, node, index, "expression", false);
+        }
+        .slice_expression(target, start, end) {
+            validate_link(file, node, target, "expression", false);
+            validate_link(file, node, start, "expression", true);
+            validate_link(file, node, end, "expression", true);
+        }
+        .struct_literal(declared_type, fields) {
+            validate_link(file, node, declared_type, "type_or_expression", false);
+            validate_range(file, node, fields, "field_value");
+        }
+        .struct_literal_field(name, value) {
+            validate_text(sources, node, name);
+            validate_link(file, node, value, "expression", false);
+        }
+        .union_variant_expression(name, arguments) {
+            validate_text(sources, node, name);
+            validate_range(file, node, arguments, "type_or_expression");
+        }
+        .parenthesized_expression(expression) {
+            validate_link(file, node, expression, "expression", false);
+        }
+        .absent {
+        }
+    }
+}
+
+pub void validate_syntax(&in SourceMap sources, &in ParsedFile file)
+    raises SyntaxValidationError, BoundsError, ArenaHandleError, SourceMapError,
+        CapacityError, LayoutError, AllocationError {
+    SystemAllocator pending_allocator;
+    Vector(ArenaHandle(SyntaxNode), SystemAllocator) pending(pending_allocator, file.root_count());
+    SystemAllocator seen_allocator;
+    Vector(bool, SystemAllocator) seen(seen_allocator, file.node_count());
+    usize index = usize(0);
+    while (index < file.node_count()) { seen.push(false); index = index + usize(1); }
+    index = usize(0);
+    usize previous_end = usize(0);
+    while (index < file.root_count()) {
+        ArenaHandle(SyntaxNode) root = file.root(index);
+        &in SyntaxNode node = file.node(root);
+        if (node.span.start_offset() < previous_end
+            || category_matches(node.kind(), "statement") == false) { raise SyntaxValidationError { }; }
+        previous_end = node.span.end_offset();
+        pending.push(root);
+        index = index + usize(1);
+    }
+    while (pending.is_empty() == false) {
+        ArenaHandle(SyntaxNode) handle = pending.pop();
+        &in SyntaxNode node = file.node(handle);
+        if (node.ordinal >= seen.len()) { raise SyntaxValidationError { }; }
+        if (seen.get(node.ordinal)) { raise SyntaxValidationError { }; }
+        &inout bool visited = seen.get_mut(node.ordinal);
+        visited = true;
+        validate_payload(sources, file, node);
+        index = usize(0);
+        while (index < child_count(node)) {
+            pending.push(syntax_child(file, node, index));
+            index = index + usize(1);
+        }
+    }
+}

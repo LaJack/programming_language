@@ -55,5 +55,6 @@ pub struct Arena(
     }
 
     usize len(&in self) { return self.values.len(); }
+    usize capacity(&in self) { return self.values.capacity(); }
     bool is_empty(&in self) { return self.values.is_empty(); }
 }

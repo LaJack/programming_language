@@ -1,0 +1,59 @@
+import bootstrap.frontend;
+import bootstrap.source;
+import bootstrap.syntax;
+import bootstrap.lexer;
+import bootstrap.parser;
+import bootstrap.diagnostics;
+import std.collections.vector;
+import std.collections.arena;
+import std.memory;
+import std.string;
+import std.io;
+
+extern "c" i64 clock();
+
+Vector(Token, SystemAllocator) tokenize(&in FrontendContext context, SourceId source)
+    raises {
+    &in SourceMap sources = context.source_map();
+    &in u8[] bytes = sources.bytes(source);
+    SystemAllocator allocator;
+    return lex(SystemAllocator, source, bytes, allocator);
+}
+
+void measure(str path) raises {
+    File input = open_read(path);
+    SystemAllocator allocator;
+    String(SystemAllocator) text = read_to_string(SystemAllocator, input, allocator);
+    close(input);
+    FrontendContext context = frontend_context();
+    SourceId source = context.add_source(path, text);
+    Vector(Token, SystemAllocator) tokens = tokenize(context, source);
+    DiagnosticBag diagnostics(usize(20));
+    i64 start = clock();
+    ParsedFileId id = parse_strict(context, source, tokens, diagnostics);
+    i64 end = clock();
+    &in ParsedFile file = context.file(id);
+    print(f"ticks\t{end - start}");
+    print(f"nodes\t{file.node_count()}");
+    print(f"node_size\t{file.node_size()}");
+    print(f"links\t{file.link_count()}");
+    print(f"retained_bytes\t{file.retained_bytes()}");
+    print(f"scratch_peak\t{file.scratch_peak()}");
+    print(f"scratch_capacity\t{file.scratch_capacity()}");
+}
+
+i32 main(&in str[] arguments) {
+    if (usize(len(arguments)) != usize(2)) { return 2; }
+    try { measure(arguments[1]); return 0; }
+    catch IoError { return 1; }
+    catch Utf8Error { return 1; }
+    catch CapacityError { return 1; }
+    catch LayoutError { return 1; }
+    catch AllocationError { return 1; }
+    catch SourceMapError { return 1; }
+    catch BoundsError { return 1; }
+    catch ArenaHandleError { return 1; }
+    catch ParseFailed { return 1; }
+    catch SyntaxValidationError { return 1; }
+    catch FrontendReferenceError { return 1; }
+}

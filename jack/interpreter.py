@@ -1130,6 +1130,8 @@ class Interpreter:
             )
         if isinstance(expression, HIRDereferenceExpression):
             pointer = self._eval_hir_expression(expression.expr, scope)
+            if isinstance(pointer, (JackBorrow, JackArrayElementBorrow)):
+                return self._read_value(pointer)
             if pointer is None:
                 raise EvaluationError('Cannot dereference a null raw pointer.')
             if not isinstance(pointer, JackRawPointer):
@@ -2064,6 +2066,11 @@ class Interpreter:
             return
         if isinstance(target, HIRDereferenceExpression):
             pointer = self._eval_hir_expression(target.expr, scope)
+            if isinstance(pointer, (JackBorrow, JackArrayElementBorrow)):
+                if not borrow_mode_can_write(pointer.mode):
+                    raise EvaluationError('Cannot assign through a read-only borrow.')
+                pointer.value = value
+                return
             if pointer is None:
                 raise EvaluationError('Cannot assign through a null raw pointer.')
             if not isinstance(pointer, JackRawPointer):

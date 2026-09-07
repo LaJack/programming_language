@@ -31,7 +31,7 @@ i32 run() raises CapacityError, LayoutError, AllocationError, Utf8Error,
     );
     SystemAllocator second_allocator;
     String(SystemAllocator) second_text(second_allocator, "other\n");
-    SourceMap sources;
+    SourceMap sources = source_map();
     SourceId first = sources.add("first.jack", first_text);
     SourceId second = sources.add("second.jack", second_text);
 
@@ -166,7 +166,7 @@ void run() raises CapacityError, LayoutError, AllocationError, Utf8Error,
 {
     SystemAllocator allocator;
     String(SystemAllocator) text(allocator, "short");
-    SourceMap sources;
+    SourceMap sources = source_map();
     SourceId source = sources.add("short.jack", text);
     Diagnostic diagnostic = source_diagnostic(
         DiagnosticSeverity.error, "test.invalid", source_span(
@@ -221,7 +221,7 @@ void inspect(move SourceMap sources, SourceId empty, SourceId text)
 void run() raises CapacityError, LayoutError, AllocationError, Utf8Error,
     SourceMapError, BoundsError
 {
-    SourceMap sources;
+    SourceMap sources = source_map();
     SystemAllocator empty_allocator;
     String(SystemAllocator) empty_text(empty_allocator, "");
     SourceId empty = sources.add("empty.jack", empty_text);

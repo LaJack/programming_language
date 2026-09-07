@@ -4,6 +4,8 @@ from pathlib import Path
 
 from jack.ast_nodes import (
     FunctionDeclaration,
+    FormattedStringExpression,
+    FunctionCall,
     InvalidExpression,
     InvalidStatement,
     VariableDeclaration,
@@ -13,6 +15,14 @@ from jack.hir_lowering_pass import compile_to_hir
 
 
 class RecoveringParserTests(unittest.TestCase):
+    def test_formatted_strings_allow_quoted_embedded_expressions(self):
+        source = 'print(f"value {len("hello")} {{literal}} {f"nested {1}"}");'
+        statement = parse(source)[0]
+        self.assertIsInstance(statement.expr, FormattedStringExpression)
+        self.assertIsInstance(statement.expr.parts[1], FunctionCall)
+        self.assertIsInstance(statement.expr.parts[-1], FormattedStringExpression)
+        self.assertEqual([], parse_recovering(source).diagnostics)
+
     def test_strict_parse_remains_fail_fast(self):
         with self.assertRaisesRegex(ParseError, 'Expected expression'):
             parse('i32 bad = ; i32 later = 2;')

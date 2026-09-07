@@ -7,7 +7,10 @@ from pathlib import Path
 
 from jack.compiler_driver import CompilationOptions, CompilerDriver
 from jack.interpreter import Interpreter
-from jack.parser import Lexer
+from jack.parser import Lexer, ParseError, parse
+from tests.bootstrap_syntax_normalization import (
+    bootstrap_nodes, first_difference, python_node, read_dump, root_source_ranges,
+)
 from jack.runtime_externs import default_runtime_externs
 
 
@@ -57,17 +60,16 @@ class BootstrapLexerTests(unittest.TestCase):
                 ),
             )
             cls.executables[backend] = output
-        optimized = cls.root / 'bootstrap-llvm-o2'
-        driver.compile_executable(
-            ENTRY,
-            CompilationOptions(
-                backend='llvm',
-                output=optimized,
-                optimization=2,
-                module_roots=(SELFHOST_ROOT,),
-            ),
-        )
-        cls.executables['llvm-o2'] = optimized
+        for backend in ('llvm', 'c'):
+            optimized = cls.root / f'bootstrap-{backend}-o2'
+            driver.compile_executable(
+                ENTRY,
+                CompilationOptions(
+                    backend=backend, output=optimized, optimization=2,
+                    module_roots=(SELFHOST_ROOT,),
+                ),
+            )
+            cls.executables[f'{backend}-o2'] = optimized
 
     @classmethod
     def tearDownClass(cls):
@@ -94,6 +96,7 @@ class BootstrapLexerTests(unittest.TestCase):
             [str(self.executables[backend]), *arguments],
             capture_output=True,
             text=True,
+            timeout=20,
             check=False,
         )
         return result.returncode, result.stdout, result.stderr
@@ -175,7 +178,7 @@ class BootstrapLexerTests(unittest.TestCase):
     def test_usage_and_missing_file_contracts(self):
         for backend in ('c', 'llvm'):
             status, stdout, stderr = self.run_native(backend)
-            self.assertEqual((2, '', 'usage: jack-bootstrap [--diagnostic-format human|stable] <source>\n'),
+            self.assertEqual((2, '', 'usage: jack-bootstrap [--diagnostic-format human|stable] [--dump tokens|syntax] <source>\n'),
                              (status, stdout, stderr))
             status, stdout, stderr = self.run_native(
                 backend, str(self.root / 'missing.jack')
@@ -232,6 +235,183 @@ class BootstrapLexerTests(unittest.TestCase):
         for backend, result in self.compilation_results.items():
             with self.subTest(backend=backend):
                 self.assertIn(expected, result.comptime_dependencies)
+
+    def test_syntax_dump_preserves_precedence_across_runtimes(self):
+        path = self.root / 'syntax.jack'
+        path.write_text('module demo;\ni32 value = 1 + 2 * 3;\n')
+        results = [self.run_interpreter(path, '--dump', 'syntax')]
+        results.extend(
+            self.run_native(backend, '--dump', 'syntax', str(path))
+            for backend in ('c', 'llvm', 'llvm-o2', 'c-o2')
+        )
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0], results[2])
+        self.assertEqual(results[0], results[3])
+        self.assertEqual(results[0], results[4])
+        status, output, errors = results[0]
+        self.assertEqual((0, ''), (status, errors))
+        self.assertIn('node\t0\tmodule_declaration\t0\t12\n', output)
+        self.assertIn('node\t3\tbinary_expression\t25\t34\n', output)
+        self.assertIn('field\t3\toperator\t27\t28\n', output)
+        self.assertIn('field\t5\toperator\t31\t32\n', output)
+        self.assertEqual(python_node(parse(path.read_text())), bootstrap_nodes(path.read_text(), output))
+
+    def test_syntax_recovery_retains_later_declarations(self):
+        path = self.root / 'recover.jack'
+        path.write_text('i32 first = ;\ni32 second = 2;\n')
+        status, output, errors = self.run_native(
+            'llvm', '--diagnostic-format', 'stable', '--dump', 'syntax', str(path)
+        )
+        self.assertEqual(1, status)
+        self.assertEqual(2, output.count('root\t'))
+        self.assertIn('invalid_expression', output)
+        self.assertIn('field\t3\tname\t18\t24\n', output)
+        self.assertIn('parse.expected-expression', errors)
+
+    def test_syntax_mode_parses_checked_in_jack_sources(self):
+        paths = [
+            *sorted((ROOT / 'examples').glob('*.jack')),
+            *sorted((ROOT / 'jack' / 'std').glob('*.jack')),
+            *sorted((ROOT / 'jack' / 'std' / 'collections').glob('*.jack')),
+            *sorted((SELFHOST_ROOT / 'bootstrap').glob('*.jack')),
+        ]
+        for path in paths:
+            with self.subTest(path=path.relative_to(ROOT)):
+                status, output, errors = self.run_native(
+                    'llvm', '--dump', 'syntax', str(path)
+                )
+                self.assertEqual((0, ''), (status, errors))
+                source = path.read_text()
+                expected = python_node(parse(source))
+                actual = bootstrap_nodes(source, output)
+                self.assertIsNone(first_difference(expected, actual))
+                expected_ranges, actual_ranges = root_source_ranges(source, parse(source), output)
+                self.assertEqual(expected_ranges, actual_ranges)
+
+    def test_structured_grammar_fixtures_match_python(self):
+        sources = [
+            'import protocol.frame as frame; import std.memory.{Allocation, Layout};',
+            'void f() { for (;;) { return; } for (i32 i = 0; i < 3; i = i + 1) { print(i); } }',
+            'void f() { try { return; } catch Option(i32) error { rethrow; } }',
+            'void f() { i32 x = match (move value) { .some(item) => move item, .none => 0, }; }',
+            'void f() { match (&inout value) { .some(item, _) { item = 1; } _ { } } }',
+            'i32 a = 1 | 2 ^ 3 & 4 == 5 << 6 + 7 * 8; i32 b = ~a[0];',
+            '&in u8[] whole = &in values[..]; &in u8[] prefix = &in values[..2];',
+            'Box(N + 1, u8[4], &in T) box; interface Copier { init(&out self, &in Self other); }',
+            'comptime print(1); comptime for (i32 i = 0; i < 3; i = i + 1) { print(i); }',
+            'for (comptime i32 i = 0; i < 3; comptime i = i + 1) { print(i); }',
+            'struct Generic(comptime type T: Copyable + Printable) { T value; }',
+            'pub const i32[2] values = comptime make_values();',
+            'pub unsafe extern "c" ?*inout u8 allocate(usize size);',
+            'unsafe void update(*inout i32 pointer) { *pointer = 42; }',
+            'print(f"value {len("hello")} {{braces}} {f"nested {1}"}");',
+        ]
+        for index, source in enumerate(sources):
+            with self.subTest(source=source):
+                path = self.root / f'grammar-{index}.jack'
+                path.write_text(source)
+                expected = python_node(parse(source))
+                status, output, errors = self.run_native('llvm', '--dump', 'syntax', str(path))
+                self.assertEqual((0, ''), (status, errors))
+                self.assertIsNone(first_difference(expected, bootstrap_nodes(source, output)))
+
+    def test_recovered_trees_remain_valid_across_runtimes(self):
+        source = 'void f(i32 a,,i32 b) { i32 x = (1 + ); print(2); } i32 later = 3;'
+        path = self.root / 'damaged.jack'
+        path.write_text(source)
+        results = [self.run_interpreter(path, '--dump', 'syntax', '--diagnostic-format', 'stable')]
+        results.extend(self.run_native(backend, '--dump', 'syntax', '--diagnostic-format', 'stable', str(path))
+                       for backend in ('llvm', 'c', 'llvm-o2', 'c-o2'))
+        for result in results:
+            self.assertEqual(results[0], result)
+            self.assertEqual(1, result[0])
+            self.assertIn('invalid_expression', result[1])
+            self.assertNotIn('syntax.invalid-tree', result[2])
+            self.assertEqual(2, result[1].count('root\t'))
+
+    def test_malformed_grammar_and_deterministic_mutations(self):
+        malformed = [
+            'void f() { try { return; } }', 'pub pub i32 value;', 'const i32 value;',
+            'i32 if = 1;', 'import a.{B,};', '*out i32 pointer;',
+            'void f() { match (&in value) { .some(x,) { } } }',
+            'void f() { match (&in value) { .some(x) => x, .none { } } }',
+            'void f(i32 a,,i32 b) { return; }', 'void f() { print(1,); print(2); }',
+            'print(f"bad {1 + }");', 'print(f"bad } text");',
+            'comptime comptime print(1);', 'pub import a;', 'unsafe struct Bad { }',
+            'print 1;', 'void f() { raise; }', 'i32 value = 1; value;', '*i32 pointer;',
+        ]
+        valid = 'void f(i32 value) { if (value > 0) { print(value); } } i32 tail = 2;'
+        for token in Lexer(valid).tokenize():
+            if token.kind in {'(', ')', '{', '}', ';'}:
+                mutated = valid[:token.offset] + valid[token.end_offset:]
+                try:
+                    parse(mutated)
+                except ParseError:
+                    malformed.append(mutated)
+        for index, source in enumerate(malformed):
+            with self.subTest(source=source):
+                with self.assertRaises(ParseError):
+                    parse(source)
+                path = self.root / f'malformed-{index}.jack'
+                path.write_text(source)
+                status, output, errors = self.run_native(
+                    'llvm', '--dump', 'syntax', '--diagnostic-format', 'stable', str(path))
+                self.assertEqual(1, status)
+                self.assertIn('diagnostic\t', errors)
+                self.assertNotIn('syntax.invalid-tree', errors)
+                self.assertTrue(output)
+
+    def test_nested_formatted_strings_have_absolute_utf8_spans(self):
+        source = '// heading\r\n\tprint(f"cafe\u00e9 {len("hi")} {{ok}}");\n'
+        path = self.root / 'formatted-utf8.jack'
+        path.write_bytes(source.encode())
+        result = self.run_native('llvm', '--dump', 'syntax', str(path))
+        self.assertEqual((0, ''), (result[0], result[2]))
+        self.assertEqual(python_node(parse(source)), bootstrap_nodes(source, result[1]))
+        nodes, _ = read_dump(result[1])
+        calls = [node for node in nodes.values() if node.kind == 'call_expression']
+        start = source.encode().index(b'len(')
+        self.assertEqual([(start, start + len(b'len("hi")'))], [(node.start, node.end) for node in calls])
+
+    def test_default_nesting_limit_and_diagnostic_cap(self):
+        path = self.root / 'nesting.jack'
+        path.write_text('i32 value = ' + '(' * 150 + '1' + ')' * 150 + ';')
+        status, output, errors = self.run_native(
+            'llvm', '--dump', 'syntax', '--diagnostic-format', 'stable', str(path))
+        self.assertEqual(1, status)
+        self.assertIn('parse.nesting-limit', errors)
+        self.assertTrue(output)
+        path.write_text('\n'.join(f'i32 value{i} = ;' for i in range(30)))
+        status, output, errors = self.run_native(
+            'llvm', '--dump', 'syntax', '--diagnostic-format', 'stable', str(path))
+        self.assertEqual(1, status)
+        self.assertEqual(20, errors.count('diagnostic\t'))
+        self.assertIn('omitted\t', errors)
+        self.assertEqual(30, output.count('root\t'))
+
+    def test_dump_options_are_order_independent_and_reject_duplicates(self):
+        path = self.root / 'options.jack'
+        path.write_text('i32 value = 1;')
+        first = self.run_native(
+            'llvm', '--dump', 'syntax', '--diagnostic-format', 'stable', str(path)
+        )
+        second = self.run_native(
+            'llvm', str(path), '--diagnostic-format', 'stable', '--dump', 'syntax'
+        )
+        self.assertEqual(first, second)
+        duplicate = self.run_native(
+            'llvm', '--dump', 'tokens', '--dump', 'syntax', str(path)
+        )
+        self.assertEqual(2, duplicate[0])
+        for options in [('--unknown',), ('--dump', 'wrong', str(path)),
+                        ('--diagnostic-format', 'stable', '--diagnostic-format', 'human', str(path))]:
+            self.assertEqual(2, self.run_native('llvm', *options)[0])
+
+    def test_generated_lexer_supports_all_bitwise_symbols(self):
+        path = self.root / 'bitwise.jack'
+        source = 'a && b || c << 1 >> 1 | d ^ ~e;'
+        path.write_text(source)
+        self.assert_runtime_parity(path, expected_dump(source))
 
 
 if __name__ == '__main__':

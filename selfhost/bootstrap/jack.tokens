@@ -4,7 +4,7 @@ token identifier = /[A-Za-z_]([A-Za-z0-9_])*/;
 token integer = /[0-9]+/;
 token floating = /[0-9]+\.[0-9]+/;
 token string = handler string /"/;
-token symbol = /==|!=|<=|>=|\.\.|=>|[{}();,:+\-.=<>!\[\]&*?%\/]/;
+token symbol = /==|!=|<=|>=|<<|>>|&&|\|\||\.\.|=>|[{}();,:+\-.=<>!\[\]&*?%\/|^~]/;
 token invalid = invalid;
 token formatted_string = handler formatted_string /f"/;
 

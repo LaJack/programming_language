@@ -1,0 +1,46 @@
+module std.path;
+
+import std.io;
+import std.memory;
+import std.string;
+
+unsafe extern "c" i32 jack_io_canonical_path(
+    str path, *inout u8 data, usize capacity, &out usize length
+);
+
+// Returns the required byte count. An undersized destination is left untouched.
+pub usize canonical_path_into(str path, &out u8[] destination) raises IoError {
+    usize length;
+    u8 unused;
+    unsafe {
+        *inout u8 data = raw(&out unused);
+        if (len(destination) != 0) { data = raw(&out destination[0]); }
+        i32 status = jack_io_canonical_path(path, data, usize(len(destination)), length);
+        if (status != 0) { raise IoError { code = status }; }
+    }
+    return length;
+}
+
+pub String(SystemAllocator) canonical_path(str path)
+    raises IoError, CapacityError, LayoutError, AllocationError, Utf8Error {
+    SystemAllocator allocator;
+    ByteBuffer(SystemAllocator) buffer(allocator);
+    usize required = usize(128);
+    while (true) {
+        // Slice lengths currently use i32 even though string lengths use usize.
+        if (required > usize(2147483647)) { raise LayoutError { }; }
+        buffer.reserve(required);
+        while (buffer.len() < required) { buffer.push(u8(0)); }
+        if (true) {
+            &inout u8[] destination = buffer.bytes_mut();
+            required = canonical_path_into(path, destination);
+        }
+        if (required <= buffer.len()) {
+            SystemAllocator result_allocator;
+            StringBuilder(SystemAllocator) result(result_allocator);
+            &in u8[] bytes = buffer.bytes();
+            result.append_bytes(bytes[0..i32(required)]);
+            return finish_string(SystemAllocator, result);
+        }
+    }
+}

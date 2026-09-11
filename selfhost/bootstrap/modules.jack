@@ -1,0 +1,588 @@
+module bootstrap.modules;
+
+import bootstrap.project;
+import bootstrap.frontend;
+import bootstrap.names;
+import bootstrap.source;
+import bootstrap.syntax;
+import bootstrap.lexer;
+import bootstrap.parser;
+import bootstrap.diagnostics;
+import std.collections.vector;
+import std.collections.arena;
+import std.memory;
+import std.string;
+import std.io;
+import std.path;
+
+pub struct ModuleNotFound { }
+
+pub struct ModuleHeader {
+    NameLink name;
+    bool valid;
+    DiagnosticOrigin origin;
+}
+
+// Validate before translating dots into directories, including configured stubs.
+bool valid_module_path(str name) {
+    bool first = true;
+    usize index = usize(0);
+    while (index < len(name)) {
+        u8 byte = jack_str_byte(name, index);
+        if (byte == u8(46)) {
+            if (first) { return false; }
+            first = true;
+        } else {
+            bool letter = (byte >= u8(65) && byte <= u8(90)) ||
+                (byte >= u8(97) && byte <= u8(122)) || byte == u8(95);
+            bool digit = byte >= u8(48) && byte <= u8(57);
+            if (letter == false && (first || digit == false)) { return false; }
+            first = false;
+        }
+        index = index + usize(1);
+    }
+    return first == false;
+}
+
+Diagnostic graph_diagnostic(DiagnosticOrigin origin, str code, str message)
+    raises CapacityError, LayoutError, AllocationError {
+    return match (&in origin) {
+        .none => locationless_diagnostic(DiagnosticSeverity.error, code, message),
+        .source(span) => source_diagnostic(DiagnosticSeverity.error, code, span, message),
+    };
+}
+
+void graph_error(&inout ProjectBuilder builder, &inout DiagnosticBag diagnostics,
+    DiagnosticOrigin origin, str code, str message)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    builder.mark_error();
+    Diagnostic diagnostic = graph_diagnostic(origin, code, message);
+    diagnostics.add(diagnostic);
+}
+
+SourceSpan graph_span(&in ProjectBuilder builder, NodeRef reference)
+    raises FrontendReferenceError {
+    &in FrontendProject project = builder.project();
+    &in FrontendContext context = project.frontend();
+    &in SyntaxNode node = context.node(reference);
+    return node.source_span();
+}
+
+bool graph_header_terminated(&in ProjectBuilder builder, SourceSpan span)
+    raises SourceMapError {
+    if (span.end_offset() <= span.start_offset()) { return false; }
+    &in FrontendProject project = builder.project();
+    &in FrontendContext context = project.frontend();
+    &in SourceMap sources = context.source_map();
+    return sources.byte_at(span.source_id(), span.end_offset() - usize(1)) == u8(59);
+}
+
+bool graph_has_recovered_nodes(&in ProjectBuilder builder, NodeRef reference)
+    raises FrontendReferenceError {
+    &in FrontendProject project = builder.project();
+    &in FrontendContext context = project.frontend();
+    &in SyntaxNode node = context.node(reference);
+    SyntaxKind kind = node.kind();
+    if (kind == SyntaxKind.invalid_declaration || kind == SyntaxKind.invalid_statement ||
+        kind == SyntaxKind.invalid_type || kind == SyntaxKind.invalid_pattern ||
+        kind == SyntaxKind.invalid_expression) { return true; }
+    usize index = usize(0);
+    while (index < child_count(node)) {
+        if (graph_has_recovered_nodes(builder, context.child(reference, index))) { return true; }
+        index = index + usize(1);
+    }
+    return false;
+}
+
+SyntaxData graph_payload(&in ProjectBuilder builder, NodeRef reference)
+    raises FrontendReferenceError {
+    &in FrontendProject project = builder.project();
+    &in FrontendContext context = project.frontend();
+    &in SyntaxNode node = context.node(reference);
+    return node.payload();
+}
+
+NodeRef graph_root(&in ProjectBuilder builder, ParsedFileId file, usize index)
+    raises FrontendReferenceError {
+    &in FrontendProject project = builder.project();
+    &in FrontendContext context = project.frontend();
+    return context.root(file, index);
+}
+
+usize graph_root_count(&in ProjectBuilder builder, ParsedFileId id)
+    raises FrontendReferenceError {
+    &in FrontendProject project = builder.project();
+    &in FrontendContext context = project.frontend();
+    &in ParsedFile file = context.file(id);
+    return file.root_count();
+}
+
+// Dotted names are reconstructed from tokens, not source gaps or comment text.
+String(SystemAllocator) graph_spelling(&in ProjectBuilder builder,
+    ParsedFileId id, SourceSpan span, bool first_only)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        SourceMapError, FrontendReferenceError, Utf8Error {
+    &in FrontendProject project = builder.project();
+    &in FrontendContext context = project.frontend();
+    &in SourceMap sources = context.source_map();
+    &in ParsedFile file = context.file(id);
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    usize index = usize(0);
+    bool finished = false;
+    while (index < file.token_count() && finished == false) {
+        &in Token token = file.token(index);
+        usize start = token.start_offset();
+        usize end = token.end_offset();
+        if (start >= span.start_offset() && end <= span.end_offset() && end > start) {
+            usize offset = start;
+            while (offset < end) {
+                output.append_byte(sources.byte_at(span.source_id(), offset));
+                offset = offset + usize(1);
+            }
+            finished = first_only;
+        }
+        index = index + usize(1);
+    }
+    return finish_string(SystemAllocator, output);
+}
+
+ModuleLink find_graph_module(&in ProjectBuilder builder, NameId name, bool by_path)
+    raises ProjectReferenceError {
+    &in FrontendProject project = builder.project();
+    usize index = usize(0);
+    while (index < project.module_count()) {
+        ModuleId id = project.module_at(index);
+        &in ModuleRecord record = project.module_record(id);
+        if (by_path) {
+            NameId path = record.canonical_path();
+            if (path.equals(name)) { return ModuleLink.present(id); }
+        } else {
+            NameLink module_name = record.module_name();
+            match (&in module_name) {
+                .none { }
+                .present(value) { if (value.equals(name)) { return ModuleLink.present(id); } }
+            }
+        }
+        index = index + usize(1);
+    }
+    return ModuleLink.none;
+}
+
+ModuleState graph_module_state(&in ProjectBuilder builder, ModuleId id)
+    raises ProjectReferenceError {
+    &in FrontendProject project = builder.project();
+    &in ModuleRecord record = project.module_record(id);
+    return record.load_state();
+}
+
+NameLink graph_module_name(&in ProjectBuilder builder, ModuleId id)
+    raises ProjectReferenceError {
+    &in FrontendProject project = builder.project();
+    &in ModuleRecord record = project.module_record(id);
+    return record.module_name();
+}
+
+String(SystemAllocator) graph_name_text(&in ProjectBuilder builder, NameId name)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+    &in FrontendProject project = builder.project();
+    SystemAllocator allocator;
+    String(SystemAllocator) result(allocator, project.name(name));
+    return result;
+}
+
+String(SystemAllocator) entry_directory(str path)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error {
+    usize end = usize(0);
+    usize index = usize(0);
+    while (index < len(path)) {
+        if (jack_str_byte(path, index) == u8(47)) { end = index + usize(1); }
+        index = index + usize(1);
+    }
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    index = usize(0);
+    while (index < end) {
+        output.append_byte(jack_str_byte(path, index));
+        index = index + usize(1);
+    }
+    return finish_string(SystemAllocator, output);
+}
+
+String(SystemAllocator) entry_stem(str path)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error {
+    usize start = usize(0);
+    usize end = len(path);
+    usize index = usize(0);
+    while (index < len(path)) {
+        u8 byte = jack_str_byte(path, index);
+        if (byte == u8(47)) { start = index + usize(1); end = len(path); }
+        if (byte == u8(46) && index > start) { end = index; }
+        index = index + usize(1);
+    }
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    index = start;
+    while (index < end) {
+        output.append_byte(jack_str_byte(path, index));
+        index = index + usize(1);
+    }
+    return finish_string(SystemAllocator, output);
+}
+
+String(SystemAllocator) stub_replacement(&in ProjectOptions options, str requested)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    usize index = options.stub_count();
+    while (index > usize(0)) {
+        index = index - usize(1);
+        &in ModuleOverride override = options.stub(index);
+        if (override.requested_name() == requested) {
+            SystemAllocator allocator;
+            String(SystemAllocator) result(allocator, override.replacement_name());
+            return result;
+        }
+    }
+    SystemAllocator allocator;
+    String(SystemAllocator) result(allocator, requested);
+    return result;
+}
+
+String(SystemAllocator) module_candidate(str root, str name, str suffix)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error {
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    output.append(root);
+    output.append("/");
+    usize index = usize(0);
+    while (index < len(name)) {
+        u8 byte = jack_str_byte(name, index);
+        if (byte == u8(46)) { output.append("/"); }
+        else { output.append_byte(byte); }
+        index = index + usize(1);
+    }
+    output.append(suffix);
+    return finish_string(SystemAllocator, output);
+}
+
+String(SystemAllocator) resolve_module_path(str name, str directory, &in ProjectOptions options)
+    raises ModuleNotFound, IoError, Utf8Error, CapacityError, LayoutError, AllocationError, BoundsError {
+    usize root_index = usize(0);
+    while (root_index <= options.module_root_count()) {
+        usize suffix_index = usize(0);
+        while (suffix_index < usize(2)) {
+            str root = directory;
+            if (root_index > usize(0)) { root = options.module_root(root_index - usize(1)); }
+            str suffix = ".jack";
+            if (suffix_index == usize(1)) { suffix = ".jk"; }
+            String(SystemAllocator) candidate = module_candidate(root, name, suffix);
+            try {
+                Metadata info = metadata(candidate.as_str());
+                if (info.regular_file()) { return canonical_path(candidate.as_str()); }
+            } catch IoError error {
+                if (error.error_code() != 2 && error.error_code() != 20) { rethrow; }
+            }
+            suffix_index = suffix_index + usize(1);
+        }
+        root_index = root_index + usize(1);
+    }
+    raise ModuleNotFound { };
+}
+
+ModuleHeader read_module_header(&inout ProjectBuilder builder, ParsedFileId file,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, NameReferenceError, Utf8Error {
+    ModuleHeader result = ModuleHeader {
+        name = NameLink.none, valid = true, origin = DiagnosticOrigin.none
+    };
+    bool seen_module = false;
+    bool seen_import = false;
+    bool seen_body = false;
+    usize index = usize(0);
+    while (index < graph_root_count(builder, file)) {
+        NodeRef node = graph_root(builder, file, index);
+        SyntaxData data = graph_payload(builder, node);
+        SourceSpan span = graph_span(builder, node);
+        match (&in data) {
+            .module_declaration(path) {
+                result.origin = DiagnosticOrigin.source(span);
+                if (seen_module || seen_import || seen_body) {
+                    graph_error(builder, diagnostics, DiagnosticOrigin.source(span),
+                        "module.declaration-order", "module declaration must appear once, before imports and code");
+                    result.valid = false;
+                }
+                String(SystemAllocator) name = graph_spelling(builder, file, path, false);
+                if (valid_module_path(name.as_str()) && graph_header_terminated(builder, span)) {
+                    result.name = NameLink.present(builder.intern(name.as_str()));
+                } else {
+                    result.valid = false;
+                    graph_error(builder, diagnostics, DiagnosticOrigin.source(span),
+                        "module.invalid-name", "expected a dotted module name");
+                }
+                seen_module = true;
+            }
+            .import_declaration(_, _, _) { seen_import = true; }
+            .invalid_declaration {
+                String(SystemAllocator) first = graph_spelling(builder, file, span, true);
+                if (first.as_str() == "module") { result.valid = false; }
+                else { if (first.as_str() != "import") { seen_body = true; } }
+            }
+            _ { seen_body = true; }
+        }
+        index = index + usize(1);
+    }
+    return result;
+}
+
+void report_cycle(&inout ProjectBuilder builder, &inout DiagnosticBag diagnostics, DiagnosticOrigin origin)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        FrontendReferenceError, ProjectReferenceError {
+    builder.mark_error();
+    Diagnostic diagnostic = graph_diagnostic(origin, "module.cycle", "cyclic module import");
+    &in FrontendProject project = builder.project();
+    &in FrontendContext context = project.frontend();
+    usize index = usize(0);
+    while (index < project.import_count()) {
+        &in ImportRecord edge = project.import_edge(index);
+        if (edge.load_state() == ImportState.pending) {
+            &in SyntaxNode node = context.node(edge.syntax_node());
+            SourceSpan span = node.source_span();
+            bool primary = match (&in origin) {
+                .none => false,
+                .source(location) => location.same_range(span),
+            };
+            if (primary == false) { diagnostic.add_secondary(span, "import on the active dependency path"); }
+        }
+        index = index + usize(1);
+    }
+    diagnostics.add(diagnostic);
+}
+
+ModuleLink load_named_module(&inout ProjectBuilder builder, NameId name, str directory,
+    &in ProjectOptions options, &inout DiagnosticBag diagnostics, DiagnosticOrigin origin)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
+        ProjectReferenceError, NameReferenceError, Utf8Error {
+    ModuleLink existing = find_graph_module(builder, name, false);
+    match (&in existing) {
+        .none { }
+        .present(id) {
+            if (graph_module_state(builder, id) == ModuleState.loading) {
+                report_cycle(builder, diagnostics, origin);
+                return ModuleLink.none;
+            }
+            return ModuleLink.present(id);
+        }
+    }
+    String(SystemAllocator) text = graph_name_text(builder, name);
+    try {
+        String(SystemAllocator) path = resolve_module_path(text.as_str(), directory, options);
+        return load_canonical_module(builder, path.as_str(), NameLink.present(name), directory, options, diagnostics, origin);
+    } catch ModuleNotFound {
+        graph_error(builder, diagnostics, origin, "module.not-found", text.as_str());
+    } catch IoError {
+        graph_error(builder, diagnostics, origin, "module.path", text.as_str());
+    }
+    return ModuleLink.none;
+}
+
+ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLink expected,
+    str directory, &in ProjectOptions options, &inout DiagnosticBag diagnostics, DiagnosticOrigin origin)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
+        ProjectReferenceError, NameReferenceError, Utf8Error {
+    NameId path_name = builder.intern(path);
+    ModuleLink existing = find_graph_module(builder, path_name, true);
+    match (&in existing) {
+        .none { }
+        .present(id) {
+            NameLink actual = graph_module_name(builder, id);
+            match (&in expected) {
+                .none { }
+                .present(requested) {
+                    match (&in actual) {
+                        .none { }
+                        .present(name) {
+                            if (requested.equals(name) == false) {
+                                graph_error(builder, diagnostics, origin, "module.identity-conflict", path);
+                                return ModuleLink.none;
+                            }
+                        }
+                    }
+                }
+            }
+            if (graph_module_state(builder, id) == ModuleState.loading) {
+                report_cycle(builder, diagnostics, origin);
+                return ModuleLink.none;
+            }
+            return ModuleLink.present(id);
+        }
+    }
+    ParsedFileId file;
+    try {
+        File input = open_read(path);
+        SystemAllocator allocator;
+        String(SystemAllocator) text = read_to_string(SystemAllocator, input, allocator);
+        close(input);
+        file = builder.parse_source(path, text, diagnostics, options.parser_options());
+    } catch IoError {
+        graph_error(builder, diagnostics, origin, "module.read", path);
+        return ModuleLink.none;
+    } catch Utf8Error {
+        graph_error(builder, diagnostics, origin, "module.utf8", path);
+        return ModuleLink.none;
+    }
+    ModuleHeader header = read_module_header(builder, file, diagnostics);
+    NameLink actual = header.name;
+    NameLink inferred = actual;
+    if (header.valid) {
+        match (&in actual) {
+            .none {
+                inferred = expected;
+                match (&in expected) {
+                    .none {
+                        String(SystemAllocator) stem = entry_stem(path);
+                        inferred = NameLink.present(builder.intern(stem.as_str()));
+                    }
+                    .present(_) { }
+                }
+            }
+            .present(name) {
+                match (&in expected) {
+                    .none { }
+                    .present(requested) {
+                        if (requested.equals(name) == false) {
+                            builder.mark_error();
+                            Diagnostic diagnostic = graph_diagnostic(header.origin,
+                                "module.name-mismatch", "declared module name does not match the requested import");
+                            match (&in origin) {
+                                .none { }
+                                .source(span) { diagnostic.add_secondary(span, "requested by this import"); }
+                            }
+                            diagnostics.add(diagnostic);
+                            header.valid = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    actual = inferred;
+    ModuleId id;
+    bool incomplete = header.valid == false;
+    if (header.valid) {
+        match (&in actual) {
+            .none { raise ProjectReferenceError { }; }
+            .present(name) {
+                ModuleLink conflict = find_graph_module(builder, name, false);
+                match (&in conflict) {
+                    .none { id = builder.add_module(name, path_name, file, ModuleState.loading); }
+                    .present(_) {
+                        graph_error(builder, diagnostics, origin, "module.identity-conflict", path);
+                        id = builder.add_incomplete_module(path_name, file);
+                        incomplete = true;
+                    }
+                }
+            }
+        }
+    } else { id = builder.add_incomplete_module(path_name, file); }
+    bool seen_body = false;
+    bool damaged_header = false;
+    usize index = usize(0);
+    while (index < graph_root_count(builder, file)) {
+        NodeRef node = graph_root(builder, file, index);
+        SyntaxData data = graph_payload(builder, node);
+        match (&in data) {
+            .module_declaration(_) {
+                damaged_header = graph_header_terminated(builder, graph_span(builder, node)) == false;
+            }
+            .import_declaration(import_path, alias_span, _) {
+                SourceSpan span = graph_span(builder, node);
+                if (seen_body) {
+                    graph_error(builder, diagnostics, DiagnosticOrigin.source(span),
+                        "module.import-order", "imports must appear before code");
+                    incomplete = true;
+                }
+                String(SystemAllocator) requested_text = graph_spelling(builder, file, import_path, false);
+                String(SystemAllocator) effective_text = stub_replacement(options, requested_text.as_str());
+                NameLink requested = NameLink.none;
+                NameLink effective = NameLink.none;
+                damaged_header = graph_header_terminated(builder, span) == false;
+                if (valid_module_path(requested_text.as_str()) && damaged_header == false) {
+                    requested = NameLink.present(builder.intern(requested_text.as_str()));
+                    if (valid_module_path(effective_text.as_str())) {
+                        effective = NameLink.present(builder.intern(effective_text.as_str()));
+                    }
+                }
+                NameLink alias = NameLink.none;
+                if (alias_span.end_offset() > alias_span.start_offset()) {
+                    String(SystemAllocator) alias_text = graph_spelling(builder, file, alias_span, false);
+                    alias = NameLink.present(builder.intern(alias_text.as_str()));
+                }
+                usize edge = builder.add_import(id, node, requested, effective, alias);
+                ModuleLink target = ModuleLink.none;
+                match (&in effective) {
+                    .none {
+                        graph_error(builder, diagnostics, DiagnosticOrigin.source(span),
+                            "module.invalid-name", "expected a dotted import or stub replacement name");
+                    }
+                    .present(name) {
+                        target = load_named_module(builder, name, directory, options, diagnostics, DiagnosticOrigin.source(span));
+                    }
+                }
+                builder.resolve_import(edge, target);
+                match (&in target) {
+                    .none { incomplete = true; }
+                    .present(imported) {
+                        if (graph_module_state(builder, imported) == ModuleState.incomplete) { incomplete = true; }
+                    }
+                }
+            }
+            .invalid_declaration {
+                SourceSpan span = graph_span(builder, node);
+                String(SystemAllocator) first = graph_spelling(builder, file, span, true);
+                if (first.as_str() == "import") {
+                    usize edge = builder.add_import(id, node, NameLink.none, NameLink.none, NameLink.none);
+                    builder.resolve_import(edge, ModuleLink.none);
+                    incomplete = true;
+                } else {
+                    if (first.as_str() != "module" && damaged_header == false) { seen_body = true; }
+                }
+            }
+            _ {
+                if (damaged_header == false || graph_has_recovered_nodes(builder, node) == false) {
+                    seen_body = true;
+                    damaged_header = false;
+                }
+            }
+        }
+        index = index + usize(1);
+    }
+    if (true) {
+        &in FrontendProject project = builder.project();
+        &in FrontendContext context = project.frontend();
+        &in ParsedFile parsed = context.file(file);
+        if (parsed.has_errors()) { incomplete = true; }
+    }
+    ModuleState state = ModuleState.loaded;
+    if (incomplete) { state = ModuleState.incomplete; }
+    builder.set_module_state(id, state);
+    return ModuleLink.present(id);
+}
+
+pub FrontendProject load_module_graph(str entry, &in ProjectOptions options,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
+        ProjectReferenceError, NameReferenceError, Utf8Error {
+    ProjectBuilder builder = project_builder();
+    try {
+        String(SystemAllocator) path = canonical_path(entry);
+        String(SystemAllocator) directory = entry_directory(path.as_str());
+        load_canonical_module(builder, path.as_str(), NameLink.none, directory.as_str(), options,
+            diagnostics, DiagnosticOrigin.none);
+    } catch IoError {
+        graph_error(builder, diagnostics, DiagnosticOrigin.none, "module.entry", entry);
+    }
+    return finish_project(builder);
+}

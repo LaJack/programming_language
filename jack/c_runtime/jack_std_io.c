@@ -87,6 +87,26 @@ static char *jack_io_path(jack_str path) {
     return buffer;
 }
 
+int32_t jack_io_canonical_path(jack_str path, uint8_t *data, size_t capacity, size_t *length) {
+    *length = 0;
+    if (path.len == 0 || memchr(path.data, '\0', path.len) != NULL) return EINVAL;
+    char *input = jack_io_path(path);
+    if (input == NULL) return errno ? errno : ENOMEM;
+    char *resolved = realpath(input, NULL);
+    int error = errno;
+    free(input);
+    if (resolved == NULL) return error ? error : EIO;
+    size_t size = strlen(resolved);
+    if (!jack_valid_utf8((const uint8_t *)resolved, size)) {
+        free(resolved);
+        return EILSEQ;
+    }
+    *length = size;
+    if (size <= capacity) memcpy(data, resolved, size);
+    free(resolved);
+    return 0;
+}
+
 FILE *jack_io_open(jack_str path, uint8_t mode) {
     static const char *modes[] = {"rb", "wb", "ab", "r+b"};
     if (mode >= sizeof(modes) / sizeof(modes[0])) {

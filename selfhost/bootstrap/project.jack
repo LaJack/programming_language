@@ -1,0 +1,540 @@
+module bootstrap.project;
+
+import bootstrap.frontend;
+import bootstrap.names;
+import bootstrap.source;
+import bootstrap.syntax;
+import bootstrap.parser;
+import bootstrap.lexer;
+import bootstrap.diagnostics;
+import std.collections.vector;
+import std.collections.arena;
+import std.memory;
+import std.string;
+
+pub struct ProjectReferenceError { }
+
+pub struct ModuleId {
+    usize project;
+    usize index;
+    bool equals(&in self, ModuleId other) {
+        return self.project == other.project && self.index == other.index;
+    }
+}
+pub struct SymbolId {
+    usize project;
+    usize index;
+    bool equals(&in self, SymbolId other) {
+        return self.project == other.project && self.index == other.index;
+    }
+}
+pub struct ScopeId {
+    usize project;
+    usize index;
+    bool equals(&in self, ScopeId other) {
+        return self.project == other.project && self.index == other.index;
+    }
+}
+
+pub union ModuleLink { none; present(ModuleId id); }
+pub union NameLink { none; present(NameId id); }
+pub union SymbolLink { none; present(SymbolId id); }
+pub union ScopeLink { none; present(ScopeId id); }
+pub union ScopeLocation { builtin; module_file(ParsedFileId file); source(NodeRef node); }
+pub union ModuleState { loading; loaded; incomplete; }
+pub union ImportState { pending; resolved; invalid; }
+pub union SymbolOrigin { builtin; source(NodeRef node, SourceSpan name); }
+pub union SymbolKind {
+    builtin_type; builtin_function; module_alias;
+    function; structure; sum_type; view_type; interface_type; implementation;
+    inherent_method; interface_requirement; implementation_method;
+    global; constant; computed_type; type_parameter; parameter; local;
+    field; variant; catch_binding; match_binding; self_type;
+}
+pub union OccurrenceRole {
+    declaration; read; write; call; type_use; import_use; member; pattern;
+}
+pub union DeferredReason {
+    receiver_type; generic_type; computed_type; pattern_type; comptime_selection;
+}
+pub union ReferenceStatus {
+    resolved(SymbolId symbol);
+    deferred(DeferredReason reason);
+    invalid;
+}
+
+pub struct ModuleRecord {
+    NameLink name;
+    NameId path;
+    ParsedFileId file;
+    ModuleState state;
+    NameLink module_name(&in self) { return self.name; }
+    NameId canonical_path(&in self) { return self.path; }
+    ParsedFileId parsed_file(&in self) { return self.file; }
+    ModuleState load_state(&in self) { return self.state; }
+}
+
+pub struct ImportRecord {
+    ModuleId importer;
+    NodeRef declaration;
+    NameLink requested;
+    NameLink effective;
+    NameLink alias;
+    ModuleLink target;
+    ImportState state;
+    ModuleId importing_module(&in self) { return self.importer; }
+    NodeRef syntax_node(&in self) { return self.declaration; }
+    NameLink requested_name(&in self) { return self.requested; }
+    NameLink effective_name(&in self) { return self.effective; }
+    NameLink import_alias(&in self) { return self.alias; }
+    ModuleLink imported_module(&in self) { return self.target; }
+    ImportState load_state(&in self) { return self.state; }
+}
+
+pub struct ScopeRecord {
+    ScopeLink parent;
+    ModuleLink module_link;
+    SymbolLink owner;
+    ScopeLocation location;
+    ScopeLink parent_scope(&in self) { return self.parent; }
+    ModuleLink module_owner(&in self) { return self.module_link; }
+    SymbolLink symbol_owner(&in self) { return self.owner; }
+    ScopeLocation source_location(&in self) { return self.location; }
+}
+
+pub struct SymbolRecord {
+    NameId name;
+    SymbolKind kind;
+    ScopeId scope;
+    SymbolLink owner;
+    SymbolOrigin origin;
+    DeclarationModifiers modifiers;
+    bool poisoned;
+    NameId symbol_name(&in self) { return self.name; }
+    SymbolKind symbol_kind(&in self) { return self.kind; }
+    ScopeId lexical_scope(&in self) { return self.scope; }
+    SymbolLink symbol_owner(&in self) { return self.owner; }
+    SymbolOrigin declaration_origin(&in self) { return self.origin; }
+    DeclarationModifiers contracts(&in self) { return self.modifiers; }
+    bool is_poisoned(&in self) { return self.poisoned; }
+}
+
+pub struct ReferenceOccurrence {
+    NodeRef node;
+    SourceSpan span;
+    ScopeId scope;
+    OccurrenceRole role;
+    ReferenceStatus status;
+    NodeRef syntax_node(&in self) { return self.node; }
+    SourceSpan name_span(&in self) { return self.span; }
+    ScopeId lexical_scope(&in self) { return self.scope; }
+    OccurrenceRole occurrence_role(&in self) { return self.role; }
+    ReferenceStatus binding(&in self) { return self.status; }
+}
+
+pub struct ModuleOverride {
+    String(SystemAllocator) requested;
+    String(SystemAllocator) replacement;
+    str requested_name(&in self) { return self.requested.as_str(); }
+    str replacement_name(&in self) { return self.replacement.as_str(); }
+}
+
+pub struct ProjectOptions {
+    Vector(String(SystemAllocator), SystemAllocator) roots;
+    Vector(ModuleOverride, SystemAllocator) overrides;
+    ParserOptions parser;
+    usize maximum;
+
+    void add_module_root(&inout self, str path)
+        raises CapacityError, LayoutError, AllocationError {
+        SystemAllocator allocator;
+        String(SystemAllocator) owned(allocator, path);
+        self.roots.push(owned);
+    }
+    void add_stub(&inout self, str requested, str replacement)
+        raises CapacityError, LayoutError, AllocationError {
+        SystemAllocator left_allocator;
+        String(SystemAllocator) left(left_allocator, requested);
+        SystemAllocator right_allocator;
+        String(SystemAllocator) right(right_allocator, replacement);
+        self.overrides.push(ModuleOverride { requested = move left, replacement = move right });
+    }
+    void set_parser_options(&inout self, ParserOptions options) { self.parser = options; }
+    void set_maximum_diagnostics(&inout self, usize maximum) {
+        self.maximum = maximum;
+        if (maximum == usize(0)) { self.maximum = usize(1); }
+    }
+    ParserOptions parser_options(&in self) { return self.parser; }
+    usize maximum_diagnostics(&in self) { return self.maximum; }
+    usize module_root_count(&in self) { return self.roots.len(); }
+    str module_root(&in self, usize index) raises BoundsError {
+        &in String(SystemAllocator) root = self.roots.get(index);
+        return root.as_str();
+    }
+    usize stub_count(&in self) { return self.overrides.len(); }
+    &in ModuleOverride stub(&in self, usize index) raises BoundsError {
+        return self.overrides.get(index);
+    }
+}
+
+pub ProjectOptions project_options() raises CapacityError, LayoutError, AllocationError {
+    SystemAllocator roots_allocator;
+    Vector(String(SystemAllocator), SystemAllocator) roots(roots_allocator, usize(0));
+    SystemAllocator overrides_allocator;
+    Vector(ModuleOverride, SystemAllocator) overrides(overrides_allocator, usize(0));
+    ParserOptions parser(usize(128));
+    return ProjectOptions {
+        roots = move roots, overrides = move overrides,
+        parser = parser, maximum = usize(100),
+    };
+}
+
+pub struct FrontendProject {
+    FrontendContext context;
+    NameInterner names;
+    Vector(ModuleRecord, SystemAllocator) modules;
+    Vector(ImportRecord, SystemAllocator) imports;
+    Vector(SymbolRecord, SystemAllocator) symbols;
+    Vector(ScopeRecord, SystemAllocator) scopes;
+    Vector(ReferenceOccurrence, SystemAllocator) occurrences;
+    bool errors;
+    usize deferred;
+
+    &in FrontendContext frontend(&in self) { return &in self.context; }
+    bool has_errors(&in self) { return self.errors; }
+    usize deferred_count(&in self) { return self.deferred; }
+    usize name_count(&in self) { return self.names.len(); }
+    usize module_count(&in self) { return self.modules.len(); }
+    usize import_count(&in self) { return self.imports.len(); }
+    usize symbol_count(&in self) { return self.symbols.len(); }
+    usize scope_count(&in self) { return self.scopes.len(); }
+    usize occurrence_count(&in self) { return self.occurrences.len(); }
+
+    str name(&in self, NameId id) raises ProjectReferenceError {
+        try { return self.names.text(id); }
+        catch NameReferenceError { raise ProjectReferenceError { }; }
+    }
+    ModuleId module_at(&in self, usize index) raises ProjectReferenceError {
+        if (self.context.identity_value() == usize(0) || index >= self.modules.len()) {
+            raise ProjectReferenceError { };
+        }
+        return ModuleId { project = self.context.identity_value(), index = index };
+    }
+    SymbolId symbol_at(&in self, usize index) raises ProjectReferenceError {
+        if (self.context.identity_value() == usize(0) || index >= self.symbols.len()) {
+            raise ProjectReferenceError { };
+        }
+        return SymbolId { project = self.context.identity_value(), index = index };
+    }
+    ScopeId scope_at(&in self, usize index) raises ProjectReferenceError {
+        if (self.context.identity_value() == usize(0) || index >= self.scopes.len()) {
+            raise ProjectReferenceError { };
+        }
+        return ScopeId { project = self.context.identity_value(), index = index };
+    }
+    &in ModuleRecord module_record(&in self, ModuleId id) raises ProjectReferenceError {
+        ModuleId expected = self.module_at(id.index);
+        if (id.equals(expected) == false) { raise ProjectReferenceError { }; }
+        try { return self.modules.get(id.index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in SymbolRecord symbol(&in self, SymbolId id) raises ProjectReferenceError {
+        SymbolId expected = self.symbol_at(id.index);
+        if (id.equals(expected) == false) { raise ProjectReferenceError { }; }
+        try { return self.symbols.get(id.index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in ScopeRecord scope(&in self, ScopeId id) raises ProjectReferenceError {
+        ScopeId expected = self.scope_at(id.index);
+        if (id.equals(expected) == false) { raise ProjectReferenceError { }; }
+        try { return self.scopes.get(id.index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in ReferenceOccurrence occurrence(&in self, usize index) raises ProjectReferenceError {
+        try { return self.occurrences.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in ImportRecord import_edge(&in self, usize index) raises ProjectReferenceError {
+        try { return self.imports.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+}
+
+pub FrontendProject frontend_project()
+    raises CapacityError, LayoutError, AllocationError, SourceMapError, NameReferenceError {
+    FrontendContext context = frontend_context();
+    NameInterner names = name_interner();
+    SystemAllocator module_allocator;
+    Vector(ModuleRecord, SystemAllocator) modules(module_allocator, usize(0));
+    SystemAllocator import_allocator;
+    Vector(ImportRecord, SystemAllocator) imports(import_allocator, usize(0));
+    SystemAllocator symbol_allocator;
+    Vector(SymbolRecord, SystemAllocator) symbols(symbol_allocator, usize(0));
+    SystemAllocator scope_allocator;
+    Vector(ScopeRecord, SystemAllocator) scopes(scope_allocator, usize(0));
+    SystemAllocator occurrence_allocator;
+    Vector(ReferenceOccurrence, SystemAllocator) occurrences(occurrence_allocator, usize(0));
+    return FrontendProject {
+        context = move context, names = move names, modules = move modules, imports = move imports,
+        symbols = move symbols, scopes = move scopes, occurrences = move occurrences,
+        errors = false, deferred = usize(0),
+    };
+}
+
+pub struct ProjectBuilder {
+    FrontendProject value;
+    &in FrontendProject project(&in self) { return &in self.value; }
+    void mark_error(&inout self) { self.value.errors = true; }
+    NameId intern(&inout self, str name)
+        raises CapacityError, LayoutError, AllocationError, NameReferenceError {
+        return self.value.names.intern(name);
+    }
+
+    ParsedFileId parse_source(&inout self, str path, move String(SystemAllocator) text,
+        &inout DiagnosticBag diagnostics, ParserOptions options)
+        raises CapacityError, LayoutError, AllocationError, SourceMapError, BoundsError,
+            ArenaHandleError, SyntaxValidationError, FrontendReferenceError {
+        SourceId source = self.value.context.add_source(path, text);
+        Vector(Token, SystemAllocator) tokens;
+        if (true) {
+            &in SourceMap sources = self.value.context.source_map();
+            &in u8[] bytes = sources.bytes(source);
+            SystemAllocator allocator;
+            tokens = lex(SystemAllocator, source, bytes, allocator);
+        }
+        ParsedFileId file = parse_recovering_with_options(
+            self.value.context, source, tokens, diagnostics, options);
+        &in ParsedFile parsed = self.value.context.file(file);
+        if (parsed.has_errors()) { self.value.errors = true; }
+        return file;
+    }
+
+    ModuleId add_module(&inout self, NameId name, NameId path, ParsedFileId file, ModuleState state)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+            FrontendReferenceError {
+        self.value.name(name);
+        self.value.name(path);
+        self.value.context.file(file);
+        usize index = self.value.modules.len();
+        self.value.modules.push(ModuleRecord { name = NameLink.present(name), path = path, file = file, state = state });
+        if (state == ModuleState.incomplete) { self.value.errors = true; }
+        return self.value.module_at(index);
+    }
+
+    ModuleId add_incomplete_module(&inout self, NameId path, ParsedFileId file)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+            FrontendReferenceError {
+        self.value.name(path);
+        self.value.context.file(file);
+        usize index = self.value.modules.len();
+        self.value.modules.push(ModuleRecord {
+            name = NameLink.none, path = path, file = file, state = ModuleState.incomplete,
+        });
+        self.value.errors = true;
+        return self.value.module_at(index);
+    }
+
+    void set_module_state(&inout self, ModuleId id, ModuleState state)
+        raises ProjectReferenceError {
+        self.value.module_record(id);
+        try {
+            &inout ModuleRecord record = self.value.modules.get_mut(id.index);
+            record.state = state;
+        } catch BoundsError { raise ProjectReferenceError { }; }
+        if (state == ModuleState.incomplete) { self.value.errors = true; }
+    }
+
+    usize add_import(&inout self, ModuleId importer, NodeRef declaration,
+        NameLink requested, NameLink effective, NameLink alias)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+            FrontendReferenceError {
+        if (true) {
+            &in SyntaxNode node = self.value.context.node(declaration);
+            if (node.kind() != SyntaxKind.import_declaration
+                && node.kind() != SyntaxKind.invalid_declaration) { raise ProjectReferenceError { }; }
+        }
+        if (true) {
+            &in ModuleRecord record = self.value.module_record(importer);
+            ParsedFileId file = record.parsed_file();
+            if (file.equals(declaration.file_id()) == false) { raise ProjectReferenceError { }; }
+        }
+        check_name_link(self.value, requested);
+        check_name_link(self.value, effective);
+        check_name_link(self.value, alias);
+        usize index = self.value.imports.len();
+        self.value.imports.push(ImportRecord {
+            importer = importer, declaration = declaration, requested = requested,
+            effective = effective, alias = alias, target = ModuleLink.none, state = ImportState.pending,
+        });
+        return index;
+    }
+
+    void resolve_import(&inout self, usize index, ModuleLink target)
+        raises ProjectReferenceError {
+        check_module_link(self.value, target);
+        bool failed = match (&in target) { .none => true, .present(_) => false, };
+        try {
+            &inout ImportRecord record = self.value.imports.get_mut(index);
+            record.target = target;
+            record.state = ImportState.resolved;
+            if (failed) { record.state = ImportState.invalid; }
+        } catch BoundsError { raise ProjectReferenceError { }; }
+        if (failed) { self.value.errors = true; }
+    }
+
+    ScopeId add_scope(&inout self, ScopeLink parent, ModuleLink module_link, SymbolLink owner)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+        check_scope_link(self.value, parent);
+        check_module_link(self.value, module_link);
+        check_symbol_link(self.value, owner);
+        ScopeLocation location = ScopeLocation.builtin;
+        match (&in module_link) {
+            .none { }
+            .present(id) {
+                &in ModuleRecord record = self.value.module_record(id);
+                location = ScopeLocation.module_file(record.parsed_file());
+            }
+        }
+        usize index = self.value.scopes.len();
+        self.value.scopes.push(ScopeRecord {
+            parent = parent, module_link = module_link, owner = owner, location = location,
+        });
+        return self.value.scope_at(index);
+    }
+
+    ScopeId add_lexical_scope(&inout self, ScopeId parent, SymbolLink owner, NodeRef node)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+            FrontendReferenceError {
+        self.value.context.node(node);
+        check_symbol_link(self.value, owner);
+        ModuleLink module_link = ModuleLink.none;
+        if (true) {
+            &in ScopeRecord enclosing = self.value.scope(parent);
+            module_link = enclosing.module_owner();
+        }
+        match (&in module_link) {
+            .none { }
+            .present(id) {
+                &in ModuleRecord record = self.value.module_record(id);
+                ParsedFileId file = record.parsed_file();
+                if (file.equals(node.file_id()) == false) { raise ProjectReferenceError { }; }
+            }
+        }
+        usize index = self.value.scopes.len();
+        self.value.scopes.push(ScopeRecord {
+            parent = ScopeLink.present(parent), module_link = module_link,
+            owner = owner, location = ScopeLocation.source(node),
+        });
+        return self.value.scope_at(index);
+    }
+
+    SymbolId add_symbol(&inout self, NameId name, SymbolKind kind, ScopeId scope,
+        SymbolLink owner, SymbolOrigin origin, DeclarationModifiers modifiers)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+            FrontendReferenceError {
+        self.value.name(name);
+        self.value.scope(scope);
+        check_symbol_link(self.value, owner);
+        match (&in origin) {
+            .builtin { }
+            .source(node, span) { check_source_origin(self.value, node, span); }
+        }
+        usize index = self.value.symbols.len();
+        self.value.symbols.push(SymbolRecord {
+            name = name, kind = kind, scope = scope, owner = owner,
+            origin = origin, modifiers = modifiers, poisoned = false,
+        });
+        return self.value.symbol_at(index);
+    }
+
+    void poison(&inout self, SymbolId id) raises ProjectReferenceError {
+        self.value.symbol(id);
+        try {
+            &inout SymbolRecord symbol = self.value.symbols.get_mut(id.index);
+            symbol.poisoned = true;
+        } catch BoundsError { raise ProjectReferenceError { }; }
+        self.value.errors = true;
+    }
+
+    usize add_occurrence(&inout self, NodeRef node, SourceSpan span,
+        ScopeId scope, OccurrenceRole role, ReferenceStatus status)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+            FrontendReferenceError {
+        check_source_origin(self.value, node, span);
+        self.value.scope(scope);
+        check_reference_status(self.value, status);
+        usize index = self.value.occurrences.len();
+        self.value.occurrences.push(ReferenceOccurrence {
+            node = node, span = span, scope = scope, role = role, status = status,
+        });
+        match (&in status) {
+            .resolved(_) { }
+            .deferred(_) { self.value.deferred = self.value.deferred + usize(1); }
+            .invalid { self.value.errors = true; }
+        }
+        return index;
+    }
+
+    void bind_occurrence(&inout self, usize index, ReferenceStatus status)
+        raises ProjectReferenceError {
+        check_reference_status(self.value, status);
+        try {
+            &inout ReferenceOccurrence occurrence = self.value.occurrences.get_mut(index);
+            match (&in occurrence.status) {
+                .resolved(_) { }
+                .deferred(_) { self.value.deferred = self.value.deferred - usize(1); }
+                .invalid { }
+            }
+            occurrence.status = status;
+        } catch BoundsError { raise ProjectReferenceError { }; }
+        match (&in status) {
+            .resolved(_) { }
+            .deferred(_) { self.value.deferred = self.value.deferred + usize(1); }
+            .invalid { self.value.errors = true; }
+        }
+    }
+}
+
+pub ProjectBuilder project_builder()
+    raises CapacityError, LayoutError, AllocationError, SourceMapError, NameReferenceError {
+    FrontendProject value = frontend_project();
+    return ProjectBuilder { value = move value };
+}
+
+pub FrontendProject finish_project(move ProjectBuilder builder) {
+    FrontendProject result = move builder.value;
+    return result;
+}
+
+void check_module_link(&in FrontendProject project, ModuleLink link) raises ProjectReferenceError {
+    match (&in link) { .none { } .present(id) { project.module_record(id); } }
+}
+void check_name_link(&in FrontendProject project, NameLink link) raises ProjectReferenceError {
+    match (&in link) { .none { } .present(id) { project.name(id); } }
+}
+void check_symbol_link(&in FrontendProject project, SymbolLink link) raises ProjectReferenceError {
+    match (&in link) { .none { } .present(id) { project.symbol(id); } }
+}
+void check_scope_link(&in FrontendProject project, ScopeLink link) raises ProjectReferenceError {
+    match (&in link) { .none { } .present(id) { project.scope(id); } }
+}
+void check_reference_status(&in FrontendProject project, ReferenceStatus status)
+    raises ProjectReferenceError {
+    match (&in status) {
+        .resolved(id) { project.symbol(id); }
+        .deferred(_) { }
+        .invalid { }
+    }
+}
+void check_source_origin(&in FrontendProject project, NodeRef reference, SourceSpan span)
+    raises ProjectReferenceError, FrontendReferenceError {
+    &in SyntaxNode node = project.context.node(reference);
+    SourceSpan extent = node.source_span();
+    SourceId source = extent.source_id();
+    if (source.equals(span.source_id()) == false
+        || span.start_offset() < extent.start_offset()
+        || span.end_offset() > extent.end_offset()
+        || span.start_offset() > span.end_offset()) {
+        raise ProjectReferenceError { };
+    }
+}

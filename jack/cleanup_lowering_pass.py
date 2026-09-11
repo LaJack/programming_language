@@ -173,6 +173,15 @@ class HIRStaticCleanupLoweringPass:
                 self._merge_errors(
                     errors, self._hir_expression_raised_errors(branch.condition)
                 )
+                self._merge_errors(
+                    errors,
+                    self._hir_statement_list_raised_errors(branch.body, dict(env)),
+                )
+            if statement.else_body is not None:
+                self._merge_errors(
+                    errors,
+                    self._hir_statement_list_raised_errors(statement.else_body, dict(env)),
+                )
         elif isinstance(statement, HIRMatch):
             self._merge_errors(
                 errors, self._hir_expression_raised_errors(statement.scrutinee)
@@ -187,17 +196,6 @@ class HIRStaticCleanupLoweringPass:
                         errors,
                         self._hir_statement_list_raised_errors(arm.body, dict(env)),
                     )
-                self._merge_errors(
-                    errors,
-                    self._hir_statement_list_raised_errors(branch.body, dict(env)),
-                )
-            if statement.else_body is not None:
-                self._merge_errors(
-                    errors,
-                    self._hir_statement_list_raised_errors(
-                        statement.else_body, dict(env)
-                    ),
-                )
         elif isinstance(statement, HIRWhile):
             self._merge_errors(
                 errors, self._hir_expression_raised_errors(statement.condition)

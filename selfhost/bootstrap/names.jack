@@ -1,0 +1,145 @@
+module bootstrap.names;
+
+import std.collections.vector;
+import std.memory;
+import std.string;
+
+pub struct NameReferenceError { }
+
+usize next_interner_identity = usize(1);
+
+pub struct NameId {
+    usize owner;
+    usize index;
+
+    bool equals(&in self, NameId other) {
+        return self.owner == other.owner && self.index == other.index;
+    }
+}
+
+pub struct InternedName {
+    String(SystemAllocator) text;
+    u64 hash;
+}
+
+// Buckets contain insertion indexes plus one; zero denotes an empty bucket.
+pub struct NameInterner {
+    usize identity;
+    Vector(InternedName, SystemAllocator) names;
+    Vector(usize, SystemAllocator) buckets;
+
+    usize len(&in self) { return self.names.len(); }
+
+    bool contains(&in self, NameId id) {
+        return self.identity != usize(0) && id.owner == self.identity
+            && id.index < self.names.len();
+    }
+
+    NameId at(&in self, usize index) raises NameReferenceError {
+        if (self.identity == usize(0) || index >= self.names.len()) {
+            raise NameReferenceError { };
+        }
+        return NameId { owner = self.identity, index = index };
+    }
+
+    str text(&in self, NameId id) raises NameReferenceError {
+        if (self.contains(id) == false) { raise NameReferenceError { }; }
+        try {
+            &in InternedName name = self.names.get(id.index);
+            return name.text.as_str();
+        }
+        catch BoundsError { raise NameReferenceError { }; }
+    }
+
+    NameId intern(&inout self, str text)
+        raises CapacityError, LayoutError, AllocationError, NameReferenceError {
+        if (self.identity == usize(0)) { raise NameReferenceError { }; }
+        u64 hash = name_hash(text);
+        try {
+            usize position = usize(hash % u64(self.buckets.len()));
+            while (self.buckets.get(position) != usize(0)) {
+                usize index = self.buckets.get(position) - usize(1);
+                &in InternedName existing = self.names.get(index);
+                if (existing.hash == hash && existing.text.equals(text)) {
+                    return NameId { owner = self.identity, index = index };
+                }
+                position = (position + usize(1)) % self.buckets.len();
+            }
+            if (self.names.len() >= self.buckets.len() / usize(2)) {
+                grow_buckets(self);
+                position = usize(hash % u64(self.buckets.len()));
+                while (self.buckets.get(position) != usize(0)) {
+                    position = (position + usize(1)) % self.buckets.len();
+                }
+            }
+            SystemAllocator allocator;
+            String(SystemAllocator) owned(allocator, text);
+            usize index = self.names.len();
+            self.names.push(InternedName { text = move owned, hash = hash });
+            &inout usize bucket = self.buckets.get_mut(position);
+            bucket = index + usize(1);
+            return NameId { owner = self.identity, index = index };
+        } catch BoundsError { raise NameReferenceError { }; }
+    }
+}
+
+u64 name_hash(str text) {
+    u64 hash = 5381;
+    usize index = usize(0);
+    while (index < len(text)) {
+        hash = ((hash << u32(5)) | (hash >> u32(59)))
+            ^ u64(jack_str_byte(text, index));
+        index = index + usize(1);
+    }
+    return hash;
+}
+
+void grow_buckets(&inout NameInterner interner)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    if (interner.buckets.len() > usize(18446744073709551615) / usize(2)) {
+        raise LayoutError { };
+    }
+    usize count = interner.buckets.len() * usize(2);
+    // Reserve is the only fallible allocation; keep the old index intact until it succeeds.
+    interner.buckets.reserve(count);
+    while (interner.buckets.len() < count) { interner.buckets.push(usize(0)); }
+    usize index = usize(0);
+    while (index < count) {
+        &inout usize bucket = interner.buckets.get_mut(index);
+        bucket = usize(0);
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < interner.names.len()) {
+        &in InternedName name = interner.names.get(index);
+        u64 hash = name.hash;
+        usize position = usize(hash % u64(count));
+        while (interner.buckets.get(position) != usize(0)) {
+            position = (position + usize(1)) % count;
+        }
+        &inout usize bucket = interner.buckets.get_mut(position);
+        bucket = index + usize(1);
+        index = index + usize(1);
+    }
+}
+
+pub NameInterner name_interner()
+    raises CapacityError, LayoutError, AllocationError, NameReferenceError {
+    if (next_interner_identity == usize(18446744073709551615)) {
+        raise NameReferenceError { };
+    }
+    SystemAllocator names_allocator;
+    Vector(InternedName, SystemAllocator) names(names_allocator, usize(0));
+    SystemAllocator buckets_allocator;
+    Vector(usize, SystemAllocator) buckets(buckets_allocator, usize(16));
+    usize index = usize(0);
+    while (index < usize(16)) {
+        buckets.push(usize(0));
+        index = index + usize(1);
+    }
+    usize identity = next_interner_identity;
+    next_interner_identity = next_interner_identity + usize(1);
+    return NameInterner {
+        identity = identity, names = move names, buckets = move buckets,
+    };
+}

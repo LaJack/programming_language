@@ -35,6 +35,7 @@ from .hir_nodes import (
     HIRMaybeUninitTakeExpression,
     HIRMaybeUninitWriteExpression,
     HIRMoveExpression,
+    HIRNode,
     HIRPointerCastExpression,
     HIRPointerOffsetExpression,
     HIRPrint,
@@ -1875,8 +1876,26 @@ class LLVMLoweringPass:
         for declaration in program.declarations:
             if isinstance(declaration, (HIRTypeDeclaration, HIREnumDeclaration)):
                 functions.extend(declaration.methods)
-        names = sorted({error.name for function in functions for error in function.raises})
-        self.error_tags = {name: index + 1 for index, name in enumerate(names)}
+        names = {error.name for function in functions for error in function.raises}
+        seen: set[int] = set()
+
+        # Locally caught errors need payload storage even when no signature raises them.
+        def visit(value) -> None:
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    visit(item)
+            elif isinstance(value, HIRNode) and id(value) not in seen:
+                seen.add(id(value))
+                if isinstance(value, HIRRaise):
+                    names.add(value.error_type.name)
+                elif isinstance(value, HIRTry):
+                    names.update(catch.error_type.name for catch in value.catches)
+                for item in fields(value):
+                    if item.name != 'span':
+                        visit(getattr(value, item.name))
+
+        visit(program)
+        self.error_tags = {name: index + 1 for index, name in enumerate(sorted(names))}
 
     def _collect_inline_candidates(self, program: HIRProgram) -> None:
         candidates: dict[str, InlineCandidate] = {}

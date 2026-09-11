@@ -16,6 +16,7 @@ void jack_io_close_discard(FILE *file);
 int32_t jack_io_seek(FILE *file, int64_t offset, int32_t origin, size_t *position);
 int32_t jack_io_tell(FILE *file, size_t *position);
 int32_t jack_io_metadata(jack_str path, size_t *size, bool *is_file, bool *is_directory);
+int32_t jack_io_canonical_path(jack_str path, uint8_t *data, size_t capacity, size_t *length);
 FILE *jack_io_stdin(void);
 FILE *jack_io_stdout(void);
 FILE *jack_io_stderr(void);

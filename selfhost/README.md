@@ -108,6 +108,57 @@ such as `left`, `parameters`, and `body`. Child indexes are local to their role.
 The default remains `--dump tokens`, preserving existing lexer differential
 workflows. Diagnostic and dump options may appear in either order.
 
+## Project Analysis Foundations (In Progress)
+
+`bootstrap.names` provides an owned insertion-ordered name interner. Its private
+open-addressed hash index never determines public iteration order. `NameId`
+values survive growth and movement; lookups reject default, out-of-range, and
+foreign-interner identities. Names are copied into owned UTF-8 storage, and
+failed insertion leaves existing IDs and text valid. Construct the interner
+with `name_interner()`, not default initialization.
+
+`std.path.canonical_path` resolves an existing path, including symlinks, into an
+owned UTF-8 string. Relative paths use the process working directory. The
+lower-level `canonical_path_into` accepts caller-owned byte storage and returns
+the required length; undersized buffers are left untouched. Neither API scans
+directories or invokes a shell. Empty or NUL-containing paths are rejected.
+
+`bootstrap.project` now owns checked project storage. `project_options()` sets
+ordered roots/stubs, parser options, and a default diagnostic maximum of 100.
+`project_builder()` constructs a `ProjectBuilder` owning its frontend context,
+interner, modules, import edges, symbols, scopes, and reference occurrences.
+Builder insertion checks identities and source ranges before modifying tables.
+`finish_project` consumes the builder and returns a read-only `FrontendProject`;
+moving it preserves all IDs. Public lookups reject foreign and out-of-range IDs.
+
+Import edges distinguish requested names, effective stub replacements, aliases,
+and pending/resolved/invalid targets. Scopes retain parent, module, symbol owner,
+and source locations. Symbols retain source contracts and support poisoning;
+occurrences retain checked syntax references, spans, roles, and explicit
+resolved/deferred/invalid states. Error state is independent of diagnostic-bag
+capacity, and rebinding maintains the deferred count.
+
+`bootstrap.modules.load_module_graph(entry, options, diagnostics)` builds the
+recovering transitive import graph without executing comptime code. Search uses
+the canonical entry directory followed by explicit roots, trying `.jack` before
+`.jk` in each root. The self-hosted loader does not add a standard-library root;
+callers must supply `jack` when importing `std.*`. Stub replacement is one-step,
+and the last override for a requested name wins.
+
+Files are deduplicated by canonical path and named modules by effective name.
+Cycles, missing files, mismatched identities, and header/import ordering errors
+produce diagnostics without stopping independent branches. Malformed headers
+retain unnamed, incomplete module records; malformed imports retain unresolved
+edges and never supply guessed paths. Dotted names are reconstructed from tokens
+so whitespace and comments do not change their identity. Parsing and graph errors
+remain recorded even when the caller's diagnostic bag is full.
+
+This is not yet a completed project analyzer. Declaration/scoping passes, import
+visibility and binding checks, name resolution, project CLI modes, and stage-0
+name-resolution differential acceptance remain to be implemented. The eventual
+`analyze_project` API will compose these passes. Existing token and syntax CLI
+behavior is unchanged.
+
 ## Verification And Measurements
 
 `tests/test_bootstrap_lexer.py` compares independently normalized Python ASTs

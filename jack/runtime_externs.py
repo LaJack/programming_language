@@ -1,5 +1,6 @@
 import sys
 import os
+import errno
 
 from .builtin_types import JackPrimitiveValue
 from .interpreter import (
@@ -41,6 +42,7 @@ def default_runtime_externs(stdout: object | None = None) -> dict[str, ExternHan
         'jack_io_seek': jack_io_seek,
         'jack_io_tell': jack_io_tell,
         'jack_io_metadata': jack_io_metadata,
+        'jack_io_canonical_path': jack_io_canonical_path,
         'jack_io_stdin': lambda: _file_pointer(sys.stdin),
         'jack_io_stdout': lambda: _file_pointer(stream),
         'jack_io_stderr': lambda: _file_pointer(sys.stderr),
@@ -183,6 +185,23 @@ def jack_io_metadata(
     return 0
 
 
+def jack_io_canonical_path(path: object, data: object, capacity: object, length: object) -> int:
+    _set_out(length, 0)
+    try:
+        text = _as_str(path)
+        if not text or '\0' in text:
+            return errno.EINVAL
+        resolved = os.path.realpath(text, strict=True).encode('utf-8')
+    except OSError as error:
+        return error.errno or errno.EIO
+    except UnicodeError:
+        return errno.EILSEQ
+    _set_out(length, len(resolved))
+    if len(resolved) <= _as_int(capacity):
+        _write_borrowed_bytes(data, resolved)
+    return 0
+
+
 def _file_pointer(file_obj: object) -> JackRawPointer:
     return JackRawPointer(JackBorrow(file_obj, mutable=True), mutable=True)
 
@@ -321,6 +340,8 @@ def _unwrap_borrow(value: object) -> object:
 
 
 def _borrowed_bytes(value: object, byte_count: int) -> bytes:
+    if byte_count == 0:
+        return b''
     if isinstance(value, JackRawPointer):
         target = value.target
         if isinstance(target, JackArrayElementBorrow):
@@ -421,10 +442,17 @@ def _write_array_bytes(array: JackArray, start: int, payload: bytes) -> None:
         )
     for index, byte in enumerate(payload, start=start):
         current = array.values[index]
+        slot = current if isinstance(current, MemoryMaybeUninit) else None
+        if slot is not None:
+            current = slot.get()
         if isinstance(current, JackPrimitiveValue):
-            array.values[index] = JackPrimitiveValue(current.type_name, byte)
+            replacement = JackPrimitiveValue(current.type_name, byte)
         else:
-            array.values[index] = byte
+            replacement = byte
+        if slot is not None:
+            slot.set_initialized(replacement)
+        else:
+            array.values[index] = replacement
 
 
 def _write_bytes(stream: object, payload: bytes) -> None:

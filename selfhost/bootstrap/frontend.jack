@@ -24,6 +24,12 @@ pub struct ParsedFileId {
 pub struct NodeRef {
     ParsedFileId file;
     ArenaHandle(SyntaxNode) node;
+
+    bool equals(&in self, NodeRef other) {
+        return self.file.equals(other.file) && self.node.equals(other.node);
+    }
+
+    ParsedFileId file_id(&in self) { return self.file; }
 }
 
 pub struct FrontendContext {
@@ -47,6 +53,14 @@ pub struct FrontendContext {
 
     &in SourceMap source_map(&in self) { return &in self.sources; }
     usize file_count(&in self) { return self.files.len(); }
+    usize identity_value(&in self) { return self.sources.identity_value(); }
+
+    NodeRef reference(&in self, ParsedFileId id, ArenaHandle(SyntaxNode) node)
+        raises FrontendReferenceError {
+        NodeRef result = NodeRef { file = id, node = node };
+        self.node(result);
+        return result;
+    }
 
     &in ParsedFile file(&in self, ParsedFileId id) raises FrontendReferenceError {
         if (id.context != self.sources.identity_value()) {

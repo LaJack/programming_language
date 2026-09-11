@@ -7,7 +7,7 @@ from pathlib import Path
 
 from jack.compiler_driver import CompilationOptions, CompilerDriver
 from jack.interpreter import Interpreter
-from jack.runtime_externs import default_runtime_externs
+from jack.runtime_externs import default_runtime_externs, jack_string_view
 
 
 SOURCE = '''
@@ -38,6 +38,9 @@ EXPECTED = (
 
 
 class StringLibraryTests(unittest.TestCase):
+    def test_empty_string_view_does_not_read_its_storage(self):
+        self.assertEqual('', jack_string_view(object(), 0))
+
     def test_owned_string_and_integer_helpers_match_all_runtimes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

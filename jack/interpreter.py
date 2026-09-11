@@ -1435,7 +1435,10 @@ class Interpreter:
                 expression.expr, scope, mutable=mutable, mode=expression.mode
             )
 
-        if isinstance(expression.expr, HIRVariableExpression):
+        if (
+            isinstance(expression.expr, HIRVariableExpression)
+            and not self._is_slice_type(expression.expr.type_ref)
+        ):
             return JackSymbolBorrow(
                 scope,
                 expression.expr.name,
@@ -1447,7 +1450,10 @@ class Interpreter:
         if isinstance(value, JackSlice):
             if mutable and not value.mutable:
                 raise EvaluationError('Cannot create a writable slice from a read-only slice.')
-            return JackSlice(value.array, value.start, value.length, mutable=mutable, mode=expression.mode)
+            return JackSlice(
+                value.array, value.start, value.length, mutable=mutable,
+                mode=expression.mode, unwrap_storage=value.unwrap_storage,
+            )
         return JackBorrow(value, mutable=mutable, mode=expression.mode)
 
     def _eval_hir_index_borrow(

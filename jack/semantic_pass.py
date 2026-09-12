@@ -53,6 +53,7 @@ try:
         Statement,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -114,6 +115,7 @@ except ImportError:
         Statement,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -1097,6 +1099,8 @@ class SemanticPass:
                 self._validate_for(statement, scope, allow_return)
             elif type(statement) is Try:
                 self._validate_try(statement, scope, allow_return)
+            elif type(statement) is Block:
+                self._validate_statements(statement.body, SemanticScope(scope), allow_return)
             elif type(statement) is UnsafeBlock:
                 self.unsafe_depth += 1
                 try:

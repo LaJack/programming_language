@@ -145,6 +145,8 @@ def _python_node(value):
         return n('try', body=python_node(value.body), catches=python_node(value.catches))
     if isinstance(value, ast.CatchClause):
         return n('catch', name=value.name, error_type=python_type(value.error_type), body=python_node(value.body))
+    if isinstance(value, ast.Block):
+        return n('block', body=python_node(value.body))
     if isinstance(value, ast.UnsafeBlock):
         return n('unsafe', body=python_node(value.body))
     if isinstance(value, ast.Return):
@@ -232,6 +234,8 @@ def bootstrap_nodes(source, output):
         def one(role, default=None):
             items = many(role)
             assert len(items) <= 1, (kind, role, items)
+            if items and role == 'body' and isinstance(items[0], dict) and items[0].get('kind') == 'block':
+                return items[0]['body']
             return items[0] if items else default
         mods = sorted(key for key, value in node.values.items()
                       if value == 'true' and key not in {'consuming', 'constructor'})
@@ -295,7 +299,7 @@ def bootstrap_nodes(source, output):
         if kind == 'view_field':
             return n('view_field', name=text('name'), type=one('type'), mode=text('mode'))
         if kind == 'block_statement':
-            return many('statements')
+            return n('block', body=many('statements'))
         if kind == 'comptime_statement':
             return n('comptime', statement=one('statement'))
         if kind == 'unsafe_block':

@@ -9,6 +9,7 @@ from typing import Iterable, Mapping
 from urllib.parse import unquote, urlparse
 
 from .ast_nodes import (
+    Block,
     Assignment,
     BorrowExpression,
     CatchClause,
@@ -632,8 +633,12 @@ class _GraphIndexBuilder:
                 )
             for argument in node.constructor_args:
                 self._expression(argument, env)
-            if node.name in self.top_by_internal:
-                return
+            top_id = self.top_by_internal.get(node.name)
+            if top_id is not None:
+                top = self.model.symbols[top_id]
+                if (top.span.source_path == node.span.source_path
+                        and top.span.start_offset == node.span.start_offset):
+                    return
             symbol = self._declare_local(node, module_name, scope, 'variable')
             env[node.name] = symbol.id
             return
@@ -717,6 +722,12 @@ class _GraphIndexBuilder:
                 child_env = dict(env)
                 for statement in node.else_body:
                     self._statement(statement, module_name, child_env, child, owner_type)
+            return
+        if isinstance(node, Block):
+            child = self._child_scope(node.span, scope)
+            child_env = dict(env)
+            for statement in node.body:
+                self._statement(statement, module_name, child_env, child, owner_type)
             return
         if isinstance(node, While):
             condition = self._expression(node.condition, env)

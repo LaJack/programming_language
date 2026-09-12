@@ -40,6 +40,7 @@ try:
         StructLiteralExpression,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -96,6 +97,7 @@ try:
         HIRStructLiteralField,
         HIRTry,
         HIRUnsafeBlock,
+        HIRBlock,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
         HIRVariableExpression,
@@ -140,6 +142,7 @@ except ImportError:
         StructLiteralExpression,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -196,6 +199,7 @@ except ImportError:
         HIRStructLiteralField,
         HIRTry,
         HIRUnsafeBlock,
+        HIRBlock,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
         HIRVariableExpression,
@@ -776,6 +780,10 @@ class HIRLoweringPass(SemanticPass):
             return self._for_statement(statement, scope)
         if type(statement) is Try:
             return self._try_statement(statement, scope)
+        if type(statement) is Block:
+            return HIRBlock(
+                body=self._block(statement.body, SemanticScope(scope)), span=statement.span
+            )
         if type(statement) is UnsafeBlock:
             return HIRUnsafeBlock(
                 body=self._block(statement.body, SemanticScope(scope)),

@@ -506,6 +506,45 @@ else {
 }
 ```
 
+### Lexical Blocks
+
+Standalone braces introduce an unconditional lexical scope:
+
+```jack
+i32 value = 1;
+{
+    &in i32 borrowed = &in value;
+    print(borrowed);
+}
+value = 2;
+```
+
+Blocks may be empty or nested and do not take a trailing semicolon. They are
+statements, not expressions. Locals and named borrows end at the closing brace;
+remaining owned locals are destroyed in reverse declaration order, including
+on return and error propagation. Changes to outer variables and ownership state
+remain effective afterward. Blocks inherit, but do not grant, unsafe access.
+Module-level declarations remain module-level; a block cannot export declarations
+or contain imports, local functions, or local nominal types.
+
+`comptime { ... }` executes the complete body during compilation in a child scope,
+without repeating `comptime` on each statement. It emits no runtime statements:
+
+```jack
+comptime i32 total = 0;
+comptime {
+    i32 increment = 3;
+    total = total + increment;
+}
+print(total);
+```
+
+Comptime locals do not escape, runtime values cannot be read during comptime
+execution, and a comptime block cannot return from an enclosing runtime function.
+Existing comptime IO permissions and dependency recording still apply. Ordinary
+top-level blocks belong to legacy runtime programs and cannot coexist with typed
+`main`; fully comptime blocks may coexist with typed `main`.
+
 Loops use `while` and C-style `for`:
 
 ```jack

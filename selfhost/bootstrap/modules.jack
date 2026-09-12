@@ -558,7 +558,7 @@ ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLi
         }
         index = index + usize(1);
     }
-    if (true) {
+    {
         &in FrontendProject project = builder.project();
         &in FrontendContext context = project.frontend();
         &in ParsedFile parsed = context.file(file);

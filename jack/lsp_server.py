@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import BinaryIO, TextIO
 
 from .ast_nodes import (
+    Block,
     For,
     EnumDeclaration,
     FunctionDeclaration,
@@ -309,7 +310,7 @@ def _collect_statement_entries(
             _collect_statement_entries(nested, tokens, entries)
         return
 
-    if isinstance(statement, While):
+    if isinstance(statement, (While, Block)):
         for nested in statement.body:
             _collect_statement_entries(nested, tokens, entries)
         return

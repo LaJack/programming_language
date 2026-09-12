@@ -33,6 +33,7 @@ try:
         Statement,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -74,6 +75,7 @@ except ImportError:
         Statement,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -145,8 +147,9 @@ class JackEmitPass:
             return self._for_statement(statement, level)
         if type(statement) is Try:
             return self._try_statement(statement, level)
-        if type(statement) is UnsafeBlock:
-            lines = [self._line(level, 'unsafe {')]
+        if type(statement) in {UnsafeBlock, Block}:
+            prefix = 'unsafe ' if type(statement) is UnsafeBlock else ('comptime ' if statement.comptime else '')
+            lines = [self._line(level, prefix + '{')]
             lines.extend(self._block_lines(statement.body, level + 1))
             lines.append(self._line(level, '}'))
             return '\n'.join(lines)

@@ -156,6 +156,18 @@ Value value;
 
         self.assertIn('before', {item['label'] for item in completions})
 
+    def test_standalone_blocks_keep_shadowed_bindings_separate(self):
+        entry = self.write('main.jack', 'i32 value = 1;\n{\n i32 value = 2;\n print(value);\n}\nprint(value);\n')
+        analysis = self.analyze(entry, versions={entry: 1})
+        self.assertEqual([], analysis.diagnostics)
+        symbols = [symbol for symbol in analysis.model.symbols.values() if symbol.name == 'value']
+        self.assertEqual(2, len(symbols))
+        uses = [item for item in analysis.model.occurrences if not item.declaration
+                and item.symbol_id in {symbol.id for symbol in symbols}]
+        inner = next(item for item in uses if item.span.start_line == 4)
+        outer = next(item for item in uses if item.span.start_line == 6)
+        self.assertNotEqual(inner.symbol_id, outer.symbol_id)
+
     def test_semantic_tokens_and_signature_help_use_project_model(self):
         entry = self.write(
             'main.jack',

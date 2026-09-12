@@ -44,6 +44,7 @@ try:
         Statement,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -96,6 +97,7 @@ except ImportError:
         Statement,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -549,7 +551,7 @@ class Parser:
         if self._match_keyword('import'):
             return self._import_declaration()
 
-        if self._check_statement_keyword():
+        if self._check('{') or self._check_statement_keyword():
             return self._statement()
 
         is_public = self._match_keyword('pub')
@@ -563,6 +565,11 @@ class Parser:
                 'const declarations use a comptime initializer and cannot be comptime, unsafe, or extern.',
             )
         extern_abi = self._extern_abi() if is_extern else None
+
+        if self._check('{') and not is_unsafe:
+            if is_public or is_const or is_extern:
+                raise self._error(self._peek(), 'Blocks cannot be public, const, or extern.')
+            return Block(self._block(), comptime=is_comptime)
 
         if is_unsafe and self._check('{'):
             if is_public or is_comptime or is_extern:
@@ -1222,6 +1229,8 @@ class Parser:
         return self._with_span(self._statement_inner(), start_token)
 
     def _statement_inner(self) -> Statement:
+        if self._check('{'):
+            return Block(self._block())
         if self._match_keyword('unsafe'):
             return UnsafeBlock(self._block())
 

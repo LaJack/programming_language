@@ -56,6 +56,7 @@ try:
         Statement,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -118,6 +119,7 @@ except ImportError:
         Statement,
         Try,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -234,6 +236,16 @@ class ComptimeStringBuilderValue:
     data: bytearray
 
 
+class ComptimeStringView(str):
+    def __new__(cls, text: str, owner: ComptimeStringValue):
+        value = super().__new__(cls, text)
+        value.owner = owner
+        return value
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 @dataclass
 class ComptimeEffects:
     dependencies: dict[Path, str]
@@ -334,6 +346,8 @@ class CompileTimeScope:
         self.parent = parent
         self.variables: dict[str, LiteralExpression] = {}
         self.runtime_constants: set[str] = set()
+        self.runtime_names: set[str] = set()
+        self.moved_names: set[str] = set()
 
     def declare(self, name: str, value: LiteralExpression) -> None:
         if "." in name:
@@ -364,6 +378,8 @@ class CompileTimeScope:
             return True
 
         current = scope.variables[parts[0]]
+        if parts[0] in scope.moved_names:
+            raise CompileTimeError(f'Comptime value "{parts[0]}" has been moved.')
         current_path = parts[0]
         for field_name in parts[1:-1]:
             current = self._field_value(current, field_name, current_path)
@@ -385,6 +401,9 @@ class CompileTimeScope:
         scope = self._scope_containing(parts[0])
         if scope is None:
             return None
+
+        if parts[0] in scope.moved_names:
+            raise CompileTimeError(f'Comptime value "{parts[0]}" has been moved.')
 
         current = scope.variables[parts[0]]
         current_path = parts[0]
@@ -419,6 +438,8 @@ class CompileTimeScope:
         return self._scope_containing(root) is not None
 
     def _scope_containing(self, name: str) -> "CompileTimeScope | None":
+        if name in self.runtime_names:
+            return None
         if name in self.variables:
             return self
         if self.parent is not None:
@@ -742,6 +763,8 @@ class CompileTimePass:
                 raise
             self._inherit_statement_metadata(node, statements)
             lowered.extend(statements)
+            if type(node) is VariableDeclaration and not node.comptime and not node.constant:
+                scope.runtime_names.add(node.name)
 
         return lowered
 
@@ -828,6 +851,15 @@ class CompileTimePass:
             return self._apply_for(node, scope)
         if type(node) is Try:
             return self._apply_try(node, scope)
+        if type(node) is Block:
+            self._validate_lexical_block(node)
+            if node.comptime:
+                try:
+                    self.executor._execute_statement(node, scope, allow_return=False)
+                except ComptimeRaisedError as err:
+                    raise CompileTimeError(f'Unhandled comptime error "{err.type_name}".') from err
+                return []
+            return [Block(self._apply_statements(node.body, CompileTimeScope(scope)))]
         if type(node) is UnsafeBlock:
             if node.comptime:
                 raise CompileTimeError('unsafe blocks cannot be comptime.')
@@ -872,6 +904,19 @@ class CompileTimePass:
             return [*prelude, Return(expr)]
 
         raise CompileTimeError(f'Unknown statement type "{type(node).__name__}".')
+
+    def _validate_lexical_block(self, block: Block) -> None:
+        for statement in block.body:
+            if isinstance(statement, (
+                ModuleDeclaration, ImportDeclaration, FunctionDeclaration,
+                TypeDeclaration, EnumDeclaration, InterfaceDeclaration,
+                ImplementationDeclaration, ViewDeclaration,
+            )) or statement.public or getattr(statement, 'extern', False):
+                raise CompileTimeError('Module-level declarations are not allowed in lexical blocks.', statement.span)
+            if isinstance(statement, VariableDeclaration) and (
+                statement.constant or self._is_type_type(statement.type)
+            ):
+                raise CompileTimeError('Local constant and type declarations are not supported.', statement.span)
 
     def _apply_variable_declaration(
         self, declaration: VariableDeclaration, scope: CompileTimeScope
@@ -1323,6 +1368,7 @@ class CompileTimePass:
             return []
 
         body_scope = CompileTimeScope(scope)
+        body_scope.runtime_names.update(parameter.name for parameter in declaration.parameters)
         return_type = self._apply_type_reference(declaration.return_type, body_scope)
         body = self._apply_statements(declaration.body, body_scope)
         self._validate_returns(declaration.name, return_type, body)
@@ -1712,6 +1758,7 @@ class CompileTimePass:
         if variant_name is None:
             variant_name = self._variant_name(call.function_name, key[1])
             self.variant_names[key] = variant_name
+            body_scope.runtime_names.update(parameter.name for parameter in runtime_parameters)
             return_type = self._apply_type_reference(declaration.return_type, body_scope)
             previous_dispatch = self.active_interface_dispatch
             self.active_interface_dispatch = self._generic_interface_dispatch(declaration)
@@ -2207,11 +2254,14 @@ class CompileTimePass:
         return lowered
 
     def _eval_comptime_argument(
-        self, argument: object, expected_type: TypeReference, scope: CompileTimeScope
+        self, argument: object, expected_type: TypeReference, scope: CompileTimeScope,
+        passing_mode: str = 'copy',
     ) -> LiteralExpression:
         if self._is_type_type(expected_type):
             return LiteralExpression(self._eval_comptime_type_argument(argument, scope), 'type')
         expression = self._argument_as_expression(argument)
+        if self.executor.lexical_depth and passing_mode == 'move' and isinstance(expression, VariableExpression):
+            expression = MoveExpression(expression, span=expression.span)
         if expected_type.borrow is not None:
             if type(expression) is BorrowExpression:
                 raise CompileTimeError(
@@ -2318,7 +2368,7 @@ class CompileTimePass:
 
         function_scope = CompileTimeScope(scope)
         for parameter, argument in zip(declaration.parameters, call.parameters):
-            value = self._eval_comptime_argument(argument, parameter.type, function_scope)
+            value = self._eval_comptime_argument(argument, parameter.type, function_scope, parameter.passing_mode)
             function_scope.declare(parameter.name, value)
 
         return_type = self._apply_type_reference(declaration.return_type, function_scope)
@@ -2353,7 +2403,7 @@ class CompileTimePass:
             else:
                 call_scope.declare(
                     parameter.name,
-                    self._eval_comptime_argument(argument, parameter.type, call_scope),
+                    self._eval_comptime_argument(argument, parameter.type, call_scope, parameter.passing_mode),
                 )
         if source_name in {
             'create', 'open_append', 'open_read_write', 'write_stdout',
@@ -2369,7 +2419,7 @@ class CompileTimePass:
                 raise CompileTimeError('open_read expects one path.')
             path_value = call_scope.get(declaration.parameters[0].name)
             assert path_value is not None
-            if path_value.type != 'str' or type(path_value.value) is not str:
+            if path_value.type != 'str' or not isinstance(path_value.value, str):
                 raise CompileTimeError('open_read path must be str.')
             path = Path(path_value.value).resolve()
             try:
@@ -2480,7 +2530,7 @@ class CompileTimePass:
         variants: list[ComptimeUnionVariant] = []
         for index in range(value.value.window_length()):
             item = value.value.element_cell(index)
-            if type(item.value) is str:
+            if isinstance(item.value, str):
                 variants.append(ComptimeUnionVariant(item.value, span=item.span))
             elif type(item.value) is ComptimeUnionVariant:
                 variants.append(copy.deepcopy(item.value))
@@ -2503,7 +2553,7 @@ class CompileTimePass:
                     f'{call.function_name} expects a name and a type.'
                 )
             name = self._eval_comptime_expression(call.parameters[0], scope)
-            if name.type != 'str' or type(name.value) is not str:
+            if name.type != 'str' or not isinstance(name.value, str):
                 raise CompileTimeError(f'{call.function_name} field name must be str.')
             type_ref = self._eval_comptime_type_argument(call.parameters[1], scope)
             return LiteralExpression(
@@ -2520,7 +2570,7 @@ class CompileTimePass:
         if not call.parameters:
             raise CompileTimeError('variant expects at least a name.')
         name = self._eval_comptime_expression(call.parameters[0], scope)
-        if name.type != 'str' or type(name.value) is not str:
+        if name.type != 'str' or not isinstance(name.value, str):
             raise CompileTimeError('variant name must be str.')
         fields: list[ComptimeUnionField] = []
         for expression in call.parameters[1:]:
@@ -2563,7 +2613,7 @@ class CompileTimePass:
             return LiteralExpression(len(value.value.elements), 'i32')
         if type(value.value) is ComptimeBorrowValue:
             return LiteralExpression(value.value.window_length(), 'i32')
-        if type(value.value) is str:
+        if isinstance(value.value, str):
             return LiteralExpression(len(value.value.encode('utf-8')), 'usize')
         raise CompileTimeError(
             f'len expects a comptime array, slice, or str, got "{value.type}".'
@@ -2577,7 +2627,7 @@ class CompileTimePass:
                 raise CompileTimeError('jack_str_byte expects two arguments.')
             text = self._eval_comptime_expression(call.parameters[0], scope)
             index = self._eval_comptime_expression(call.parameters[1], scope)
-            if type(text.value) is not str:
+            if not isinstance(text.value, str):
                 raise CompileTimeError('jack_str_byte expects a comptime str.')
             data = text.value.encode('utf-8')
             offset = int(index.value)
@@ -2610,7 +2660,7 @@ class CompileTimePass:
         values: list[LiteralExpression] = []
         call_scope = CompileTimeScope(scope)
         for parameter, argument in zip(declaration.parameters, call.parameters):
-            value = self._eval_comptime_argument(argument, parameter.type, call_scope)
+            value = self._eval_comptime_argument(argument, parameter.type, call_scope, parameter.passing_mode)
             call_scope.declare(parameter.name, value)
             values.append(value)
 
@@ -2694,6 +2744,8 @@ class CompileTimePass:
             return self._eval_comptime_function_call(call, scope)
 
         receiver_name, method_name = call.function_name.rsplit('.', 1)
+        if self.executor.lexical_depth and method_name == 'deinit' and receiver_name != '$drop':
+            raise CompileTimeError('Destructors cannot be called explicitly.', call.span)
         declaration = self.types.get(receiver_name)
         if isinstance(declaration, EnumDeclaration) and any(
             variant.name == method_name for variant in declaration.variants
@@ -2713,12 +2765,16 @@ class CompileTimePass:
         ):
             receiver = receiver.value.cell
         if type(receiver.value) is ComptimeVectorValue:
+            if self.executor.lexical_depth and method_name in {'push', 'reserve', 'replace', 'pop', 'clear'}:
+                self.executor._ensure_unborrowed(receiver, scope)
             return self._eval_comptime_vector_method(
                 receiver.value, method_name, call.parameters, scope
             )
         if type(receiver.value) in {
             ComptimeFileValue, ComptimeStringValue, ComptimeStringBuilderValue
         }:
+            if self.executor.lexical_depth and method_name in {'clear', 'append', 'append_bytes', 'finish'}:
+                self.executor._ensure_unborrowed(receiver, scope)
             return self._eval_comptime_resource_method(
                 receiver.value, method_name, call.parameters, scope
             )
@@ -2736,7 +2792,7 @@ class CompileTimePass:
         method_scope = CompileTimeScope(scope)
         method_scope.declare('self', receiver)
         for parameter, argument in zip(method.parameters, call.parameters):
-            value = self._eval_comptime_argument(argument, parameter.type, method_scope)
+            value = self._eval_comptime_argument(argument, parameter.type, method_scope, parameter.passing_mode)
             method_scope.declare(parameter.name, value)
 
         return_type = self._apply_type_reference(method.return_type, method_scope)
@@ -2762,7 +2818,10 @@ class CompileTimePass:
         if method_name == 'init':
             if len(arguments) != 2:
                 raise CompileTimeError('Vector.init expects allocator and initial capacity.')
-            allocator = self._eval_comptime_expression(arguments[0], scope)
+            argument = arguments[0]
+            if self.executor.lexical_depth and isinstance(argument, VariableExpression):
+                argument = MoveExpression(argument, span=argument.span)
+            allocator = self._eval_comptime_expression(argument, scope)
             requested = self._eval_comptime_expression(arguments[1], scope)
             capacity = int(requested.value)
             maximum = self._comptime_static_allocator_capacity(allocator)
@@ -2776,7 +2835,10 @@ class CompileTimePass:
         if method_name == 'push':
             if len(arguments) != 1:
                 raise CompileTimeError('Vector.push expects one value.')
-            value = self._eval_comptime_expression(arguments[0], scope)
+            argument = arguments[0]
+            if self.executor.lexical_depth and isinstance(argument, VariableExpression):
+                argument = MoveExpression(argument, span=argument.span)
+            value = self._eval_comptime_expression(argument, scope)
             item = LiteralExpression(
                 self._cast_comptime(
                     value.value, vector.element_type, source_type=value.type
@@ -2786,6 +2848,8 @@ class CompileTimePass:
             if len(vector.elements) == vector.capacity:
                 next_capacity = max(1, vector.capacity * 2)
                 if vector.maximum_capacity is not None and next_capacity > vector.maximum_capacity:
+                    if self.executor.lexical_depth:
+                        self.executor._destroy_value(item, scope)
                     self._raise_comptime_simple_error('CapacityError')
                 vector.capacity = next_capacity
             vector.elements.append(item)
@@ -2849,6 +2913,9 @@ class CompileTimePass:
                 self._raise_comptime_simple_error('BoundsError')
             return vector.elements.pop()
         if method_name in {'clear', 'deinit'}:
+            if self.executor.lexical_depth:
+                for element in reversed(vector.elements):
+                    self.executor._destroy_value(element, scope)
             vector.elements.clear()
             return LiteralExpression(None, 'void')
         raise CompileTimeError(f'Comptime Vector method "{method_name}" is not implemented.')
@@ -2858,7 +2925,10 @@ class CompileTimePass:
     ) -> LiteralExpression:
         if type(resource) is ComptimeStringValue:
             if method_name == 'as_str':
-                return LiteralExpression(resource.data.decode('utf-8'), 'str')
+                text = resource.data.decode('utf-8')
+                if self.executor.lexical_depth:
+                    text = ComptimeStringView(text, resource)
+                return LiteralExpression(text, 'str')
             if method_name == 'bytes':
                 array = ComptimeArrayValue(
                     TypeReference('u8'),
@@ -2931,7 +3001,12 @@ class CompileTimePass:
         return None
 
     def _raise_comptime_simple_error(self, type_name: str) -> None:
-        declaration = self.types.get(type_name)
+        module = 'std.collections.vector' if type_name == 'BoundsError' else 'std.memory'
+        declaration = next((candidate for candidate in self.types.values()
+                            if candidate.module_name == module and candidate.source_name == type_name),
+                           self.types.get(type_name))
+        if declaration is not None:
+            type_name = declaration.name
         payload = LiteralExpression(
             ComptimeStructValue(TypeReference(type_name), {})
             if declaration is not None else None,
@@ -2943,8 +3018,13 @@ class CompileTimePass:
         self, statements: Iterable[Statement], scope: CompileTimeScope
     ) -> LiteralExpression | None:
         try:
-            returned = self.executor._execute_statements(statements, scope, allow_return=True)
+            if self.executor.lexical_depth:
+                returned = self.executor._execute_owned_statements(statements, scope, allow_return=True)
+            else:
+                returned = self.executor._execute_statements(statements, scope, allow_return=True)
         except ComptimeRaisedError as err:
+            if self.executor.lexical_depth:
+                raise
             raise CompileTimeError(
                 f'Unhandled comptime error "{err.type_name}".'
             ) from err
@@ -3142,7 +3222,7 @@ class CompileTimePass:
         if self._is_type_type(type_ref):
             if type(value) is TypeReference:
                 return copy.deepcopy(value)
-            if type(value) is str:
+            if isinstance(value, str):
                 return TypeReference(value)
             raise CompileTimeError(f'Cannot convert {value!r} to type "type".')
         if self._is_void_type(type_ref):
@@ -3150,7 +3230,7 @@ class CompileTimePass:
                 return None
             raise CompileTimeError(f'Cannot convert {value!r} to type "void".')
         if self._is_str_type(type_ref):
-            if type(value) is str:
+            if isinstance(value, str):
                 return value
             raise CompileTimeError(f'Cannot convert {value!r} to type "str".')
         if type(value) is ComptimeOpaqueValue:
@@ -3810,6 +3890,12 @@ class CompileTimePass:
                             statement.else_body, dict(env), functions, types, rethrow_errors
                         ),
                     )
+            elif type(statement) in {Block, UnsafeBlock}:
+                self._merge_inferred_errors(
+                    errors, self._infer_raises_from_statements(
+                        statement.body, dict(env), functions, types, rethrow_errors
+                    ),
+                )
             elif type(statement) is While:
                 self._infer_raises_from_expression(
                     statement.condition, env, functions, types, errors
@@ -4098,6 +4184,8 @@ class CompileTimePass:
             raise CompileTimeError('Method "deinit" cannot raise errors.')
 
         body_scope = CompileTimeScope(scope)
+        body_scope.runtime_names.update(parameter.name for parameter in declaration.parameters)
+        body_scope.runtime_names.add('self')
         return_type = self._apply_type_reference(declaration.return_type, body_scope)
         body = self._apply_statements(declaration.body, body_scope)
         self._validate_returns(declaration.name, return_type, body)
@@ -4162,7 +4250,7 @@ class CompileTimePass:
                     self._validate_returns(function_name, return_type, branch.body)
                 if statement.else_body is not None:
                     self._validate_returns(function_name, return_type, statement.else_body)
-            elif type(statement) is While:
+            elif type(statement) in {Block, UnsafeBlock, While}:
                 self._validate_returns(function_name, return_type, statement.body)
             elif type(statement) is For:
                 self._validate_returns(function_name, return_type, statement.body)
@@ -4286,12 +4374,159 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
     def __init__(self, compile_time_pass: CompileTimePass) -> None:
         self.compile_time_pass = compile_time_pass
         self.caught_errors: list[ComptimeRaisedError] = []
+        self.lexical_depth = 0
+
+    def _execute_statement(self, statement, scope, allow_return):
+        if isinstance(statement, Block):
+            self.compile_time_pass._validate_lexical_block(statement)
+            self.lexical_depth += 1
+            try:
+                return self._execute_block(statement.body, scope, allow_return)
+            finally:
+                self.lexical_depth -= 1
+        return super()._execute_statement(statement, scope, allow_return)
 
     def _allows_comptime_statement(self, statement: Statement, scope: CompileTimeScope) -> bool:
         return True
 
     def _child_scope(self, scope: CompileTimeScope) -> CompileTimeScope:
         return CompileTimeScope(scope)
+
+    def _execute_block(self, statements, scope, allow_return):
+        child = self._child_scope(scope)
+        return self._execute_owned_statements(statements, child, allow_return)
+
+    def _execute_owned_statements(self, statements, child, allow_return):
+        try:
+            returned = self._execute_statements(statements, child, allow_return)
+            if self.lexical_depth:
+                owned = set()
+                for name, literal in child.variables.items():
+                    if name != 'self' and name not in child.moved_names:
+                        self._collect_owned(literal, owned)
+                if returned is not None and self._borrows_owned(returned.value, owned):
+                    raise CompileTimeError('A comptime borrow cannot escape its local owner.')
+                ancestor = child.parent
+                while ancestor is not None:
+                    if any(self._borrows_owned(value, owned) for name, value in ancestor.variables.items()
+                           if name not in ancestor.moved_names):
+                        raise CompileTimeError('A comptime borrow cannot escape its local owner.')
+                    ancestor = ancestor.parent
+            return returned
+        finally:
+            if self.lexical_depth:
+                for name, value in reversed(list(child.variables.items())):
+                    if name != 'self' and name not in child.moved_names:
+                        self._destroy_value(value, child)
+
+    def _collect_owned(self, literal, owned):
+        value = literal.value
+        if isinstance(value, ComptimeBorrowValue):
+            return
+        owned.add(id(literal))
+        if isinstance(value, (ComptimeStructValue, ComptimeStringValue, ComptimeFileValue,
+                              ComptimeStringBuilderValue, ComptimeArrayValue, ComptimeVectorValue,
+                              ComptimeEnumValue)):
+            owned.add(id(value))
+        if isinstance(value, ComptimeStructValue):
+            for field in value.fields.values():
+                self._collect_owned(field, owned)
+        elif isinstance(value, (ComptimeArrayValue, ComptimeVectorValue)):
+            owned.add(id(value.elements))
+            for element in value.elements:
+                self._collect_owned(element, owned)
+        elif isinstance(value, ComptimeEnumValue):
+            for field in value.fields:
+                self._collect_owned(field, owned)
+
+    def _borrows_owned(self, literal, owned):
+        value = literal.value
+        if isinstance(value, ComptimeBorrowValue):
+            return (value.cell is not None and id(value.cell) in owned) or (
+                value.array is not None and id(value.array.elements) in owned
+            )
+        if isinstance(value, ComptimeStringView):
+            return id(value.owner) in owned
+        if isinstance(value, ComptimeStructValue):
+            return any(self._borrows_owned(field, owned) for field in value.fields.values())
+        if isinstance(value, ComptimeEnumValue):
+            return any(self._borrows_owned(field, owned) for field in value.fields)
+        if isinstance(value, (ComptimeArrayValue, ComptimeVectorValue)):
+            return any(self._borrows_owned(element, owned) for element in value.elements)
+        return False
+
+    def _ensure_unborrowed(self, value, scope):
+        owned = set()
+        self._collect_owned(value, owned)
+        while scope is not None:
+            if any(self._borrows_owned(item, owned) for name, item in scope.variables.items()
+                   if name not in scope.moved_names):
+                raise CompileTimeError('Cannot move or overwrite a borrowed comptime owner.')
+            scope = scope.parent
+
+    def _destroy_value(self, literal, scope):
+        value = literal.value
+        if isinstance(value, ComptimeBorrowValue):
+            return
+        if isinstance(value, ComptimeStructValue):
+            declaration = self.compile_time_pass._type_declaration_for(value.type_ref)
+            if any(method.name == 'deinit' for method in declaration.methods):
+                temporary = CompileTimeScope(scope)
+                temporary.declare('$drop', literal)
+                self.compile_time_pass._eval_comptime_method_call(
+                    FunctionCall('$drop.deinit', []), temporary
+                )
+            for field in reversed(list(value.fields.values())):
+                self._destroy_value(field, scope)
+        elif isinstance(value, (ComptimeArrayValue, ComptimeVectorValue)):
+            for element in reversed(value.elements):
+                self._destroy_value(element, scope)
+            value.elements.clear()
+        elif isinstance(value, ComptimeEnumValue):
+            for field in reversed(value.fields):
+                self._destroy_value(field, scope)
+        elif isinstance(value, ComptimeFileValue):
+            value.open = False
+        elif isinstance(value, ComptimeStringValue):
+            value.data = b''
+        elif isinstance(value, ComptimeStringBuilderValue):
+            value.data.clear()
+
+    def _take_variable(self, expression, scope):
+        value = scope.get(expression.name)
+        if value is None:
+            raise CompileTimeError(f'Unknown comptime value "{expression.name}".')
+        if isinstance(value.value, ComptimeBorrowValue):
+            raise CompileTimeError('Cannot move a comptime borrow.')
+        self._ensure_unborrowed(value, scope)
+        parts = expression.name.split('.')
+        owner = scope._scope_containing(parts[0])
+        if owner.parent is None:
+            raise CompileTimeError('Cannot move a global comptime value.', expression.span)
+        if len(parts) == 1:
+            owner.moved_names.add(parts[0])
+            # Detach the transferred cell so later assignment cannot mutate it.
+            return LiteralExpression(value.value, value.type, span=value.span)
+        parent = scope.get('.'.join(parts[:-1]))
+        if not isinstance(parent.value, ComptimeStructValue):
+            raise CompileTimeError('Invalid comptime move target.')
+        parent.value.fields.pop(parts[-1])
+        return value
+
+    def _eval_expression(self, expression, scope):
+        if self.lexical_depth and isinstance(expression, MoveExpression):
+            if not isinstance(expression.expr, VariableExpression):
+                raise CompileTimeError('Unsupported comptime move target.', expression.span)
+            return self._take_variable(expression.expr, scope)
+        return super()._eval_expression(expression, scope)
+
+    def _eval_return(self, statement, scope):
+        if self.lexical_depth and isinstance(statement.expr, VariableExpression) and '.' not in statement.expr.name:
+            value = scope.get(statement.expr.name)
+            owner = scope._scope_containing(statement.expr.name)
+            if value is not None and owner.parent is not None and not isinstance(value.value, ComptimeBorrowValue):
+                return self._take_variable(statement.expr, scope)
+        return super()._eval_return(statement, scope)
 
     def _execute_variable_declaration(
         self, declaration: VariableDeclaration, scope: CompileTimeScope
@@ -4316,6 +4551,15 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
 
     def _execute_assignment(self, assignment: Assignment, scope: CompileTimeScope) -> None:
         if type(assignment.name) is str:
+            owner = scope._scope_containing(assignment.name)
+            if owner is not None and assignment.name in owner.moved_names:
+                value = self._eval_expression(assignment.expr, scope)
+                current = owner.variables[assignment.name]
+                current.value = self.compile_time_pass._cast_comptime(
+                    value.value, self.compile_time_pass._literal_type_reference(current), source_type=value.type
+                )
+                owner.moved_names.remove(assignment.name)
+                return
             current = scope.get(assignment.name)
             if current is None:
                 raise CompileTimeError(
@@ -4341,12 +4585,16 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
                 return
 
             current_type = self.compile_time_pass._literal_type_reference(current)
+            replacement = self.compile_time_pass._cast_comptime(
+                value.value, current_type, source_type=value.type
+            )
+            if self.lexical_depth:
+                self._ensure_unborrowed(current, scope)
+                self._destroy_value(current, scope)
             scope.assign(
                 assignment.name,
                 LiteralExpression(
-                    self.compile_time_pass._cast_comptime(
-                        value.value, current_type, source_type=value.type
-                    ),
+                    replacement,
                     self.compile_time_pass._type_name(current_type),
                 ),
             )
@@ -4397,9 +4645,13 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
                         catch_scope.declare(catch.name, copy.deepcopy(err.payload))
                     self.caught_errors.append(err)
                     try:
+                        if self.lexical_depth:
+                            return self._execute_owned_statements(catch.body, catch_scope, allow_return)
                         return self._execute_statements(catch.body, catch_scope, allow_return)
                     finally:
                         self.caught_errors.pop()
+            if self.lexical_depth:
+                raise
             raise CompileTimeError(f'Unhandled comptime error "{err.type_name}".') from err
 
     def _catch_matches_error(
@@ -4417,6 +4669,13 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
     ) -> LiteralExpression:
         value = scope.get(variable.name)
         if value is not None:
+            if self.lexical_depth and isinstance(value.value, (
+                ComptimeVectorValue, ComptimeFileValue, ComptimeStringValue, ComptimeStringBuilderValue
+            )):
+                raise CompileTimeError(f'Comptime value "{variable.name}" requires an ownership transfer.', variable.span)
+            if self.lexical_depth and isinstance(value.value, ComptimeStructValue):
+                if not self.compile_time_pass._type_satisfies_constraint(value.value.type_ref, 'Copyable'):
+                    raise CompileTimeError(f'Comptime value "{variable.name}" is not Copyable.', variable.span)
             if value.type == 'type':
                 raise CompileTimeError(f'Cannot use type "{variable.name}" as a value.')
             if (

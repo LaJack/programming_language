@@ -4,6 +4,7 @@ from typing import Generic, Iterable, TypeVar
 try:
     from .ast_nodes import (
         Assignment,
+        Block,
         BorrowExpression,
         CompositeExpression,
         UnaryExpression,
@@ -36,6 +37,7 @@ try:
 except ImportError:
     from ast_nodes import (
         Assignment,
+        Block,
         BorrowExpression,
         CompositeExpression,
         UnaryExpression,
@@ -117,6 +119,8 @@ class ExecutionEngine(Generic[Value, Scope]):
             if not allow_return:
                 self._return_outside_function()
             return ReturnSignal(self._eval_return(statement, scope))
+        elif type(statement) is Block:
+            return self._execute_block(statement.body, scope, allow_return)
         elif type(statement) is If:
             return self._execute_if(statement, scope, allow_return)
         elif type(statement) is While:

@@ -302,6 +302,11 @@ class Try(Statement):
 
 
 @dataclass
+class Block(Statement):
+    body: List[Statement]
+
+
+@dataclass
 class UnsafeBlock(Statement):
     body: List[Statement]
 

@@ -296,7 +296,7 @@ pub struct ProjectBuilder {
             ArenaHandleError, SyntaxValidationError, FrontendReferenceError {
         SourceId source = self.value.context.add_source(path, text);
         Vector(Token, SystemAllocator) tokens;
-        if (true) {
+        {
             &in SourceMap sources = self.value.context.source_map();
             &in u8[] bytes = sources.bytes(source);
             SystemAllocator allocator;
@@ -348,12 +348,12 @@ pub struct ProjectBuilder {
         NameLink requested, NameLink effective, NameLink alias)
         raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
             FrontendReferenceError {
-        if (true) {
+        {
             &in SyntaxNode node = self.value.context.node(declaration);
             if (node.kind() != SyntaxKind.import_declaration
                 && node.kind() != SyntaxKind.invalid_declaration) { raise ProjectReferenceError { }; }
         }
-        if (true) {
+        {
             &in ModuleRecord record = self.value.module_record(importer);
             ParsedFileId file = record.parsed_file();
             if (file.equals(declaration.file_id()) == false) { raise ProjectReferenceError { }; }
@@ -408,7 +408,7 @@ pub struct ProjectBuilder {
         self.value.context.node(node);
         check_symbol_link(self.value, owner);
         ModuleLink module_link = ModuleLink.none;
-        if (true) {
+        {
             &in ScopeRecord enclosing = self.value.scope(parent);
             module_link = enclosing.module_owner();
         }

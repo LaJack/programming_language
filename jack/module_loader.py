@@ -35,6 +35,7 @@ try:
         Try,
         UnaryExpression,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -77,6 +78,7 @@ except ImportError:
         Try,
         UnaryExpression,
         UnsafeBlock,
+        Block,
         TypeDeclaration,
         TypeExpression,
         TypeReference,
@@ -520,7 +522,7 @@ class ModuleResolver:
                 used_aliases.update(
                     self._rewrite_statement_list_names(catch.body, context, catch_scope)
                 )
-        elif type(statement) is UnsafeBlock:
+        elif type(statement) in {UnsafeBlock, Block}:
             used_aliases.update(
                 self._rewrite_statement_list_names(
                     statement.body, context, NameRewriteScope(scope)

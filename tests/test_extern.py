@@ -138,7 +138,12 @@ class ExternTests(unittest.TestCase):
             c_source,
         )
         self.assertIn('size_t written;', c_source)
-        self.assertIn('written = fwrite(&buffer[0], 1, ((int32_t)(4)), stdout);', c_source)
+        self.assertRegex(
+            c_source,
+            r'size_t (jack_expression_argument_\d+) = \(\(int32_t\)\(4\)\);\s+'
+            r'__auto_type (\w+) = &\(written\);\s+'
+            r'\*\2 = fwrite\(&buffer\[0\], 1, \1, stdout\);',
+        )
         self.assertIn('printf("written = %zu\\n", (size_t)(written));', c_source)
 
     def test_interpreter_calls_extern_with_extern_global_borrow(self):

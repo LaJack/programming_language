@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 try:
+    from .ast_nodes import MemberExpression
     from .borrow_modes import borrow_mode_can_write, borrow_mode_compatible
     from .builtin_types import (
         BUILTIN_TYPE_SPECS,
@@ -68,6 +69,7 @@ try:
     from .execution import ExecutionEngine
     from .source_model import FrozenArrayValue, FrozenStructValue, FrozenUnionValue
 except ImportError:
+    from ast_nodes import MemberExpression
     from borrow_modes import borrow_mode_can_write, borrow_mode_compatible
     from builtin_types import (
         BUILTIN_TYPE_SPECS,
@@ -1491,9 +1493,28 @@ class CompileTimePass:
                 statement.span = expression.span
         return prelude, lowered
 
+    def _generic_variant_expression(self, expression: Expression) -> EnumVariantExpression | None:
+        member = expression.callee if isinstance(expression, FunctionCall) else expression
+        if isinstance(member, MemberExpression) and isinstance(member.target, FunctionCall):
+            target = member.target
+            if isinstance(self.types.get(target.function_name), EnumDeclaration):
+                return EnumVariantExpression(
+                    TypeReference(target.function_name, target.parameters), member.member,
+                    expression.parameters if isinstance(expression, FunctionCall) else None,
+                    span=expression.span,
+                )
+        return None
+
     def _apply_expression_inner(
         self, expression: Expression, scope: CompileTimeScope
     ) -> tuple[list[Statement], Expression]:
+        variant = self._generic_variant_expression(expression)
+        if variant is not None:
+            return self._apply_expression_inner(variant, scope)
+        if isinstance(expression, MemberExpression):
+            prelude, target = self._apply_expression(expression.target, scope)
+            return prelude, MemberExpression(target, expression.member,
+                                            member_span=expression.member_span, span=expression.span)
         if type(expression) is LiteralExpression:
             return [], copy.deepcopy(expression)
         if type(expression) is FormattedStringExpression:
@@ -1663,6 +1684,20 @@ class CompileTimePass:
     def _apply_function_call(
         self, call: FunctionCall, scope: CompileTimeScope
     ) -> tuple[list[Statement], FunctionCall]:
+        if not call.function_name:
+            if not isinstance(call.callee, MemberExpression):
+                raise CompileTimeError('Calling function values is not supported.', call.span)
+            prelude, receiver = self._apply_expression(call.callee.target, scope)
+            arguments = []
+            for argument in call.parameters:
+                argument_prelude, lowered = self._apply_expression_for_argument(argument, scope)
+                prelude.extend(argument_prelude)
+                arguments.append(lowered)
+            return prelude, FunctionCall(
+                MemberExpression(receiver, call.callee.member,
+                                 member_span=call.callee.member_span, span=call.callee.span),
+                arguments, call.interface_name, span=call.span,
+            )
         if call.function_name in self.TYPE_LAYOUT_QUERY_FUNCTIONS:
             raise CompileTimeError(f'{call.function_name} must be used as an expression.')
         if call.function_name.endswith('.cast'):
@@ -2285,6 +2320,12 @@ class CompileTimePass:
         )
 
     def _eval_comptime_type_argument(self, argument: object, scope: CompileTimeScope) -> TypeReference:
+        if isinstance(argument, TypeExpression):
+            return self._apply_type_reference(argument.type_ref, scope)
+        if isinstance(argument, IndexExpression):
+            element = self._eval_comptime_type_argument(argument.target, scope)
+            element.array_size = copy.deepcopy(argument.index)
+            return self._apply_type_reference(element, scope)
         if (
             type(argument) is LiteralExpression
             and argument.type == 'type'
@@ -2740,25 +2781,29 @@ class CompileTimePass:
     def _eval_comptime_method_call(
         self, call: FunctionCall, scope: CompileTimeScope
     ) -> LiteralExpression:
-        if '.' not in call.function_name:
+        if not call.function_name and isinstance(call.callee, MemberExpression):
+            receiver_name = None
+            method_name = call.callee.member
+            receiver = self.executor._receiver_cell(call.callee.target, scope)
+        elif '.' not in call.function_name:
             return self._eval_comptime_function_call(call, scope)
-
-        receiver_name, method_name = call.function_name.rsplit('.', 1)
-        if self.executor.lexical_depth and method_name == 'deinit' and receiver_name != '$drop':
-            raise CompileTimeError('Destructors cannot be called explicitly.', call.span)
-        declaration = self.types.get(receiver_name)
-        if isinstance(declaration, EnumDeclaration) and any(
-            variant.name == method_name for variant in declaration.variants
-        ):
-            return self.executor._eval_enum_variant(
-                EnumVariantExpression(
-                    TypeReference(receiver_name), method_name, list(call.parameters)
-                ),
-                scope,
-            )
-        receiver = scope.get(receiver_name)
-        if receiver is None:
-            raise CompileTimeError(f'Unknown comptime receiver "{receiver_name}".')
+        else:
+            receiver_name, method_name = call.function_name.rsplit('.', 1)
+            if self.executor.lexical_depth and method_name == 'deinit' and receiver_name != '$drop':
+                raise CompileTimeError('Destructors cannot be called explicitly.', call.span)
+            declaration = self.types.get(receiver_name)
+            if isinstance(declaration, EnumDeclaration) and any(
+                variant.name == method_name for variant in declaration.variants
+            ):
+                return self.executor._eval_enum_variant(
+                    EnumVariantExpression(
+                        TypeReference(receiver_name), method_name, list(call.parameters)
+                    ),
+                    scope,
+                )
+            receiver = scope.get(receiver_name)
+            if receiver is None:
+                raise CompileTimeError(f'Unknown comptime receiver "{receiver_name}".')
         if (
             type(receiver.value) is ComptimeBorrowValue
             and receiver.value.cell is not None
@@ -2778,7 +2823,9 @@ class CompileTimePass:
             return self._eval_comptime_resource_method(
                 receiver.value, method_name, call.parameters, scope
             )
-        receiver_value = self._comptime_struct_value(receiver, receiver_name)
+        receiver_value = self._comptime_struct_value(
+            receiver, receiver_name or receiver.type
+        )
         type_decl = self._type_declaration_for(receiver_value.type_ref)
         method = self._method_declaration_for(type_decl, method_name)
 
@@ -2792,7 +2839,9 @@ class CompileTimePass:
         method_scope = CompileTimeScope(scope)
         method_scope.declare('self', receiver)
         for parameter, argument in zip(method.parameters, call.parameters):
-            value = self._eval_comptime_argument(argument, parameter.type, method_scope, parameter.passing_mode)
+            value = self._eval_comptime_argument(
+                argument, parameter.type, scope, parameter.passing_mode
+            )
             method_scope.declare(parameter.name, value)
 
         return_type = self._apply_type_reference(method.return_type, method_scope)
@@ -3973,7 +4022,49 @@ class CompileTimePass:
             return TypeReference(expression.type)
         if type(expression) is VariableExpression:
             return self._infer_name_type(expression.name, env, types)
+        if isinstance(expression, MemberExpression):
+            owner = self._infer_expression_type(
+                expression.target, env, functions, types
+            )
+            if owner is None:
+                return None
+            declaration = types.get(
+                self._type_name(self._element_type(owner))
+            )
+            if declaration is None:
+                return None
+            field = next(
+                (
+                    field
+                    for field in getattr(declaration, 'fields', [])
+                    if field.name == expression.member
+                ),
+                None,
+            )
+            return None if field is None else field.type
         if type(expression) is FunctionCall:
+            if not expression.function_name:
+                if not isinstance(expression.callee, MemberExpression):
+                    return None
+                owner = self._infer_expression_type(
+                    expression.callee.target, env, functions, types
+                )
+                if owner is None:
+                    return None
+                declaration = types.get(
+                    self._type_name(self._element_type(owner))
+                )
+                if declaration is None:
+                    return None
+                method = next(
+                    (
+                        method
+                        for method in declaration.methods
+                        if method.name == expression.callee.member
+                    ),
+                    None,
+                )
+                return None if method is None else method.return_type
             if expression.function_name == 'len':
                 return TypeReference('i32')
             if expression.function_name in {'sizeof', 'alignof'}:
@@ -4029,6 +4120,10 @@ class CompileTimePass:
     ) -> None:
         if type(expression) is FunctionCall:
             self._infer_raises_from_call(expression, env, functions, types, errors)
+        elif isinstance(expression, MemberExpression):
+            self._infer_raises_from_expression(
+                expression.target, env, functions, types, errors
+            )
         elif type(expression) is CompositeExpression:
             self._infer_raises_from_expression(expression.left, env, functions, types, errors)
             self._infer_raises_from_expression(expression.right, env, functions, types, errors)
@@ -4065,6 +4160,32 @@ class CompileTimePass:
     ) -> None:
         for argument in call.parameters:
             self._infer_raises_from_expression(argument, env, functions, types, errors)
+
+        if not call.function_name and isinstance(call.callee, MemberExpression):
+            self._infer_raises_from_expression(
+                call.callee.target, env, functions, types, errors
+            )
+            receiver_type = self._infer_expression_type(
+                call.callee.target, env, functions, types
+            )
+            if receiver_type is None or receiver_type.pointer_mode is not None:
+                return
+            type_decl = types.get(
+                self._type_name(self._element_type(receiver_type))
+            )
+            if type_decl is None:
+                return
+            method = next((
+                method for method in type_decl.methods
+                if method.name == call.callee.member
+                or (
+                    call.interface_name == method.interface_name
+                    and method.source_name == call.callee.member
+                )
+            ), None)
+            if method is not None:
+                self._merge_inferred_errors(errors, method.raises)
+            return
 
         if call.function_name in {'sizeof', 'alignof', 'len'} or is_builtin_type(call.function_name):
             return
@@ -4375,6 +4496,8 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
         self.compile_time_pass = compile_time_pass
         self.caught_errors: list[ComptimeRaisedError] = []
         self.lexical_depth = 0
+        self.expression_depth = 0
+        self.expression_temporaries: list[LiteralExpression] = []
 
     def _execute_statement(self, statement, scope, allow_return):
         if isinstance(statement, Block):
@@ -4384,6 +4507,9 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
                 return self._execute_block(statement.body, scope, allow_return)
             finally:
                 self.lexical_depth -= 1
+        if type(statement) is FunctionCall:
+            self._eval_expression(statement, scope)
+            return None
         return super()._execute_statement(statement, scope, allow_return)
 
     def _allows_comptime_statement(self, statement: Statement, scope: CompileTimeScope) -> bool:
@@ -4514,11 +4640,88 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
         return value
 
     def _eval_expression(self, expression, scope):
-        if self.lexical_depth and isinstance(expression, MoveExpression):
-            if not isinstance(expression.expr, VariableExpression):
-                raise CompileTimeError('Unsupported comptime move target.', expression.span)
-            return self._take_variable(expression.expr, scope)
-        return super()._eval_expression(expression, scope)
+        outermost = self.expression_depth == 0
+        result = None
+        if outermost:
+            self.expression_temporaries = []
+        self.expression_depth += 1
+        try:
+            variant = self.compile_time_pass._generic_variant_expression(expression)
+            if variant is not None:
+                result = self._eval_enum_variant(variant, scope)
+            elif isinstance(expression, MemberExpression):
+                result = _clone_comptime_literal(self._member_cell(expression, scope))
+            elif self.lexical_depth and isinstance(expression, MoveExpression):
+                if not isinstance(expression.expr, VariableExpression):
+                    raise CompileTimeError('Unsupported comptime move target.', expression.span)
+                result = self._take_variable(expression.expr, scope)
+            else:
+                result = super()._eval_expression(expression, scope)
+            return result
+        finally:
+            self.expression_depth -= 1
+            if outermost:
+                self._finish_expression_temporaries(
+                    result, scope, getattr(expression, 'span', None)
+                )
+
+    def _finish_expression_temporaries(
+        self,
+        result: LiteralExpression | None,
+        scope: CompileTimeScope,
+        span=None,
+    ) -> None:
+        temporaries = self.expression_temporaries
+        self.expression_temporaries = []
+        owned = set()
+        for temporary in temporaries:
+            self._collect_owned(temporary, owned)
+        if result is not None and self._borrows_owned(result, owned):
+            for temporary in reversed(temporaries):
+                self._destroy_value(temporary, scope)
+            raise CompileTimeError(
+                'A comptime borrow cannot escape an owned temporary.', span
+            )
+        for temporary in reversed(temporaries):
+            self._destroy_value(temporary, scope)
+
+    def _register_expression_temporary(self, value: LiteralExpression) -> None:
+        if not any(item is value for item in self.expression_temporaries):
+            self.expression_temporaries.append(value)
+
+    def _is_comptime_place(self, expression: Expression) -> bool:
+        if isinstance(expression, VariableExpression):
+            return True
+        if isinstance(expression, (MemberExpression, IndexExpression)):
+            return self._is_comptime_place(expression.target)
+        return False
+
+    def _receiver_cell(
+        self, expression: Expression, scope: CompileTimeScope
+    ) -> LiteralExpression:
+        if self._is_comptime_place(expression):
+            return self._assignment_cell(expression, scope)
+        value = self._eval_expression(expression, scope)
+        self._register_expression_temporary(value)
+        return value
+
+    def _member_cell(
+        self, expression: MemberExpression, scope: CompileTimeScope
+    ) -> LiteralExpression:
+        target = self._receiver_cell(expression.target, scope)
+        if isinstance(target.value, ComptimeBorrowValue) and target.value.cell is not None:
+            target = target.value.cell
+        if not isinstance(target.value, ComptimeStructValue):
+            raise CompileTimeError(
+                f'Cannot access member "{expression.member}" on comptime value of type "{target.type}".',
+                expression.span,
+            )
+        field = target.value.fields.get(expression.member)
+        if field is None:
+            raise CompileTimeError(
+                f'Unknown comptime field "{expression.member}".', expression.member_span
+            )
+        return field
 
     def _eval_return(self, statement, scope):
         if self.lexical_depth and isinstance(statement.expr, VariableExpression) and '.' not in statement.expr.name:
@@ -4550,6 +4753,25 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
             )
 
     def _execute_assignment(self, assignment: Assignment, scope: CompileTimeScope) -> None:
+        outermost = self.expression_depth == 0
+        if outermost:
+            self.expression_temporaries = []
+        self.expression_depth += 1
+        try:
+            self._execute_assignment_inner(assignment, scope)
+        finally:
+            self.expression_depth -= 1
+            if outermost:
+                self._finish_expression_temporaries(None, scope, assignment.span)
+
+    def _execute_assignment_inner(
+        self, assignment: Assignment, scope: CompileTimeScope
+    ) -> None:
+        target = (
+            None
+            if type(assignment.name) is str
+            else self._assignment_cell(assignment.name, scope)
+        )
         if type(assignment.name) is str:
             owner = scope._scope_containing(assignment.name)
             if owner is not None and assignment.name in owner.moved_names:
@@ -4600,7 +4822,7 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
             )
             return
 
-        target = self._assignment_cell(assignment.name, scope)
+        assert target is not None
         target_type = self.compile_time_pass._literal_type_reference(target)
         target.value = self.compile_time_pass._cast_comptime(
             value.value, target_type, source_type=value.type
@@ -4876,6 +5098,8 @@ class CompileTimeExecutor(ExecutionEngine[LiteralExpression, CompileTimeScope]):
         )
 
     def _assignment_cell(self, target: Expression, scope: CompileTimeScope) -> LiteralExpression:
+        if isinstance(target, MemberExpression):
+            return self._member_cell(target, scope)
         if type(target) is IndexExpression:
             indexed = self._storage_value(target.target, scope)
             index = self._index_value(target.index, scope)

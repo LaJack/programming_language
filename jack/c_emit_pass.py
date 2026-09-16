@@ -27,6 +27,7 @@ try:
     from .hir_nodes import (
         HIRAssignment,
         HIRBlock,
+        HIRSequence,
         HIRBorrowExpression,
         HIRCallExpression,
         HIRCatchClause,
@@ -97,6 +98,7 @@ except ImportError:
     from hir_nodes import (
         HIRAssignment,
         HIRBlock,
+        HIRSequence,
         HIRBorrowExpression,
         HIRCallExpression,
         HIRCatchClause,
@@ -1670,6 +1672,8 @@ class CEmitPass:
             return self._emit_hir_try(statement, env)
         if isinstance(statement, HIRBlock):
             return self._emit_hir_scoped_block(statement, env)
+        if isinstance(statement, HIRSequence):
+            return self._emit_hir_block(statement.body, env)
         if isinstance(statement, HIRUnsafeBlock):
             return self._emit_hir_scoped_block(
                 HIRBlock(body=statement.body, span=statement.span), env
@@ -1708,7 +1712,7 @@ class CEmitPass:
         return lines
 
     def _hir_statement_terminates(self, statement: HIRStatement) -> bool:
-        if isinstance(statement, HIRBlock):
+        if isinstance(statement, (HIRBlock, HIRSequence)):
             return bool(statement.body) and self._hir_statement_terminates(
                 statement.body[-1]
             )
@@ -1718,6 +1722,11 @@ class CEmitPass:
         self, statement: HIRVariableDeclaration, env: dict[str, TypeReference]
     ) -> list[str]:
         symbol = statement.symbol
+        if not statement.initialized:
+            env[symbol.name] = symbol.type_ref
+            return [
+                f'{self._emit_declaration(symbol.type_ref, self._mangle(symbol.name), env)};'
+            ]
         if (
             statement.initializer is None
             and statement.constructor_call is None
@@ -1769,12 +1778,15 @@ class CEmitPass:
     def _emit_hir_assignment(
         self, statement: HIRAssignment, env: dict[str, TypeReference]
     ) -> list[str]:
+        target = self._emit_hir_expression(statement.target, env)
+        address = self._next_temporary_name('assignment_target')
+        prefix = [f'__auto_type {address} = &({target});']
         if statement.target_type.array_size is not None:
-            target = self._emit_hir_expression(statement.target, env)
             source = self._emit_hir_expression(statement.expr, env)
-            return [f'__builtin_memmove({target}, {source}, sizeof({target}));']
+            return [*prefix, f'__builtin_memmove(*{address}, {source}, sizeof(*{address}));']
         return [
-            f'{self._emit_hir_expression(statement.target, env)} = '
+            *prefix,
+            f'*{address} = '
             f'{self._emit_hir_expression_as_type(statement.expr, statement.target_type, env)};'
         ]
 
@@ -1853,7 +1865,19 @@ class CEmitPass:
     def _emit_hir_while(
         self, statement: HIRWhile, env: dict[str, TypeReference]
     ) -> list[str]:
-        lines = [f'while ({self._emit_hir_condition(statement.condition, env, "while condition")}) {{']
+        if statement.condition_setup:
+            loop_env = dict(env)
+            lines = ['while (1) {']
+            lines.extend(
+                self._indent(line)
+                for line in self._emit_hir_block(statement.condition_setup, loop_env)
+            )
+            condition = self._emit_hir_condition(
+                statement.condition, loop_env, 'while condition'
+            )
+            lines.append(self._indent(f'if (!({condition})) break;'))
+        else:
+            lines = [f'while ({self._emit_hir_condition(statement.condition, env, "while condition")}) {{']
         lines.extend(
             self._indent(line)
             for line in self._emit_hir_block(statement.body, dict(env))
@@ -1865,6 +1889,8 @@ class CEmitPass:
         self, statement: HIRFor, env: dict[str, TypeReference]
     ) -> list[str]:
         loop_env = dict(env)
+        if statement.condition_setup:
+            raise CEmitError('For condition setup must be normalized before C emission.')
         initializer = self._emit_hir_for_initializer(statement.initializer, loop_env)
         condition = '' if statement.condition is None else self._emit_hir_condition(statement.condition, loop_env, 'for condition')
         update = self._emit_hir_for_update(statement.update, loop_env)
@@ -2410,10 +2436,9 @@ class CEmitPass:
             arguments = self._emit_hir_call_arguments(call.arguments, target.parameters, env)
             return f'{self._mangle(target.name)}({arguments})'
         if target.kind == 'method':
-            receiver_name = target.receiver_name
             owner_type_name = target.owner_type_name
             self_parameter = target.self_parameter
-            if owner_type_name is None or self_parameter is None or receiver_name is None:
+            if owner_type_name is None or self_parameter is None or call.receiver is None:
                 raise CEmitError(f'Incomplete HIR method target for "{target.name}".')
             method_name = target.name.rsplit('.', 1)[-1]
             if target.raises and not allow_raising:

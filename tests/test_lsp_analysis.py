@@ -28,6 +28,32 @@ class SemanticLspProjectTests(unittest.TestCase):
             entry, overlays=overlays, versions=versions
         )
 
+    def test_expression_receiver_members_are_resolved(self):
+        entry = self.write('chains.jack', '''
+            struct Leaf { i32 value; i32 read(&in self) { return self.value; } }
+            struct Owner { Leaf leaf; &in Leaf get(&in self) { return &in self.leaf; } }
+            Owner owner = Owner { leaf = Leaf { value = 1 } };
+            print(owner.get().read());
+            print(owner.get().value);
+        ''')
+        result = self.analyze(entry)
+        self.assertFalse(result.diagnostics)
+        model = result.model
+        text = entry.read_text()
+        for suffix in ('read());', 'value);'):
+            offset = text.index(suffix, text.index('print('))
+            occurrence = next(item for item in model.occurrences if item.span.start_offset == offset)
+            self.assertEqual(suffix.split('(')[0].split(')')[0], model.symbols[occurrence.symbol_id].name)
+        server, uri = self.server_for(entry, result)
+        incomplete = text.replace('owner.get().read()', 'owner.get().')
+        server.documents[uri] = Document(uri, incomplete, 2)
+        offset = incomplete.index('owner.get().') + len('owner.get().')
+        prefix = incomplete[:offset]
+        items = server._completion({'textDocument': {'uri': uri}, 'position': {
+            'line': prefix.count('\n'), 'character': len(prefix.rsplit('\n', 1)[-1]),
+        }})
+        self.assertTrue({'read', 'value'} <= {item['label'] for item in items})
+
     def server_for(self, entry: Path, analysis, version=1):
         server = LanguageServer(None, io.BytesIO(), None)
         uri = uri_from_path(entry)

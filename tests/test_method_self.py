@@ -182,7 +182,10 @@ class ExplicitMethodSelfBorrowTests(unittest.TestCase):
 
         self.assertIn('void Packet_refresh(PacketChecksumView self);', c_source)
         self.assertIn('int32_t header = (*self.header);', c_source)
-        self.assertIn('(*self.checksum) = (header + 1);', c_source)
+        self.assertRegex(
+            c_source,
+            r'__auto_type (\w+) = &\(\(\*self\.checksum\)\);\s+\*\1 = \(header \+ 1\);',
+        )
         self.assertIn('Packet_refresh((PacketChecksumView){.header = &packet.header, .checksum = &packet.checksum});', c_source)
 
     def test_jack_emit_round_trips_explicit_self(self):

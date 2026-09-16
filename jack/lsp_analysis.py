@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlparse
 
 from .ast_nodes import (
     Block,
+    MemberExpression,
     Assignment,
     BorrowExpression,
     CatchClause,
@@ -145,6 +146,7 @@ class SemanticModel:
     sources: dict[Path, str] = field(default_factory=dict)
     modules: dict[str, Path] = field(default_factory=dict)
     versions: dict[Path, int | None] = field(default_factory=dict)
+    expression_types: dict[tuple[Path, int, int], TypeReference] = field(default_factory=dict)
     complete: bool = True
 
     def merge(self, other: 'SemanticModel') -> None:
@@ -169,6 +171,7 @@ class SemanticModel:
         self.sources.update(other.sources)
         self.modules.update(other.modules)
         self.versions.update(other.versions)
+        self.expression_types.update(other.expression_types)
         self.complete = self.complete and other.complete
 
     def occurrence_at(self, path: Path, offset: int) -> SemanticOccurrence | None:
@@ -845,10 +848,38 @@ class _GraphIndexBuilder:
     def _expression(
         self, node: Expression, env: dict[str, str]
     ) -> TypeReference | None:
+        result = self._expression_inner(node, env)
+        if result is not None and node.span is not None and node.span.source_path is not None:
+            span = node.span
+            path = Path(span.source_path)
+            end = span.end_offset
+            source = self.model.sources.get(path, '')
+            while end > span.start_offset and end <= len(source) and source[end - 1] in ' \t\r\n;':
+                end -= 1
+            self.model.expression_types[path, span.start_offset, end] = copy.deepcopy(result)
+        return result
+
+    def _expression_inner(
+        self, node: Expression, env: dict[str, str]
+    ) -> TypeReference | None:
         if isinstance(node, LiteralExpression):
             return TypeReference(node.type)
         if isinstance(node, VariableExpression):
             return self._name_occurrences(node.name, node.span, env)
+        if isinstance(node, MemberExpression):
+            receiver = self._expression(node.target, env)
+            owner_id = self._type_symbol_id(receiver.name) if receiver is not None else None
+            member = self._member(owner_id, node.member) if owner_id is not None else None
+            if member is not None:
+                self._occurrence_for_symbol(node.member_span or node.span, member, prefer_last=True)
+                return (TypeReference(member.resolved_type) if member.resolved_type is not None
+                        else _parse_type_label(member.type_label))
+            if owner_id is not None and node.span is not None:
+                self.diagnostics.append(AnalysisDiagnostic(
+                    f'Unknown member "{node.member}".', node.member_span or node.span,
+                    code='unknown-member',
+                ))
+            return None
         if isinstance(node, FunctionCall):
             return self._call(node, env)
         if isinstance(node, EnumVariantExpression):
@@ -919,6 +950,30 @@ class _GraphIndexBuilder:
         return None
 
     def _call(self, node: FunctionCall, env: dict[str, str]) -> TypeReference | None:
+        if not node.function_name and isinstance(node.callee, MemberExpression):
+            receiver_type = self._expression(node.callee.target, env)
+            for argument in node.parameters:
+                self._expression(argument, env)
+            owner_id = self._type_symbol_id(receiver_type.name) if receiver_type is not None else None
+            member = self._member(owner_id, node.callee.member) if owner_id is not None else None
+            if member is None:
+                if owner_id is not None and node.span is not None:
+                    self.diagnostics.append(AnalysisDiagnostic(
+                        f'Unknown member "{node.callee.member}".', node.callee.member_span or node.span,
+                        code='unknown-member',
+                    ))
+                return None
+            self._occurrence_for_symbol(node.callee.member_span or node.callee.span, member, prefer_last=True)
+            self._check_arity(node, member)
+            owner = self.type_declarations.get(receiver_type.name)
+            if isinstance(owner, (TypeDeclaration, EnumDeclaration)):
+                declaration = next((method for method in owner.methods if method.name == node.callee.member), None)
+                if declaration is not None:
+                    self._check_arguments(node, declaration.parameters, env)
+                    return copy.deepcopy(declaration.return_type)
+                if isinstance(owner, EnumDeclaration):
+                    return copy.deepcopy(receiver_type)
+            return None
         for argument in node.parameters:
             self._expression(argument, env)
         name = node.function_name
@@ -936,6 +991,11 @@ class _GraphIndexBuilder:
                     return TypeReference(owner.name)
         direct = self.top_by_internal.get(parts[0])
         symbol = self.model.symbols.get(direct or '')
+        owner = self.type_declarations.get(name)
+        if isinstance(owner, EnumDeclaration) and owner.parameters:
+            if symbol is not None:
+                self._occurrence_for_symbol(node.callee.span or node.span, symbol, prefer_last=True)
+            return TypeReference(name, copy.deepcopy(node.parameters))
         if symbol is not None and symbol.kind == 'function':
             self._occurrence_for_symbol(node.span, symbol, prefer_last=len(parts) > 1)
             self._check_arity(node, symbol)

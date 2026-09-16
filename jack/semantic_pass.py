@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 import copy
 
 try:
+    from .ast_nodes import MemberExpression
     from .borrow_modes import (
         BORROW_MODES,
         borrow_mode_can_read,
@@ -64,6 +65,7 @@ try:
         While,
     )
 except ImportError:
+    from ast_nodes import MemberExpression
     from borrow_modes import (
         BORROW_MODES,
         borrow_mode_can_read,
@@ -223,6 +225,7 @@ class SemanticPass:
         self.current_qualified_imports: list[ImportBinding] = []
         self.current_return_type: TypeReference | None = None
         self.current_function_name: str | None = None
+        self.expression_types: dict[int, tuple[Expression, TypeReference]] = {}
         self.current_raises: set[str] | None = None
         self.current_caught_errors: set[str] = set()
         self.current_rethrow_errors: list[str] = []
@@ -933,9 +936,9 @@ class SemanticPass:
             info = SymbolInfo(
                 'variable', parameter.type,
                 module_name=declaration.module_name,
-                can_return_borrow=self._is_borrow_type(parameter.type),
+                can_return_borrow=self._is_reference_type(parameter.type),
                 passing_mode=parameter.passing_mode,
-                owned_local=not self._is_borrow_type(parameter.type),
+                owned_local=not self._is_reference_type(parameter.type),
             )
             scope.declare(parameter.name, info)
             self.ownership_states[info.ownership_key] = 'initialized'
@@ -950,7 +953,7 @@ class SemanticPass:
         previous_rethrow_errors = self.current_rethrow_errors
         previous_borrow_return_accesses = self.current_borrow_return_accesses
         borrow_return_accesses: list[BorrowAccess] | None = (
-            [] if self._is_borrow_type(declaration.return_type) else None
+            [] if self._is_reference_type(declaration.return_type) else None
         )
         self.current_module_name = declaration.module_name
         self.current_imports = list(declaration.imports)
@@ -1001,9 +1004,9 @@ class SemanticPass:
             info = SymbolInfo(
                 'variable', parameter.type,
                 module_name=type_decl.module_name,
-                can_return_borrow=self._is_borrow_type(parameter.type),
+                can_return_borrow=self._is_reference_type(parameter.type),
                 passing_mode=parameter.passing_mode,
-                owned_local=not self._is_borrow_type(parameter.type),
+                owned_local=not self._is_reference_type(parameter.type),
             )
             scope.declare(parameter.name, info)
             self.ownership_states[info.ownership_key] = 'initialized'
@@ -1018,7 +1021,7 @@ class SemanticPass:
         previous_rethrow_errors = self.current_rethrow_errors
         previous_borrow_return_accesses = self.current_borrow_return_accesses
         borrow_return_accesses: list[BorrowAccess] | None = (
-            [] if self._is_borrow_type(method.return_type) else None
+            [] if self._is_reference_type(method.return_type) else None
         )
         self.current_module_name = type_decl.module_name
         self.current_imports = list(type_decl.imports)
@@ -1171,7 +1174,7 @@ class SemanticPass:
         if declaration.expr is not None and not declaration.constant:
             expr_type = self._expression_type_for_target(declaration.expr, declaration.type, scope)
             self._expect_assignable(declaration.type, expr_type, declaration.expr, f'initializer for "{declaration.name}"')
-            if self._is_borrow_type(declaration.type):
+            if self._is_reference_type(declaration.type):
                 borrow_accesses = self._borrow_accesses_for_initializer(
                     declaration.expr, declaration.type, scope
                 )
@@ -1193,7 +1196,7 @@ class SemanticPass:
             borrow_accesses=borrow_accesses,
             view_borrow_accesses=view_borrow_accesses,
             can_return_borrow=scope is self.global_scope,
-            owned_local=scope is not self.global_scope and not self._is_borrow_type(declaration.type),
+            owned_local=scope is not self.global_scope and not self._is_reference_type(declaration.type),
             constant=declaration.constant,
         )
         scope.declare(declaration.name, info)
@@ -1219,17 +1222,35 @@ class SemanticPass:
                 'assignment target',
                 ignore_owners=self._place_source_owners(assignment.name, scope),
             )
-        expr_type = self._expression_type_for_target(assignment.expr, target_type, scope)
+        value_scope = SemanticScope(scope)
+        for access in self._assignment_receiver_borrows(assignment.target, scope):
+            value_scope.add_borrow('<assignment receiver>', access)
+        expr_type = self._expression_type_for_target(assignment.expr, target_type, value_scope)
         self._expect_assignable(target_type, expr_type, assignment.expr, 'assignment')
         place = self._ownership_place(assignment.name, scope, require_static_index=False)
         if place is not None:
             self._set_place_state(place, 'initialized')
+
+    def _assignment_receiver_borrows(
+        self, target: Expression, scope: SemanticScope
+    ) -> tuple[BorrowAccess, ...]:
+        if isinstance(target, (MemberExpression, IndexExpression, SliceExpression)):
+            return self._assignment_receiver_borrows(target.target, scope)
+        if isinstance(target, DereferenceExpression):
+            return self._assignment_receiver_borrows(target.expr, scope)
+        if isinstance(target, FunctionCall):
+            result_type = self._expression_type(target, scope, check_reads=False)
+            if self._is_borrow_type(result_type):
+                return self._place_accesses(target, result_type.borrow, scope)
+        return ()
 
     def _assignment_root_name(self, target: str | Expression) -> str | None:
         if isinstance(target, str):
             return target.split('.', 1)[0]
         if type(target) is VariableExpression:
             return target.name.split('.', 1)[0]
+        if isinstance(target, MemberExpression):
+            return self._assignment_root_name(target.target)
         if type(target) is IndexExpression:
             return self._assignment_root_name(target.target)
         if type(target) is DereferenceExpression:
@@ -1255,6 +1276,9 @@ class SemanticPass:
         elif type(target) is VariableExpression:
             parts = target.name.split('.')
             root, projections = parts[0], tuple(parts[1:])
+        elif isinstance(target, MemberExpression):
+            base = self._ownership_place(target.target, scope, require_static_index=require_static_index)
+            return None if base is None else (base[0], base[1], (*base[2], target.member))
         elif type(target) is IndexExpression:
             base = self._ownership_place(
                 target.target, scope, require_static_index=require_static_index
@@ -1409,7 +1433,7 @@ class SemanticPass:
             return
         if self._is_void_type(self.current_return_type):
             raise SemanticError(f'Void function "{self.current_function_name}" cannot return a value.')
-        if self._is_borrow_type(self.current_return_type):
+        if self._is_reference_type(self.current_return_type):
             expr_type = self._expression_type_for_target(
                 statement.expr, self.current_return_type, scope
             )
@@ -1597,6 +1621,27 @@ class SemanticPass:
     def _expression_type(
         self, expression: Expression, scope: SemanticScope, check_reads: bool = True
     ) -> TypeReference:
+        if not check_reads and isinstance(expression, FunctionCall) and id(expression) in self.expression_types:
+            return self.expression_types[id(expression)][1]
+        result = self._expression_type_inner(expression, scope, check_reads)
+        self.expression_types[id(expression)] = (expression, result)
+        return result
+
+    def _expression_type_inner(
+        self, expression: Expression, scope: SemanticScope, check_reads: bool = True
+    ) -> TypeReference:
+        if isinstance(expression, MemberExpression):
+            owner = self._expression_type(expression.target, scope, check_reads=False)
+            field_type = self._member_type(owner, expression.member)
+            if check_reads:
+                accesses = self._place_accesses(expression, 'in', scope)
+                for access in accesses:
+                    self._require_initialized(self._borrow_path_label(access.path), scope)
+                if self._contains_non_readable_borrow(expression.target, scope):
+                    raise SemanticError('Cannot read through a write-only borrow.')
+                self._check_borrow_conflicts(accesses, scope, 'member read',
+                                           ignore_owners=self._place_source_owners(expression, scope))
+            return field_type
         if type(expression) is LiteralExpression:
             if expression.type == 'null':
                 return TypeReference('null')
@@ -1985,6 +2030,39 @@ class SemanticPass:
         raise SemanticError(f'Unknown operator "{expression.operator}".')
 
     def _function_call_type(self, call: FunctionCall, scope: SemanticScope) -> TypeReference:
+        if not call.function_name:
+            if not isinstance(call.callee, MemberExpression):
+                raise SemanticError('Calling function values is not supported.')
+            receiver_type = self._expression_type(
+                call.callee.target, scope, check_reads=False
+            )
+            if receiver_type.pointer_mode is not None:
+                if call.callee.member == 'offset':
+                    if self.unsafe_depth == 0:
+                        raise SemanticError('Raw pointer offset requires an unsafe context.')
+                    if receiver_type.nullable:
+                        raise SemanticError('offset requires a non-null raw pointer receiver.')
+                    if len(call.parameters) != 1:
+                        raise SemanticError('offset expects one element count.')
+                    self._expect_integer_expression(
+                        call.parameters[0], scope, 'pointer offset'
+                    )
+                    return copy.deepcopy(receiver_type)
+                if call.callee.member == 'cast':
+                    if self.unsafe_depth == 0:
+                        raise SemanticError('Raw pointer cast requires an unsafe context.')
+                    if len(call.parameters) != 1 or type(call.parameters[0]) is not TypeExpression:
+                        raise SemanticError('cast expects one type argument.')
+                    target = call.parameters[0].type_ref
+                    if target.name not in {'c_void', 'c_char'}:
+                        self._validate_type_reference(target, allow_void=False)
+                    return TypeReference(
+                        target.name,
+                        copy.deepcopy(target.arguments),
+                        pointer_mode=receiver_type.pointer_mode,
+                        nullable=receiver_type.nullable,
+                    )
+            return self._validate_method_call(call, scope)
         enum_result = self._enum_constructor_call_type(call, scope)
         if enum_result is not None:
             return enum_result
@@ -2160,8 +2238,14 @@ class SemanticPass:
         return TypeReference(target_type)
 
     def _validate_method_call(self, call: FunctionCall, scope: SemanticScope) -> TypeReference:
-        receiver_name, method_name = call.function_name.rsplit('.', 1)
-        receiver_type = self._resolve_name_type(receiver_name, scope)
+        if call.function_name:
+            receiver_name, method_name = call.function_name.rsplit('.', 1)
+            self_argument = VariableExpression(receiver_name, span=call.span)
+            receiver_type = self._resolve_name_type(receiver_name, scope)
+        else:
+            self_argument = call.callee.target
+            method_name = call.callee.member
+            receiver_type = self._expression_type(self_argument, scope, check_reads=False)
         type_decl = self._type_declaration_for(receiver_type)
         method = self._visible_method_for_call(type_decl, method_name, call.interface_name)
         if method is None:
@@ -2171,8 +2255,6 @@ class SemanticPass:
                 f'Call to unsafe method "{type_decl.name}.{method_name}" requires an unsafe context.'
             )
         self_parameter = self._method_self_parameter(type_decl, method)
-        self_argument = VariableExpression(receiver_name)
-        self_argument.span = call.span
         self_borrows = self._validate_call_argument(
             f'{type_decl.name}.{method_name}', self_parameter, self_argument, scope
         )
@@ -2304,10 +2386,12 @@ class SemanticPass:
     def _validate_borrow_return(
         self, expression: Expression, return_type: TypeReference, scope: SemanticScope
     ) -> None:
+        if self._is_str_type(return_type) and self._is_static_str_expression(expression):
+            return
         if (
             type(expression) is FunctionCall
             and expression.function_name.endswith(
-                ('jack_bytes_view', 'jack_bytes_view_mut')
+                ('jack_bytes_view', 'jack_bytes_view_mut', 'jack_string_view')
             )
             and self.unsafe_depth > 0
         ):
@@ -2345,6 +2429,17 @@ class SemanticPass:
                 )
         if self.current_borrow_return_accesses is not None:
             self.current_borrow_return_accesses.extend(accesses)
+
+    def _is_static_str_expression(self, expression: Expression) -> bool:
+        if type(expression) is LiteralExpression:
+            return expression.type == 'str'
+        if isinstance(expression, Match):
+            return bool(expression.arms) and all(
+                arm.expr is not None
+                and self._is_static_str_expression(arm.expr)
+                for arm in expression.arms
+            )
+        return False
 
     def _borrow_return_accesses(
         self, expression: Expression, return_type: TypeReference, scope: SemanticScope
@@ -2399,9 +2494,24 @@ class SemanticPass:
             info = scope.get(expression.name)
             if info is not None and info.borrow_accesses:
                 return self._place_accesses(expression, expected_type.borrow or 'in', scope)
-        if type(expression) is FunctionCall:
-            return self._borrow_accesses_for_call_result(expression, expected_type, scope)
+        if isinstance(expression, FunctionCall):
+            accesses = self._borrow_accesses_for_call_result(expression, expected_type, scope)
+            self._reject_temporary_borrow_escape(accesses, 'initializer')
+            return accesses
+        if isinstance(expression, (MemberExpression, IndexExpression, SliceExpression)):
+            accesses = self._place_accesses(expression, expected_type.borrow or 'in', scope)
+            self._reject_temporary_borrow_escape(accesses, 'initializer')
+            return accesses
         return ()
+
+    def _reject_temporary_borrow_escape(
+        self, accesses: tuple[BorrowAccess, ...], context: str
+    ) -> None:
+        if any(access.path.root.startswith('$temporary$') for access in accesses):
+            raise SemanticError(
+                f'Cannot store a borrow from an owned temporary in a {context}; '
+                'the temporary is destroyed at the end of the full expression.'
+            )
 
     def _view_borrow_accesses_for_initializer(
         self, expression: Expression, expected_type: TypeReference, scope: SemanticScope
@@ -2454,7 +2564,7 @@ class SemanticPass:
         if target is None:
             return ()
         declaration, parameters, receiver_name, type_decl = target
-        if not self._is_borrow_type(declaration.return_type):
+        if not self._is_reference_type(declaration.return_type):
             return ()
         if not declaration.extern:
             if type_decl is None:
@@ -2500,12 +2610,16 @@ class SemanticPass:
 
     def _borrow_return_call_target(
         self, call: FunctionCall, scope: SemanticScope
-    ) -> tuple[FunctionDeclaration, list[VariableDeclaration], str | None, TypeDeclaration | None] | None:
+    ) -> tuple[FunctionDeclaration, list[VariableDeclaration], str | Expression | None, TypeDeclaration | None] | None:
         if call.function_name in {'sizeof', 'alignof', 'len'} or is_builtin_type(call.function_name):
             return None
-        if '.' in call.function_name:
-            receiver_name, method_name = call.function_name.rsplit('.', 1)
-            receiver_type = self._resolve_name_type(receiver_name, scope)
+        if '.' in call.function_name or isinstance(call.callee, MemberExpression):
+            if call.function_name:
+                receiver_name, method_name = call.function_name.rsplit('.', 1)
+                receiver_type = self._resolve_name_type(receiver_name, scope)
+            else:
+                receiver_name, method_name = call.callee.target, call.callee.member
+                receiver_type = self._expression_type(receiver_name, scope, check_reads=False)
             type_decl = self._type_declaration_for(receiver_type)
             method = self._visible_method_for_call(
                 type_decl, method_name, call.interface_name
@@ -2520,9 +2634,10 @@ class SemanticPass:
         return declaration, declaration.parameters, None, None
 
     def _map_return_access_to_place(
-        self, place_name: str, access: BorrowAccess, scope: SemanticScope
+        self, place_name: str | Expression, access: BorrowAccess, scope: SemanticScope
     ) -> tuple[BorrowAccess, ...]:
-        base_accesses = self._place_accesses(VariableExpression(place_name), access.mode, scope)
+        target = VariableExpression(place_name) if isinstance(place_name, str) else place_name
+        base_accesses = self._place_accesses(target, access.mode, scope)
         return self._append_return_access_fields(base_accesses, access.path.fields)
 
     def _map_return_access_to_argument(
@@ -2532,7 +2647,7 @@ class SemanticPass:
         access: BorrowAccess,
         scope: SemanticScope,
     ) -> tuple[BorrowAccess, ...]:
-        if not self._is_borrow_type(parameter.type):
+        if not self._is_reference_type(parameter.type):
             return ()
         if type(argument) is BorrowExpression:
             expected_type = None if access.path.fields else parameter.type
@@ -2581,6 +2696,16 @@ class SemanticPass:
     def _place_accesses(
         self, target: str | Expression, mode: str, scope: SemanticScope
     ) -> tuple[BorrowAccess, ...]:
+        if isinstance(target, MemberExpression):
+            return self._append_return_access_fields(self._place_accesses(target.target, mode, scope), (target.member,))
+        if isinstance(target, FunctionCall):
+            result_type = self._expression_type(target, scope, check_reads=False)
+            if self._is_reference_type(result_type):
+                return tuple(BorrowAccess(access.path, mode) for access in
+                             self._borrow_accesses_for_call_result(target, result_type, scope))
+            return (BorrowAccess(BorrowPath(f'$temporary${id(target)}'), mode),)
+        if isinstance(target, (IndexExpression, SliceExpression)) and not self._raw_place_paths(target):
+            return self._append_return_access_fields(self._place_accesses(target.target, mode, scope), ('*',))
         if type(target) is DereferenceExpression:
             return ()
         paths = self._raw_place_paths(target)
@@ -2596,6 +2721,8 @@ class SemanticPass:
             return (self._path_from_name(target),)
         if type(target) is VariableExpression:
             return (self._path_from_name(target.name),)
+        if isinstance(target, MemberExpression):
+            return tuple(self._append_path(path, (target.member,)) for path in self._raw_place_paths(target.target))
         if type(target) is IndexExpression:
             return tuple(self._append_path(path, ('*',)) for path in self._raw_place_paths(target.target))
         if type(target) is SliceExpression:
@@ -2679,6 +2806,15 @@ class SemanticPass:
         return self._place_source_owners(expression, scope)
 
     def _place_source_owners(self, target: str | Expression, scope: SemanticScope) -> set[str]:
+        if isinstance(target, (MemberExpression, IndexExpression, SliceExpression)):
+            return self._place_source_owners(target.target, scope)
+        if isinstance(target, FunctionCall):
+            owners = set()
+            if isinstance(target.callee, MemberExpression):
+                owners.update(self._place_source_owners(target.callee.target, scope))
+            for argument in target.parameters:
+                owners.update(self._place_source_owners(argument, scope))
+            return owners
         return {path.root for path in self._raw_place_paths(target) if self._is_tracked_borrow_owner(path.root, scope)}
 
     def _is_tracked_borrow_owner(self, name: str, scope: SemanticScope) -> bool:
@@ -2813,6 +2949,10 @@ class SemanticPass:
     def _assignment_target_type(
         self, target: str | Expression, scope: SemanticScope
     ) -> TypeReference:
+        if isinstance(target, MemberExpression):
+            if self._contains_non_writable_borrow(target.target, scope):
+                raise SemanticError('Cannot assign through a read-only borrow.')
+            return self._expression_type(target, scope, check_reads=False)
         if type(target) is str:
             resolved = self._resolve_name_type(target, scope)
             if self._is_borrow_type(resolved) and not self._is_slice_type(resolved):
@@ -2889,7 +3029,7 @@ class SemanticPass:
         if (
             source_expression is not None
             and type(source_expression) is not MoveExpression
-            and self._raw_place_paths(source_expression)
+            and (self._raw_place_paths(source_expression) or isinstance(source_expression, MemberExpression))
             and not self._is_borrow_type(target_type)
             and not self._is_copyable_type(target_type)
         ):
@@ -3046,6 +3186,18 @@ class SemanticPass:
                 )
             current_type = field.type
         return current_type
+
+    def _member_type(self, owner: TypeReference, member: str) -> TypeReference:
+        view_field = self._view_field_for_type(owner, member)
+        if view_field is not None:
+            return view_field.type
+        declaration = self._type_declaration_for(owner)
+        field = next((field for field in declaration.fields if field.name == member), None)
+        if field is None:
+            raise SemanticError(f'Type "{declaration.name}" has no field "{member}".')
+        if not self._is_same_module(declaration.module_name):
+            raise SemanticError(f'Field "{member}" is private to module "{declaration.module_name}".')
+        return field.type
 
     def _validate_type_runtime_expressions(
         self, type_ref: TypeReference, scope: SemanticScope, context: str
@@ -3206,6 +3358,9 @@ class SemanticPass:
         return declaration
 
     def _contains_non_writable_borrow(self, expression: Expression, scope: SemanticScope) -> bool:
+        if isinstance(expression, MemberExpression):
+            if self._contains_non_writable_borrow(expression.target, scope):
+                return True
         if type(expression) is SliceExpression:
             target_type = self._expression_type(expression.target, scope, check_reads=False)
             return target_type.borrow is not None and not borrow_mode_can_write(target_type.borrow)
@@ -3213,6 +3368,9 @@ class SemanticPass:
         return expr_type.borrow is not None and not borrow_mode_can_write(expr_type.borrow)
 
     def _contains_non_readable_borrow(self, expression: Expression, scope: SemanticScope) -> bool:
+        if isinstance(expression, MemberExpression):
+            if self._contains_non_readable_borrow(expression.target, scope):
+                return True
         if type(expression) is SliceExpression:
             target_type = self._expression_type(expression.target, scope, check_reads=False)
             return target_type.borrow is not None and not borrow_mode_can_read(target_type.borrow)
@@ -3253,6 +3411,10 @@ class SemanticPass:
 
     def _is_borrow_type(self, type_ref: TypeReference) -> bool:
         return type_ref.borrow is not None
+
+    def _is_reference_type(self, type_ref: TypeReference) -> bool:
+        """Types whose values carry source provenance but do not own it."""
+        return self._is_borrow_type(type_ref) or self._is_str_type(type_ref)
 
     def _element_type(self, type_ref: TypeReference) -> TypeReference:
         return TypeReference(type_ref.name, copy.deepcopy(type_ref.arguments))

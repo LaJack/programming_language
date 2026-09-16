@@ -110,8 +110,7 @@ SourceSpan previous_span(&in ParserState parser) raises BoundsError {
 SourceSpan node_span(
     &in ParserState parser, ArenaHandle(SyntaxNode) handle
 ) raises ArenaHandleError {
-    &in SyntaxNode node = parser.file.node(handle);
-    return node.source_span();
+    return parser.file.node(handle).source_span();
 }
 
 bool token_is(
@@ -1598,12 +1597,10 @@ pub ParsedFile build_strict(
 }
 
 bool token_at_invalid(&in ParserState parser, usize index) raises BoundsError {
-    &in Token token = parser.file.token(index);
-    return token.is_invalid();
+    return parser.file.token(index).is_invalid();
 }
 SourceSpan token_span_at(&in ParserState parser, usize index) raises BoundsError {
-    &in Token token = parser.file.token(index);
-    return token.source_location();
+    return parser.file.token(index).source_location();
 }
 
 SourceSpan byte_span(&in SourceMap context, SourceId source, usize start, usize end)

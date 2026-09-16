@@ -153,7 +153,7 @@ class ArrayAndSliceTests(unittest.TestCase):
         self.assertNotIn('typedef struct jack_slice_u8 {', c_source)
         self.assertIn('uint8_t buffer[4];', c_source)
         self.assertIn('void fill(jack_slice_u8 dst);', c_source)
-        self.assertIn('(dst).data[0] = 42;', c_source)
+        self.assertRegex(c_source, r'__auto_type (\w+) = &\(\(dst\).data\[0\]\);\s+\*\1 = 42;')
         self.assertIn('fill((jack_slice_u8){ buffer, 4 });', c_source)
         self.assertIn('printf("buffer[0] = %" PRIu8 "\\n", (unsigned int)(buffer[0]));', c_source)
 
@@ -170,7 +170,7 @@ class ArrayAndSliceTests(unittest.TestCase):
         c_source = emit_c(parse(source))
 
         self.assertIn('void set_first(uint8_t *dst);', c_source)
-        self.assertIn('dst[0] = 7;', c_source)
+        self.assertRegex(c_source, r'__auto_type (\w+) = &\(dst\[0\]\);\s+\*\1 = 7;')
         self.assertIn('set_first(buffer);', c_source)
 
 
@@ -299,7 +299,7 @@ class ArrayAndSliceTests(unittest.TestCase):
 
         self.assertIn('jack_slice_u8 window;', c_source)
         self.assertIn('window = (jack_slice_u8){ &buffer[1], (3 - 1) };', c_source)
-        self.assertIn('(window).data[0] = 9;', c_source)
+        self.assertRegex(c_source, r'__auto_type (\w+) = &\(\(window\).data\[0\]\);\s+\*\1 = 9;')
         self.assertIn('printf("len(buffer) = %" PRId32 "\\n", (int32_t)(((int32_t)(4))));', c_source)
         self.assertIn('printf("len(window) = %" PRId32 "\\n", (int32_t)((window).len));', c_source)
 

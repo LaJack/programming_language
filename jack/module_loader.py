@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Mapping
 
 try:
+    from .ast_nodes import MemberExpression
     from .ast_nodes import (
         Assignment,
         BorrowExpression,
@@ -46,6 +47,7 @@ try:
     )
     from .parser import ParseError, parse
 except ImportError:
+    from ast_nodes import MemberExpression
     from ast_nodes import (
         Assignment,
         BorrowExpression,
@@ -446,11 +448,7 @@ class ModuleResolver:
                 self._rewrite_expression_names(statement.name, context, scope, used_aliases)
             self._rewrite_expression_names(statement.expr, context, scope, used_aliases)
         elif type(statement) is FunctionCall:
-            statement.function_name = self._rewrite_value_name(
-                statement.function_name, context, scope, used_aliases
-            )
-            for argument in statement.parameters:
-                self._rewrite_expression_names(argument, context, scope, used_aliases)
+            self._rewrite_expression_names(statement, context, scope, used_aliases)
         elif type(statement) is Raise:
             self._rewrite_expression_names(statement.expr, context, scope, used_aliases)
         elif type(statement) is Rethrow:
@@ -660,10 +658,15 @@ class ModuleResolver:
     ) -> None:
         if type(expression) is VariableExpression:
             expression.name = self._rewrite_value_name(expression.name, context, scope, used_aliases)
+        elif type(expression) is MemberExpression:
+            self._rewrite_expression_names(expression.target, context, scope, used_aliases)
         elif type(expression) is FunctionCall:
-            expression.function_name = self._rewrite_value_name(
-                expression.function_name, context, scope, used_aliases
-            )
+            if expression.function_name:
+                expression.function_name = self._rewrite_value_name(
+                    expression.function_name, context, scope, used_aliases
+                )
+            else:
+                self._rewrite_expression_names(expression.callee, context, scope, used_aliases)
             for argument in expression.parameters:
                 self._rewrite_expression_names(argument, context, scope, used_aliases)
         elif type(expression) is TypeExpression:

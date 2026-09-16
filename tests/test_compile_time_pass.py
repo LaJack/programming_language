@@ -431,6 +431,113 @@ class CompileTimePassTests(unittest.TestCase):
 
         self.assertEqual(7, declaration.expr.value)
 
+    def test_comptime_method_chaining_uses_expression_receivers(self):
+        ast = parse('''
+            struct Point {
+                i32 x;
+                i32 value(&in self) { return self.x; }
+            }
+            Point make_point(i32 value) {
+                return Point { x = value };
+            }
+            comptime i32 result = make_point(7).value();
+            i32 runtime_result = result;
+        ''')
+
+        compiled = apply_compile_time_pass(ast)
+        declaration = next(
+            node for node in compiled
+            if type(node) is VariableDeclaration and node.name == 'runtime_result'
+        )
+        self.assertEqual(7, declaration.expr.value)
+
+    def test_comptime_owned_receiver_is_destroyed_after_chain(self):
+        output = []
+        ast = parse('''
+            struct Resource {
+                i32 value;
+                i32 read(&in self) { comptime print(2); return self.value; }
+                deinit(move self) { comptime print(3); }
+            }
+            Resource make_resource() {
+                comptime print(1);
+                return Resource { value = 7 };
+            }
+            comptime i32 result = make_resource().read();
+            i32 runtime_result = result;
+        ''')
+
+        compiled = apply_compile_time_pass(ast, print_handler=output.append)
+        declaration = next(
+            node for node in compiled
+            if type(node) is VariableDeclaration and node.name == 'runtime_result'
+        )
+        self.assertEqual(7, declaration.expr.value)
+        self.assertEqual(['1 = 1', '2 = 2', '3 = 3'], output[-3:])
+
+    def test_comptime_nested_owned_receivers_live_until_expression_end(self):
+        output = []
+        ast = parse('''
+            struct Resource {
+                i32 value;
+                Resource next(&in self) {
+                    comptime print(2);
+                    return Resource { value = self.value + 1 };
+                }
+                i32 read(&in self) { comptime print(3); return self.value; }
+                deinit(move self) { comptime print(4); }
+            }
+            Resource make_resource() {
+                comptime print(1);
+                return Resource { value = 7 };
+            }
+            comptime i32 result = make_resource().next().read();
+            i32 runtime_result = result;
+        ''')
+
+        compiled = apply_compile_time_pass(ast, print_handler=output.append)
+        declaration = next(
+            node for node in compiled
+            if type(node) is VariableDeclaration and node.name == 'runtime_result'
+        )
+        self.assertEqual(8, declaration.expr.value)
+        self.assertEqual(
+            ['1 = 1', '2 = 2', '3 = 3', '4 = 4', '4 = 4'],
+            output[-5:],
+        )
+
+    def test_comptime_chained_assignment_evaluates_target_before_value(self):
+        output = []
+        ast = parse('''
+            struct Resource {
+                i32 value;
+                deinit(move self) { comptime print(3); }
+            }
+            Resource make_resource() {
+                comptime print(1);
+                return Resource { value = 0 };
+            }
+            i32 replacement() { comptime print(2); return 9; }
+            comptime make_resource().value = replacement();
+        ''')
+
+        apply_compile_time_pass(ast, print_handler=output.append)
+        self.assertEqual(['1 = 1', '2 = 2', '3 = 3'], output[-3:])
+
+    def test_comptime_borrow_cannot_escape_owned_receiver(self):
+        ast = parse('''
+            struct Resource {
+                i32 value;
+                &in i32 borrow_value(&in self) { return &in self.value; }
+                deinit(move self) { }
+            }
+            Resource make_resource() { return Resource { value = 7 }; }
+            comptime &in i32 escaped = make_resource().borrow_value();
+        ''')
+
+        with self.assertRaisesRegex(CompileTimeError, 'owned temporary'):
+            apply_compile_time_pass(ast)
+
     def test_comptime_struct_parameter_specializes_runtime_function_variant(self):
         ast = parse('''
             struct Point {

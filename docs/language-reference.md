@@ -198,6 +198,38 @@ Borrowed values can be returned only when their origin is allowed to escape,
 such as a borrowed parameter, `self`, a global, or a borrow returned by another
 checked function.
 
+### Chained Receivers And Temporaries
+
+Member access, calls, indexing, and slicing compose as postfix expressions.
+Methods returning borrows can be used directly as receivers without introducing
+an intermediate local:
+
+```jack
+project.file(file_id).node(node_id).span();
+owner.get_mut().value = replacement();
+```
+
+Assignment resolves its target once, before evaluating the replacement. A
+returned receiver borrow stays live during replacement evaluation, so that
+evaluation cannot invalidate the target. If target evaluation raises, the
+replacement is not evaluated; if replacement evaluation raises, no assignment
+takes place. An immutable receiver never permits mutation through a chain.
+
+Owned intermediate results live until the end of the full expression. This
+allows a temporary owner to supply a borrow to an enclosing operation:
+
+```jack
+print(make_vector().get(0));
+```
+
+Untransferred temporaries are destroyed in reverse creation order after the
+full expression, including when a later operation raises. A borrowed result
+cannot be stored or returned past that boundary; introduce a named owner when
+the borrow must survive into a later statement. Receivers and arguments are
+evaluated exactly once from left to right. Short-circuited operands and
+unselected match arms create no temporaries. Calls remain statically resolved:
+chaining does not introduce function values or dynamic dispatch.
+
 ## Ownership And Moves
 
 Every parameter has a fixed ownership contract. A plain value parameter copies,

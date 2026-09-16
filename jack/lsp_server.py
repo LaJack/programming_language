@@ -895,19 +895,26 @@ class LanguageServer:
         model = self.semantic_model
         before = document.text[:start]
         member_match = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\.\s*$', before)
-        if model is not None and member_match is not None:
-            receiver = member_match.group(1)
-            receiver_offset = member_match.start(1)
-            occurrence = model.occurrence_at(path, receiver_offset)
-            if occurrence is not None:
-                receiver_symbol = model.symbols.get(occurrence.symbol_id)
+        dot = re.search(r'\.\s*$', before)
+        if model is not None and dot is not None:
+            receiver_end = len(before[:dot.start()].rstrip())
+            previous_source = model.sources.get(path, '')
+            receivers = sorted(
+                (begin, type_ref) for (source_path, begin, end), type_ref in model.expression_types.items()
+                if source_path == path and end == receiver_end
+                and previous_source[begin:end] == document.text[begin:end]
+            )
+            owner = self._type_symbol(receivers[0][1].name) if receivers else None
+            if owner is None and member_match is not None:
+                occurrence = model.occurrence_at(path, member_match.start(1))
+                receiver_symbol = model.symbols.get(occurrence.symbol_id) if occurrence is not None else None
                 owner = self._type_symbol(receiver_symbol.resolved_type if receiver_symbol else None)
-                if owner is not None:
-                    for symbol_id in model.members.get(owner.id, []):
-                        symbol = model.symbols[symbol_id]
-                        candidates.append((symbol.name, _completion_kind(symbol), symbol.signature))
-            if not candidates:
-                alias_module = self._import_alias_module(document.text, receiver)
+            if owner is not None:
+                for symbol_id in model.members.get(owner.id, []):
+                    symbol = model.symbols[symbol_id]
+                    candidates.append((symbol.name, _completion_kind(symbol), symbol.signature))
+            if not candidates and member_match is not None:
+                alias_module = self._import_alias_module(document.text, member_match.group(1))
                 if alias_module is not None:
                     for symbol in model.symbols.values():
                         if symbol.module_name == alias_module and symbol.public and symbol.container_id is None:

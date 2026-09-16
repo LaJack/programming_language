@@ -270,7 +270,7 @@ class CEmitPassTests(unittest.TestCase):
 
         self.assertIn('typedef struct Box_comptime_T_i32_N_4 {', c_source)
         self.assertIn('    int32_t value;', c_source)
-        self.assertIn('small.value = 11;', c_source)
+        self.assertRegex(c_source, r'__auto_type (\w+) = &\(small.value\);\s+\*\1 = 11;')
         self.assertIn('printf("small.value = %" PRId32 "\\n", (int32_t)(small.value));', c_source)
         self.assertNotIn('$', c_source)
 
@@ -408,7 +408,7 @@ class CEmitPassTests(unittest.TestCase):
 
         self.assertIn('void set_target(int32_t value);', c_source)
         self.assertIn('void set_target(int32_t value) {', c_source)
-        self.assertIn('target = value;', c_source)
+        self.assertRegex(c_source, r'__auto_type (\w+) = &\(target\);\s+\*\1 = value;')
         self.assertIn('return;', c_source)
         self.assertIn('set_target(12);', c_source)
 
@@ -431,7 +431,7 @@ class CEmitPassTests(unittest.TestCase):
 
         self.assertIn('void Counter_add(Counter *self, int32_t delta);', c_source)
         self.assertIn('void Counter_add(Counter *self, int32_t delta) {', c_source)
-        self.assertIn('self->value = (self->value + delta);', c_source)
+        self.assertRegex(c_source, r'__auto_type (\w+) = &\(self->value\);\s+\*\1 = \(self->value \+ delta\);')
         self.assertIn('Counter_add(&counter, 5);', c_source)
 
     def test_emits_runtime_control_flow(self):

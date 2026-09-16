@@ -11,6 +11,7 @@ from .builtin_types import BUILTIN_TYPE_SPECS
 from .hir_nodes import (
     HIRAssignment,
     HIRBlock,
+    HIRSequence,
     HIRBorrowExpression,
     HIRCallExpression,
     HIRCompositeExpression,
@@ -732,7 +733,7 @@ class LLVMLoweringPass:
             slot = self._b.alloca(type_name, 'local')
             env[statement.symbol.name] = (slot, statement.symbol.type_ref)
             type_declaration = self.types.get(statement.symbol.type_ref.name)
-            if not (
+            if statement.initialized and not (
                 type_declaration is not None
                 and getattr(type_declaration, 'language_item', None) == 'MaybeUninit'
             ):
@@ -803,6 +804,9 @@ class LLVMLoweringPass:
             return
         if isinstance(statement, HIRBlock):
             self._scoped_statements(statement.body, dict(env), statement.span)
+            return
+        if isinstance(statement, HIRSequence):
+            self._statements(statement.body, env)
             return
         if isinstance(statement, HIRIf):
             self._if(statement, env)
@@ -926,7 +930,9 @@ class LLVMLoweringPass:
         end_label = self._b.label('while.end')
         self._b.branch(condition_label)
         self._b.start(condition_label)
-        condition = self._expression(statement.condition, env)
+        condition_env = dict(env)
+        self._statements(statement.condition_setup, condition_env)
+        condition = self._expression(statement.condition, condition_env)
         self._b.terminate(f'br i1 {condition.operand}, label %{body_label}, label %{end_label}')
         self._b.start(body_label)
         self._scoped_statements(statement.body, dict(env), statement.span)
@@ -942,6 +948,11 @@ class LLVMLoweringPass:
 
     def _for_body(self, statement: HIRFor, env) -> None:
         loop_env = dict(env)
+        if statement.condition_setup:
+            raise LLVMLoweringError(
+                'For condition setup must be normalized before LLVM lowering.',
+                statement.span,
+            )
         if statement.initializer is not None:
             self._statement(statement.initializer, loop_env)
         condition_label = self._b.label('for.cond')
@@ -1951,7 +1962,7 @@ class LLVMLoweringPass:
         statement = statements[-1]
         if isinstance(statement, (HIRReturn, HIRRaise, HIRRethrow)):
             return True
-        if isinstance(statement, HIRBlock):
+        if isinstance(statement, (HIRBlock, HIRSequence)):
             return cls._guarantees_exit(statement.body)
         if isinstance(statement, HIRIf):
             return (

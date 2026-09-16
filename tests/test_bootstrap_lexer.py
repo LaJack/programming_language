@@ -291,6 +291,7 @@ class BootstrapLexerTests(unittest.TestCase):
     def test_structured_grammar_fixtures_match_python(self):
         sources = [
             '{ { } i32 local = 1; } comptime { i32 count = 0; { count = count + 1; } }',
+            'i32 value = project.file(id).nodes()[index..end][0].span().start; values.get(index).field = replacement();',
             'import protocol.frame as frame; import std.memory.{Allocation, Layout};',
             'void f() { for (;;) { return; } for (i32 i = 0; i < 3; i = i + 1) { print(i); } }',
             'void f() { try { return; } catch Option(i32) error { rethrow; } }',

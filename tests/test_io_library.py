@@ -166,9 +166,16 @@ class IoLibraryTests(unittest.TestCase):
         self.assertIn('jack_io_open(path, mode)', c_source)
         self.assertNotIn('char *path_buffer = (char *)malloc(path_len + 1);', c_source)
         self.assertNotIn('FILE *file = fopen(path_buffer, "rb");', c_source)
-        self.assertIn('jack_io_read(self->handle, data, ((size_t)((destination).len)), &count)', c_source)
+        self.assertRegex(
+            c_source,
+            r'jack_io_read\(self->handle, data, jack_expression_argument_\d+, &count\)',
+        )
         self.assertIn('file = std_io_open_read(', c_source)
-        self.assertIn('bytes_read = std_io_File_read(&file, (jack_slice_u8){ buffer, 4 });', c_source)
+        self.assertRegex(
+            c_source,
+            r'__auto_type (\w+) = &\(bytes_read\);\s+'
+            r'\*\1 = std_io_File_read\(&file, \(jack_slice_u8\)\{ buffer, 4 \}\);',
+        )
 
 
 if __name__ == '__main__':

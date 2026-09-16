@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 try:
+    from .ast_nodes import MemberExpression
     from .ast_nodes import (
         Assignment,
         BorrowExpression,
@@ -43,6 +44,7 @@ try:
         While,
     )
 except ImportError:
+    from ast_nodes import MemberExpression
     from ast_nodes import (
         Assignment,
         BorrowExpression,
@@ -461,6 +463,8 @@ class JackEmitPass:
             source = self._literal(expression)
         elif type(expression) is VariableExpression:
             source = expression.name
+        elif type(expression) is MemberExpression:
+            source = f'{self._expression(expression.target, precedence)}.{expression.member}'
         elif type(expression) is FunctionCall:
             source = self._function_call(expression)
         elif type(expression) is CompositeExpression:
@@ -505,7 +509,7 @@ class JackEmitPass:
         return source
 
     def _function_call(self, call: FunctionCall) -> str:
-        return f'{call.function_name}({", ".join(self._expression(argument) for argument in call.parameters)})'
+        return f'{self._expression(call.callee, self._precedence(call))}({", ".join(self._expression(argument) for argument in call.parameters)})'
 
     def _struct_literal(self, expression: StructLiteralExpression) -> str:
         fields = ', '.join(
@@ -580,7 +584,7 @@ class JackEmitPass:
             BorrowExpression, MoveExpression, DereferenceExpression, UnaryExpression
         }:
             return 10
-        if type(expression) in {FunctionCall, IndexExpression, SliceExpression}:
+        if type(expression) in {FunctionCall, MemberExpression, IndexExpression, SliceExpression}:
             return 11
         return 12
 

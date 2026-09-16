@@ -5,6 +5,7 @@ try:
     from .ast_nodes import (
         Assignment,
         AstNode,
+        MemberExpression,
         BorrowExpression,
         CatchClause,
         CompositeExpression,
@@ -58,6 +59,7 @@ except ImportError:
     from ast_nodes import (
         Assignment,
         AstNode,
+        MemberExpression,
         BorrowExpression,
         CatchClause,
         CompositeExpression,
@@ -1411,23 +1413,15 @@ class Parser:
         return statement
 
     def _simple_statement(self, consume_semicolon: bool) -> Statement:
-        start = self.current
-        if self._check('IDENT'):
-            target_name = self._name()
-            if self._match('('):
-                call = self._finish_function_call(target_name)
-                if consume_semicolon:
-                    self._consume(';', 'Expected ; after function call.')
-                return call
-
-        self.current = start
         target = self._assignment_target()
+        if isinstance(target, FunctionCall):
+            if consume_semicolon:
+                self._consume(';', 'Expected ; after function call.')
+            return target
         if self._match('='):
             value = self._expression()
             if consume_semicolon:
                 self._consume(';', 'Expected ; after assignment.')
-            if type(target) is VariableExpression:
-                return Assignment(target.name, value)
             return Assignment(target, value)
 
         raise self._error(self._previous(), 'Expected assignment or function call statement.')
@@ -1521,32 +1515,47 @@ class Parser:
         raise self._error(self._peek(), f'Expected in, out, or inout after &{suffix}.')
 
     def _postfix(self) -> Expression:
-        return self._postfix_from(self._primary())
+        start = self._peek()
+        return self._postfix_from(self._with_span(self._primary(), start), start)
 
-    def _postfix_from(self, expr: Expression) -> Expression:
-        while self._match('['):
+    def _postfix_from(self, expr: Expression, start_token: Token) -> Expression:
+        while True:
+            if self._match('.'):
+                token = self._peek()
+                member = self._identifier_value('Expected member name after .')
+                expr = self._with_span(MemberExpression(expr, member, member_span=token.span), start_token)
+                continue
+            if self._match('('):
+                if isinstance(expr, MemberExpression) and expr.member == 'cast':
+                    arguments = self._finish_type_query_argument_list('cast')
+                else:
+                    arguments = self._finish_argument_list('function')
+                expr = self._with_span(FunctionCall(expr, arguments), start_token)
+                continue
+            if not self._match('['):
+                break
             if self._match('..'):
                 start = None
                 end = None if self._check(']') else self._expression()
                 self._consume(']', 'Expected ] after slice expression.')
-                expr = SliceExpression(expr, start, end)
+                expr = self._with_span(SliceExpression(expr, start, end), start_token)
                 continue
 
             first = self._expression()
             if self._match('..'):
                 end = None if self._check(']') else self._expression()
                 self._consume(']', 'Expected ] after slice expression.')
-                expr = SliceExpression(expr, first, end)
+                expr = self._with_span(SliceExpression(expr, first, end), start_token)
             else:
                 self._consume(']', 'Expected ] after index expression.')
-                expr = IndexExpression(expr, first)
+                expr = self._with_span(IndexExpression(expr, first), start_token)
 
         return expr
 
     def _assignment_target(self) -> Expression:
         if self._match('*'):
             return DereferenceExpression(self._borrow())
-        return self._postfix_from(VariableExpression(self._name()))
+        return self._postfix()
 
     def _primary(self) -> Expression:
         if self._match_keyword('match'):
@@ -1596,20 +1605,22 @@ class Parser:
             else:
                 if self._match('{'):
                     return self._struct_literal_expression(type_ref)
-                if type_ref.arguments and self._match('.'):
-                    variant_name = self._identifier_value('Expected union variant name.')
-                    if self._match('('):
-                        return EnumVariantExpression(
-                            type_ref,
-                            variant_name,
-                            self._finish_argument_list('union variant'),
-                        )
-                    return EnumVariantExpression(type_ref, variant_name)
                 self.current = start
 
+            name_start = self.current
             name = self._name()
             if self._match('('):
-                return self._finish_function_call(name)
+                tokens = self.tokens[name_start:self.current - 1]
+                callee: Expression = VariableExpression(str(tokens[0].value), span=tokens[0].span)
+                for token in tokens[2::2]:
+                    callee = MemberExpression(callee, str(token.value), member_span=token.span)
+                    callee.span = SourceSpan(
+                        tokens[0].line, tokens[0].column, token.end_line, token.end_column,
+                        tokens[0].span.start_offset, token.span.end_offset, token.span.source_path,
+                    )
+                call = self._finish_function_call(name)
+                call.callee = callee
+                return call
             return VariableExpression(name)
 
         raise self._error(self._peek(), 'Expected expression.')
@@ -1648,7 +1659,21 @@ class Parser:
 
         if not self._check(')'):
             while True:
-                parameters.append(self._expression())
+                start = self.current
+                type_argument = None
+                if self._can_start_type_reference():
+                    try:
+                        candidate = self._speculative_type_reference()
+                        if self._check(',', ')') and (
+                            candidate.pointer_mode is not None or candidate.is_slice
+                            or (candidate.name == 'bool' and not candidate.arguments)
+                        ):
+                            type_argument = TypeExpression(candidate, span=candidate.span)
+                    except ParseError:
+                        pass
+                    if type_argument is None:
+                        self.current = start
+                parameters.append(type_argument if type_argument is not None else self._expression())
                 if not self._match(','):
                     break
 

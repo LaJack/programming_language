@@ -183,7 +183,10 @@ class ViewDeclarationTests(unittest.TestCase):
         self.assertIn('int32_t *checksum;', c_source)
         self.assertIn('void update(PacketView packet)', c_source)
         self.assertIn('int32_t header = (*packet.header);', c_source)
-        self.assertIn('(*packet.checksum) = header;', c_source)
+        self.assertRegex(
+            c_source,
+            r'__auto_type (\w+) = &\(\(\*packet\.checksum\)\);\s+\*\1 = header;',
+        )
         self.assertIn('update((PacketView){.header = &packet.header, .checksum = &packet.checksum});', c_source)
 
     def test_lsp_reports_view_symbols_hover_and_definition(self):

@@ -74,6 +74,13 @@ class HIRBlock(HIRStatement):
 
 
 @dataclass(frozen=True, kw_only=True)
+class HIRSequence(HIRStatement):
+    """Ordered statements that do not introduce a lexical scope."""
+
+    body: list[HIRStatement] = field(default_factory=list)
+
+
+@dataclass(frozen=True, kw_only=True)
 class HIRModuleDeclaration(HIRDeclaration):
     name: str
 
@@ -317,6 +324,7 @@ class HIRVariableDeclaration(HIRStatement):
     symbol: HIRVariableSymbol
     initializer: HIRExpression | None = None
     constructor_call: HIRCallExpression | None = None
+    initialized: bool = True
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -391,12 +399,14 @@ class HIRMatch(HIRStatement, HIRExpression):
 class HIRWhile(HIRStatement):
     condition: HIRExpression
     body: list[HIRStatement]
+    condition_setup: list[HIRStatement] = field(default_factory=list)
 
 
 @dataclass(frozen=True, kw_only=True)
 class HIRFor(HIRStatement):
     initializer: HIRStatement | None = None
     condition: HIRExpression | None = None
+    condition_setup: list[HIRStatement] = field(default_factory=list)
     update: HIRStatement | None = None
     body: list[HIRStatement] = field(default_factory=list)
 

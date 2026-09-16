@@ -85,6 +85,30 @@ class VariableExpression(Expression):
 
 
 @dataclass
+class MemberExpression(Expression):
+    target: Expression
+    member: str
+    member_span: SourceSpan | None = field(default=None, compare=False)
+
+
+def expression_name(expression: Expression) -> str | None:
+    if isinstance(expression, VariableExpression):
+        return expression.name
+    if isinstance(expression, MemberExpression):
+        target = expression_name(expression.target)
+        return None if target is None else f'{target}.{expression.member}'
+    return None
+
+
+def name_expression(name: str, span: SourceSpan | None = None) -> Expression:
+    parts = name.split('.')
+    expression: Expression = VariableExpression(parts[0], span=span)
+    for member in parts[1:]:
+        expression = MemberExpression(expression, member, span=span)
+    return expression
+
+
+@dataclass
 class BorrowExpression(Expression):
     mode: str
     expr: Expression
@@ -311,17 +335,74 @@ class UnsafeBlock(Statement):
     body: List[Statement]
 
 
-@dataclass
+@dataclass(init=False)
 class Assignment(Statement):
-    name: str | Expression
+    target: Expression
     expr: Expression
 
+    def __init__(self, name: str | Expression | None = None, expr: Expression | None = None,
+                 *, target: Expression | None = None, **metadata):
+        if target is not None:
+            if name is not None:
+                raise TypeError('Specify either name or target, not both.')
+            name = target
+        if name is None or expr is None:
+            raise TypeError('Assignment requires a target and an expression.')
+        super().__init__(**metadata)
+        if isinstance(name, str):
+            self.target = name_expression(name)
+        elif isinstance(name, VariableExpression) and '.' in name.name:
+            self.target = name_expression(name.name, name.span)
+        else:
+            self.target = name
+        self.expr = expr
 
-@dataclass
+    @property
+    def name(self) -> str | Expression:
+        return expression_name(self.target) or self.target
+
+    @name.setter
+    def name(self, target: str | Expression) -> None:
+        self.target = name_expression(target) if isinstance(target, str) else target
+
+
+@dataclass(init=False)
 class FunctionCall(Statement, Expression):
-    function_name: str
+    callee: Expression
     parameters: List[Expression]
     interface_name: str | None = None
+
+    def __init__(self, function_name: str | Expression | None = None,
+                 parameters: List[Expression] | None = None,
+                 interface_name: str | None = None, *, callee: Expression | None = None,
+                 **metadata):
+        if callee is not None:
+            if function_name is not None:
+                raise TypeError('Specify either function_name or callee, not both.')
+            function_name = callee
+        if function_name is None:
+            raise TypeError('FunctionCall requires a callee.')
+        super().__init__(**metadata)
+        self.callee = name_expression(function_name) if isinstance(function_name, str) else function_name
+        self.parameters = [] if parameters is None else parameters
+        self.interface_name = interface_name
+
+    @property
+    def function_name(self) -> str:
+        return expression_name(self.callee) or ''
+
+    @function_name.setter
+    def function_name(self, name: str) -> None:
+        previous = self.callee
+        self.callee = name_expression(name, previous.span)
+        current = self.callee
+        while isinstance(current, MemberExpression) and isinstance(previous, MemberExpression):
+            if current.member != previous.member:
+                break
+            current.member_span = previous.member_span
+            current.span = previous.span
+            current, previous = current.target, previous.target
+        current.span = previous.span
 
 
 @dataclass

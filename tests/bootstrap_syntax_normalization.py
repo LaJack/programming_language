@@ -13,7 +13,11 @@ def n(kind, **fields):
 
 
 def name(value):
-    return n('name', value=value)
+    parts = value.split('.')
+    result = n('name', value=parts[0])
+    for member in parts[1:]:
+        result = n('member', receiver=result, name=member)
+    return result
 
 
 def apply(callee, arguments):
@@ -98,6 +102,8 @@ def _python_node(value):
         return n('view_field', name=value.name, type=python_type(value.type), mode=value.mode)
     if isinstance(value, ast.VariableExpression):
         return name(value.name)
+    if isinstance(value, ast.MemberExpression):
+        return n('member', receiver=python_node(value.target), name=value.member)
     if isinstance(value, ast.TypeExpression):
         return python_type(value.type_ref)
     if isinstance(value, ast.LiteralExpression):
@@ -113,7 +119,7 @@ def _python_node(value):
     if isinstance(value, ast.DereferenceExpression):
         return n('dereference', operand=python_node(value.expr))
     if isinstance(value, ast.FunctionCall):
-        return apply(name(value.function_name), python_node(value.parameters))
+        return apply(python_node(value.callee), python_node(value.parameters))
     if isinstance(value, ast.EnumVariantExpression):
         target = n('member', receiver=python_type(value.type_ref), name=value.variant_name)
         return target if value.arguments is None else apply(target, python_node(value.arguments))
@@ -126,12 +132,7 @@ def _python_node(value):
     if isinstance(value, ast.SliceExpression):
         return n('slice', target=python_node(value.target), start=python_node(value.start), end=python_node(value.end))
     if isinstance(value, ast.Assignment):
-        # Python stores simple assignment targets as source text.
-        target = value.name
-        if isinstance(target, str):
-            target = parse('print(' + target + ');')[0]
-            target = target.expr or ast.VariableExpression(target.name)
-        return n('assignment', target=python_node(target), value=python_node(value.expr))
+        return n('assignment', target=python_node(value.target), value=python_node(value.expr))
     if isinstance(value, ast.If):
         return n('if', branches=python_node(value.branches), otherwise=python_node(value.else_body))
     if isinstance(value, ast.IfBranch):
@@ -324,8 +325,6 @@ def bootstrap_nodes(source, output):
             return apply(one('callee'), many('arguments'))
         if kind == 'member_expression':
             receiver = one('receiver')
-            if receiver['kind'] == 'name':
-                return name(receiver['value'] + '.' + text('name'))
             return n('member', receiver=receiver, name=text('name'))
         if kind == 'index_expression':
             return n('index', target=one('target'), index=one('index'))

@@ -10,6 +10,7 @@ try:
     from .hir_nodes import (
         HIRAssignment,
         HIRBlock,
+        HIRSequence,
         HIRBorrowExpression,
         HIRCallExpression,
         HIRCallTarget,
@@ -63,6 +64,7 @@ except ImportError:
     from hir_nodes import (
         HIRAssignment,
         HIRBlock,
+        HIRSequence,
         HIRBorrowExpression,
         HIRCallExpression,
         HIRCallTarget,
@@ -198,6 +200,12 @@ class HIRStaticCleanupLoweringPass:
                     )
         elif isinstance(statement, HIRWhile):
             self._merge_errors(
+                errors,
+                self._hir_statement_list_raised_errors(
+                    statement.condition_setup, dict(env)
+                ),
+            )
+            self._merge_errors(
                 errors, self._hir_expression_raised_errors(statement.condition)
             )
             self._merge_errors(
@@ -217,6 +225,12 @@ class HIRStaticCleanupLoweringPass:
                 self._merge_errors(
                     errors, self._hir_expression_raised_errors(statement.condition)
                 )
+            self._merge_errors(
+                errors,
+                self._hir_statement_list_raised_errors(
+                    statement.condition_setup, dict(loop_env)
+                ),
+            )
             if statement.update is not None:
                 self._merge_errors(
                     errors,
@@ -248,7 +262,7 @@ class HIRStaticCleanupLoweringPass:
                         catch.body, catch_env
                     ),
                 )
-        elif isinstance(statement, (HIRBlock, HIRUnsafeBlock)):
+        elif isinstance(statement, (HIRBlock, HIRSequence, HIRUnsafeBlock)):
             self._merge_errors(
                 errors,
                 self._hir_statement_list_raised_errors(statement.body, dict(env)),
@@ -597,6 +611,13 @@ class HIRStaticCleanupLoweringPass:
         inherited_deinit_names: list[str],
         return_type: TypeReference | None,
     ) -> list[HIRStatement]:
+        flattened: list[HIRStatement] = []
+        for statement in statements:
+            if isinstance(statement, HIRSequence):
+                flattened.extend(statement.body)
+            else:
+                flattened.append(statement)
+        statements = flattened
         previous_drop_flags = dict(self.drop_flags)
         lowered: list[HIRStatement] = []
         local_deinit_names: list[str] = []
@@ -638,7 +659,7 @@ class HIRStaticCleanupLoweringPass:
                     lowered.extend(
                         self._hir_create_drop_flags(
                             statement.symbol.name, statement.symbol.type_ref,
-                            True, statement.span,
+                            statement.initialized, statement.span,
                         )
                     )
 
@@ -890,6 +911,12 @@ class HIRStaticCleanupLoweringPass:
             return [
                 replace(
                     statement,
+                    condition_setup=self._lower_hir_block(
+                        statement.condition_setup,
+                        dict(env),
+                        active_deinit_names,
+                        return_type,
+                    ),
                     body=self._lower_hir_block(
                         statement.body,
                         dict(env),
@@ -920,7 +947,7 @@ class HIRStaticCleanupLoweringPass:
                         statement.update, dict(loop_env)
                     ),
                 )
-            needs_desugaring = bool(header_errors)
+            needs_desugaring = bool(header_errors or statement.condition_setup)
             if isinstance(statement.initializer, HIRVariableDeclaration):
                 if self._has_deinit(statement.initializer.symbol.type_ref):
                     needs_desugaring = True
@@ -1204,6 +1231,12 @@ class HIRStaticCleanupLoweringPass:
             lowered_loop = [
                 HIRWhile(
                     condition=condition,
+                    condition_setup=self._lower_hir_block(
+                        statement.condition_setup,
+                        dict(block_env),
+                        loop_active_names,
+                        return_type,
+                    ),
                     body=lowered_body,
                     span=statement.span,
                 )
@@ -1624,6 +1657,7 @@ class HIRStaticCleanupLoweringPass:
                 synthetic=True,
                 span=span,
             ),
+            initialized=False,
             span=span,
         )
 
@@ -1671,7 +1705,7 @@ class HIRStaticCleanupLoweringPass:
         if not statements:
             return False
         last = statements[-1]
-        if isinstance(last, HIRBlock):
+        if isinstance(last, (HIRBlock, HIRSequence)):
             return self._hir_ends_with_terminator(last.body)
         return isinstance(last, (HIRReturn, HIRRaise, HIRRethrow))
 
@@ -1706,6 +1740,9 @@ class HIRStaticCleanupLoweringPass:
                 if statement.else_body is not None:
                     self._collect_hir_statement_names(statement.else_body, names)
             elif isinstance(statement, (HIRWhile, HIRFor)):
+                self._collect_hir_statement_names(
+                    statement.condition_setup, names
+                )
                 if isinstance(statement, HIRFor):
                     self._collect_hir_statement_names(
                         [
@@ -1722,5 +1759,5 @@ class HIRStaticCleanupLoweringPass:
                     if catch.name is not None:
                         names.add(catch.name)
                     self._collect_hir_statement_names(catch.body, names)
-            elif isinstance(statement, (HIRBlock, HIRUnsafeBlock)):
+            elif isinstance(statement, (HIRBlock, HIRSequence, HIRUnsafeBlock)):
                 self._collect_hir_statement_names(statement.body, names)

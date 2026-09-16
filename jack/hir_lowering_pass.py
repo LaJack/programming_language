@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Callable, Iterator
 
 try:
+    from .ast_nodes import MemberExpression
     from .borrow_modes import borrow_mode_can_read
     from .builtin_types import is_builtin_type
     from .compile_time_pass import ComptimeEffects, apply_compile_time_pass
@@ -98,6 +99,7 @@ try:
         HIRTry,
         HIRUnsafeBlock,
         HIRBlock,
+        HIRSequence,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
         HIRVariableExpression,
@@ -108,6 +110,7 @@ try:
     )
     from .semantic_pass import SemanticError, SemanticPass, SemanticScope, SymbolInfo
 except ImportError:
+    from ast_nodes import MemberExpression
     from borrow_modes import borrow_mode_can_read
     from builtin_types import is_builtin_type
     from compile_time_pass import ComptimeEffects, apply_compile_time_pass
@@ -200,6 +203,7 @@ except ImportError:
         HIRTry,
         HIRUnsafeBlock,
         HIRBlock,
+        HIRSequence,
         HIRTypeDeclaration,
         HIRVariableDeclaration,
         HIRVariableExpression,
@@ -244,6 +248,8 @@ class HIRLoweringPass(SemanticPass):
         self.copy_helper_results: dict[str, str] = {}
         self.entry_function: FunctionDeclaration | None = None
         self.match_temporary_counter = 0
+        self.expression_temporary_counter = 0
+        self.expression_preludes: list[list[HIRStatement]] = []
 
     def lower(self, ast: list[Statement]) -> HIRProgram:
         self.validate(ast)
@@ -258,6 +264,17 @@ class HIRLoweringPass(SemanticPass):
             if type(statement).__name__ in {'InterfaceDeclaration', 'ImplementationDeclaration'}:
                 continue
             if self._is_top_level_declaration(statement):
+                if type(statement) is VariableDeclaration:
+                    declaration, initialization = self._global_variable_declaration(
+                        statement
+                    )
+                    declaration = self._record_statement(statement, declaration)
+                    declarations.append(declaration)
+                    top_level.append(declaration)
+                    if initialization is not None:
+                        body.append(initialization)
+                        top_level.append(initialization)
+                    continue
                 declaration = self._declaration(statement)
                 declaration = self._record_statement(statement, declaration)
                 declarations.append(declaration)
@@ -280,6 +297,45 @@ class HIRLoweringPass(SemanticPass):
             ),
             module_dependencies=module_dependencies,
         )
+
+    def _global_variable_declaration(
+        self, statement: VariableDeclaration
+    ) -> tuple[HIRGlobalVariable, HIRStatement | None]:
+        self.expression_preludes.append([])
+        try:
+            with self._statement_context(statement):
+                lowered = self._variable_declaration(
+                    statement, self.global_scope, top_level=True
+                )
+            prelude = self.expression_preludes[-1]
+        finally:
+            self.expression_preludes.pop()
+        declaration = HIRGlobalVariable(
+            symbol=lowered.symbol,
+            initializer=(None if prelude else lowered.initializer),
+            constructor_call=(None if prelude else lowered.constructor_call),
+            span=statement.span,
+        )
+        if not prelude:
+            return declaration, None
+        initialization: list[HIRStatement] = [*prelude]
+        if lowered.initializer is not None:
+            initialization.append(HIRAssignment(
+                target=HIRVariableExpression(
+                    name=lowered.symbol.name,
+                    type_ref=self._copy_type(lowered.symbol.type_ref),
+                    read_type=self._read_type(lowered.symbol.type_ref),
+                    span=statement.span,
+                ),
+                expr=lowered.initializer,
+                target_type=self._copy_type(lowered.symbol.type_ref),
+                span=statement.span,
+            ))
+        if lowered.constructor_call is not None:
+            initialization.append(HIRExpressionStatement(
+                expr=lowered.constructor_call, span=statement.span
+            ))
+        return declaration, HIRBlock(body=initialization, span=statement.span)
 
     def _validate_entry_function(
         self, ast: list[Statement], entry_module: str | None
@@ -520,14 +576,13 @@ class HIRLoweringPass(SemanticPass):
         if type(statement) is FunctionDeclaration:
             return self._function_declaration(statement)
         if type(statement) is VariableDeclaration:
-            with self._statement_context(statement):
-                lowered = self._variable_declaration(statement, self.global_scope, top_level=True)
-            return HIRGlobalVariable(
-                symbol=lowered.symbol,
-                initializer=lowered.initializer,
-                constructor_call=lowered.constructor_call,
-                span=statement.span,
-            )
+            declaration, initialization = self._global_variable_declaration(statement)
+            if initialization is not None:
+                raise HIRLoweringError(
+                    'Global initialization with expression temporaries must be '
+                    'lowered through the program startup sequence.', statement.span
+                )
+            return declaration
         raise HIRLoweringError(
             f'Top-level statement "{type(statement).__name__}" cannot be lowered as a HIR declaration.',
             getattr(statement, 'span', None),
@@ -721,6 +776,45 @@ class HIRLoweringPass(SemanticPass):
         return dependencies
 
     def _statement(self, statement: Statement, scope: SemanticScope) -> HIRStatement:
+        self.expression_preludes.append([])
+        try:
+            lowered = self._statement_inner(statement, scope)
+            prelude = self.expression_preludes[-1]
+        finally:
+            self.expression_preludes.pop()
+        if not prelude:
+            return lowered
+        if isinstance(lowered, HIRVariableDeclaration):
+            declaration = replace(
+                lowered,
+                initializer=None,
+                constructor_call=None,
+                initialized=lowered.initializer is None,
+            )
+            initialization: list[HIRStatement] = [*prelude]
+            if lowered.initializer is not None:
+                initialization.append(HIRAssignment(
+                    target=HIRVariableExpression(
+                        name=lowered.symbol.name,
+                        type_ref=self._copy_type(lowered.symbol.type_ref),
+                        read_type=self._read_type(lowered.symbol.type_ref),
+                        span=lowered.span,
+                    ),
+                    expr=lowered.initializer,
+                    target_type=self._copy_type(lowered.symbol.type_ref),
+                    span=lowered.span,
+                ))
+            if lowered.constructor_call is not None:
+                initialization.append(HIRExpressionStatement(
+                    expr=lowered.constructor_call, span=lowered.span
+                ))
+            return HIRSequence(
+                body=[declaration, HIRBlock(body=initialization, span=statement.span)],
+                span=statement.span,
+            )
+        return HIRBlock(body=[*prelude, lowered], span=statement.span)
+
+    def _statement_inner(self, statement: Statement, scope: SemanticScope) -> HIRStatement:
         if type(statement) is VariableDeclaration:
             return self._variable_declaration(statement, scope, top_level=False)
         if type(statement) is Assignment:
@@ -771,8 +865,12 @@ class HIRLoweringPass(SemanticPass):
         if type(statement) is Match:
             return self._match(statement, scope)
         if type(statement) is While:
+            condition, condition_setup = self._loop_condition(
+                statement.condition, scope
+            )
             return HIRWhile(
-                condition=self._expression(statement.condition, scope),
+                condition=condition,
+                condition_setup=condition_setup,
                 body=self._block(statement.body, SemanticScope(scope)),
                 span=statement.span,
             )
@@ -880,25 +978,127 @@ class HIRLoweringPass(SemanticPass):
             return expression
         return self._expression(target, scope)
 
-    def _if_statement(self, statement: If, scope: SemanticScope) -> HIRIf:
-        return HIRIf(
-            branches=[
-                HIRIfBranch(
-                    condition=self._expression(branch.condition, scope),
-                    body=self._block(branch.body, SemanticScope(scope)),
+    def _if_statement(self, statement: If, scope: SemanticScope) -> HIRStatement:
+        lowered_branches = [
+            (
+                branch,
+                *self._expression_with_isolated_prelude(branch.condition, scope),
+                self._block(branch.body, SemanticScope(scope)),
+            )
+            for branch in statement.branches
+        ]
+        fallback = (
+            None if statement.else_body is None
+            else self._block(statement.else_body, SemanticScope(scope))
+        )
+        if not any(prelude for _, _, prelude, _ in lowered_branches):
+            return HIRIf(
+                branches=[HIRIfBranch(
+                    condition=condition, body=body, span=branch.span
+                ) for branch, condition, _, body in lowered_branches],
+                else_body=fallback,
+                span=statement.span,
+            )
+        for branch, condition, prelude, body in reversed(lowered_branches):
+            if prelude:
+                self.expression_temporary_counter += 1
+                name = f'$jack$expression$condition${self.expression_temporary_counter}'
+                condition_type = TypeReference('bool')
+                declaration = HIRVariableDeclaration(
+                    symbol=HIRVariableSymbol(
+                        name=name, type_ref=condition_type, synthetic=True,
+                        span=branch.condition.span,
+                    ),
+                    initialized=False,
+                    span=branch.condition.span,
+                )
+                evaluation = HIRBlock(body=[
+                    *prelude,
+                    HIRAssignment(
+                        target=HIRVariableExpression(
+                            name=name, type_ref=condition_type,
+                            read_type=condition_type, span=branch.condition.span,
+                        ),
+                        expr=condition,
+                        target_type=condition_type,
+                        span=branch.condition.span,
+                    ),
+                ], span=branch.condition.span)
+                condition = HIRVariableExpression(
+                    name=name, type_ref=condition_type,
+                    read_type=condition_type, span=branch.condition.span,
+                )
+                current: HIRStatement = HIRSequence(body=[
+                    declaration,
+                    evaluation,
+                    HIRIf(
+                        branches=[HIRIfBranch(
+                            condition=condition, body=body, span=branch.span
+                        )],
+                        else_body=fallback,
+                        span=branch.span,
+                    ),
+                ], span=branch.span)
+            else:
+                current = HIRIf(
+                    branches=[HIRIfBranch(
+                        condition=condition, body=body, span=branch.span
+                    )],
+                    else_body=fallback,
                     span=branch.span,
                 )
-                for branch in statement.branches
-            ],
-            else_body=(
-                None
-                if statement.else_body is None
-                else self._block(statement.else_body, SemanticScope(scope))
-            ),
-            span=statement.span,
-        )
+            fallback = [current]
+        assert fallback is not None and len(fallback) == 1
+        return fallback[0]
 
-    def _match(self, statement: Match, scope: SemanticScope) -> HIRMatch:
+    def _expression_with_isolated_prelude(
+        self, expression: Expression, scope: SemanticScope
+    ) -> tuple[HIRExpression, list[HIRStatement]]:
+        self.expression_preludes.append([])
+        try:
+            lowered = self._expression(expression, scope)
+            prelude = self.expression_preludes[-1]
+        finally:
+            self.expression_preludes.pop()
+        return lowered, prelude
+
+    def _loop_condition(
+        self, expression: Expression, scope: SemanticScope
+    ) -> tuple[HIRExpression, list[HIRStatement]]:
+        condition, prelude = self._expression_with_isolated_prelude(expression, scope)
+        if not prelude:
+            return condition, []
+        self.expression_temporary_counter += 1
+        name = f'$jack$expression$loop$condition${self.expression_temporary_counter}'
+        condition_type = TypeReference('bool')
+        assignment = HIRAssignment(
+            target=HIRVariableExpression(
+                name=name, type_ref=condition_type, read_type=condition_type,
+                span=expression.span,
+            ),
+            expr=condition,
+            target_type=condition_type,
+            span=expression.span,
+        )
+        # The condition slot is declared by its setup on each evaluation. It is
+        # scalar and remains valid after the nested temporary scope is cleaned.
+        setup = [
+            HIRVariableDeclaration(
+                symbol=HIRVariableSymbol(
+                    name=name, type_ref=condition_type, synthetic=True,
+                    span=expression.span,
+                ),
+                initialized=False,
+                span=expression.span,
+            ),
+            HIRBlock(body=[*prelude, assignment], span=expression.span),
+        ]
+        return HIRVariableExpression(
+            name=name, type_ref=condition_type, read_type=condition_type,
+            span=expression.span,
+        ), setup
+
+    def _match(self, statement: Match, scope: SemanticScope) -> HIRExpression:
         scrutinee = self._expression(statement.scrutinee, scope)
         enum_name = self._type_name(self._element_type(scrutinee.type_ref))
         declaration = self.types[enum_name]
@@ -907,6 +1107,7 @@ class HIRLoweringPass(SemanticPass):
             # Matching an existing borrow needs its address, not a payload copy.
             scrutinee = replace(scrutinee, read_type=None)
         arms: list[HIRMatchArm] = []
+        expression_preludes: list[list[HIRStatement]] = []
         variants = {variant.name: (index, variant) for index, variant in enumerate(declaration.variants)}
         for arm in statement.arms:
             arm_scope = SemanticScope(scope)
@@ -946,12 +1147,19 @@ class HIRLoweringPass(SemanticPass):
                         field_index=field_index,
                         span=binding.span,
                     ))
+            arm_expression = None
+            arm_prelude: list[HIRStatement] = []
+            if arm.expr is not None:
+                arm_expression, arm_prelude = self._expression_with_isolated_prelude(
+                    arm.expr, arm_scope
+                )
+            expression_preludes.append(arm_prelude)
             arms.append(HIRMatchArm(
                 variant_name=arm.variant_name,
                 discriminant=discriminant,
                 bindings=bindings,
                 body=None if arm.body is None else self._block(arm.body, arm_scope),
-                expression=None if arm.expr is None else self._expression(arm.expr, arm_scope),
+                expression=arm_expression,
                 span=arm.span,
             ))
         # Arms were validated before lowering. Revalidating statement arms here
@@ -961,7 +1169,7 @@ class HIRLoweringPass(SemanticPass):
             if arms and arms[0].expression is not None
             else TypeReference('void')
         )
-        return HIRMatch(
+        lowered_match = HIRMatch(
             scrutinee=scrutinee,
             ownership=ownership,
             arms=arms,
@@ -969,6 +1177,45 @@ class HIRLoweringPass(SemanticPass):
             read_type=self._read_type(result_type),
             span=statement.span,
         )
+        if arms and arms[0].expression is not None and any(expression_preludes):
+            if not self.expression_preludes:
+                raise HIRLoweringError(
+                    'Match temporary is not inside a full expression.', statement.span
+                )
+            self.expression_temporary_counter += 1
+            name = f'$jack$expression$match${self.expression_temporary_counter}'
+            result_symbol = HIRVariableSymbol(
+                name=name, type_ref=self._copy_type(result_type), synthetic=True,
+                span=statement.span,
+            )
+            result = HIRVariableExpression(
+                name=name, type_ref=self._copy_type(result_type),
+                read_type=self._read_type(result_type), span=statement.span,
+            )
+            self.expression_preludes[-1].append(HIRVariableDeclaration(
+                symbol=result_symbol, initialized=False, span=statement.span
+            ))
+            statement_arms = []
+            for arm, prelude in zip(arms, expression_preludes):
+                assert arm.expression is not None
+                statement_arms.append(replace(
+                    arm,
+                    expression=None,
+                    body=[*prelude, HIRAssignment(
+                        target=result,
+                        expr=arm.expression,
+                        target_type=self._copy_type(result_type),
+                        span=arm.span,
+                    )],
+                ))
+            self.expression_preludes[-1].append(replace(
+                lowered_match,
+                arms=statement_arms,
+                type_ref=TypeReference('void'),
+                read_type=TypeReference('void'),
+            ))
+            return result
+        return lowered_match
 
     def _for_statement(self, statement: For, scope: SemanticScope) -> HIRFor:
         loop_scope = SemanticScope(scope)
@@ -980,13 +1227,16 @@ class HIRLoweringPass(SemanticPass):
                 self._statement(statement.initializer, loop_scope),
             )
         )
+        condition = None
+        condition_setup: list[HIRStatement] = []
+        if statement.condition is not None:
+            condition, condition_setup = self._loop_condition(
+                statement.condition, loop_scope
+            )
         return HIRFor(
             initializer=initializer,
-            condition=(
-                None
-                if statement.condition is None
-                else self._expression(statement.condition, loop_scope)
-            ),
+            condition=condition,
+            condition_setup=condition_setup,
             update=(
                 None
                 if statement.update is None
@@ -1044,6 +1294,17 @@ class HIRLoweringPass(SemanticPass):
                     span=expression.span,
                 ),
             )
+        if isinstance(expression, MemberExpression):
+            target = self._expression(expression.target, scope)
+            target = self._materialize_receiver(target, expression.target)
+            field_type = self._member_type(target.type_ref, expression.member)
+            return self._record_expression(expression, HIRFieldAccessExpression(
+                target=target, field_name=expression.member,
+                owner_type_name=self._type_name(self._element_type(target.type_ref)),
+                from_view=self._view_field_for_type(target.type_ref, expression.member) is not None,
+                type_ref=self._copy_type(field_type), read_type=self._read_type(field_type),
+                span=expression.span,
+            ))
         if type(expression) is VariableExpression:
             enum_type = self._fieldless_enum_value_type(expression)
             if enum_type is not None:
@@ -1072,6 +1333,40 @@ class HIRLoweringPass(SemanticPass):
                 source=expression,
             )
         if type(expression) is FunctionCall:
+            if not expression.function_name:
+                if isinstance(expression.callee, MemberExpression):
+                    receiver_type = self._expression_type(
+                        expression.callee.target, scope, check_reads=False
+                    )
+                    if receiver_type.pointer_mode is not None:
+                        pointer = self._expression(expression.callee.target, scope)
+                        if expression.callee.member == 'offset':
+                            return self._record_expression(
+                                expression,
+                                HIRPointerOffsetExpression(
+                                    pointer=pointer,
+                                    offset=self._expression(expression.parameters[0], scope),
+                                    type_ref=self._copy_type(receiver_type),
+                                    read_type=self._copy_type(receiver_type),
+                                    span=expression.span,
+                                ),
+                            )
+                        if expression.callee.member == 'cast':
+                            target = expression.parameters[0]
+                            assert type(target) is TypeExpression
+                            type_ref = self._copy_type(target.type_ref)
+                            type_ref.pointer_mode = receiver_type.pointer_mode
+                            type_ref.nullable = receiver_type.nullable
+                            return self._record_expression(
+                                expression,
+                                HIRPointerCastExpression(
+                                    pointer=pointer,
+                                    type_ref=type_ref,
+                                    read_type=self._copy_type(type_ref),
+                                    span=expression.span,
+                                ),
+                            )
+                return self._call_expression(expression, scope)
             enum_construct = self._enum_constructor(expression, scope)
             if enum_construct is not None:
                 return self._record_expression(expression, enum_construct)
@@ -1242,7 +1537,58 @@ class HIRLoweringPass(SemanticPass):
             )
         if type(expression) is CompositeExpression:
             left = self._expression(expression.left, scope)
-            right = self._expression(expression.right, scope)
+            left = self._stage_effectful_argument(left, None, expression.left)
+            if expression.operator in {'&&', '||'}:
+                right, right_prelude = self._expression_with_isolated_prelude(
+                    expression.right, scope
+                )
+                if right_prelude:
+                    self.expression_temporary_counter += 1
+                    name = f'$jack$expression$lazy${self.expression_temporary_counter}'
+                    result_type = TypeReference('bool')
+                    result = HIRVariableExpression(
+                        name=name, type_ref=result_type, read_type=result_type,
+                        span=expression.span,
+                    )
+                    self.expression_preludes[-1].append(HIRVariableDeclaration(
+                        symbol=HIRVariableSymbol(
+                            name=name, type_ref=result_type, synthetic=True,
+                            span=expression.span,
+                        ),
+                        initialized=False,
+                        span=expression.span,
+                    ))
+                    selected = HIRBlock(body=[
+                        *right_prelude,
+                        HIRAssignment(
+                            target=result, expr=right,
+                            target_type=result_type, span=expression.right.span,
+                        ),
+                    ], span=expression.right.span)
+                    default = HIRAssignment(
+                        target=result,
+                        expr=HIRLiteralExpression(
+                            value=expression.operator == '||',
+                            literal_type='bool', type_ref=result_type,
+                            read_type=result_type, span=expression.span,
+                        ),
+                        target_type=result_type,
+                        span=expression.span,
+                    )
+                    branch = HIRIf(
+                        branches=[HIRIfBranch(
+                            condition=left,
+                            body=([selected] if expression.operator == '&&' else [default]),
+                            span=expression.span,
+                        )],
+                        else_body=([default] if expression.operator == '&&' else [selected]),
+                        span=expression.span,
+                    )
+                    self.expression_preludes[-1].append(branch)
+                    return self._record_expression(expression, result)
+            else:
+                right = self._expression(expression.right, scope)
+                right = self._stage_effectful_argument(right, None, expression.right)
             type_ref = self._composite_result_type(left, expression.operator)
             return self._record_expression(
                 expression,
@@ -1257,6 +1603,7 @@ class HIRLoweringPass(SemanticPass):
             )
         if type(expression) is IndexExpression:
             target = self._expression(expression.target, scope)
+            target = self._materialize_receiver(target, expression.target)
             index = self._expression(expression.index, scope)
             type_ref = self._indexed_element_type(target.type_ref)
             return self._record_expression(
@@ -1271,6 +1618,7 @@ class HIRLoweringPass(SemanticPass):
             )
         if type(expression) is SliceExpression:
             target = self._expression(expression.target, scope)
+            target = self._materialize_receiver(target, expression.target)
             type_ref = TypeReference(self._element_type(target.type_ref).name, is_slice=True)
             return self._record_expression(
                 expression,
@@ -1460,8 +1808,9 @@ class HIRLoweringPass(SemanticPass):
         arguments = []
         for index, argument in enumerate(call.parameters):
             lowered = self._expression(argument, scope)
+            parameter = target.parameters[index] if index < len(target.parameters) else None
             if index < len(target.parameters):
-                parameter = target.parameters[index]
+                assert parameter is not None
                 if (
                     parameter.type_ref.borrow is not None
                     and (
@@ -1490,7 +1839,9 @@ class HIRLoweringPass(SemanticPass):
                     lowered = self._maybe_custom_copy(
                         lowered, parameter.type_ref, argument
                     )
-            arguments.append(lowered)
+            arguments.append(
+                self._stage_effectful_argument(lowered, parameter, argument)
+            )
         expression = HIRCallExpression(
             target=target,
             arguments=arguments,
@@ -1559,6 +1910,8 @@ class HIRLoweringPass(SemanticPass):
     def _call_target(
         self, call: FunctionCall, scope: SemanticScope
     ) -> tuple[HIRCallTarget, HIRExpression | None, HIRBorrowExpression | None]:
+        if not call.function_name:
+            return self._method_call_target(call, scope)
         if call.function_name in {'sizeof', 'alignof'}:
             raise HIRLoweringError(
                 f'{call.function_name} must be folded by the compile-time pass.',
@@ -1615,8 +1968,14 @@ class HIRLoweringPass(SemanticPass):
     def _method_call_target(
         self, call: FunctionCall, scope: SemanticScope
     ) -> tuple[HIRCallTarget, HIRExpression, HIRBorrowExpression]:
-        receiver_name, method_name = call.function_name.rsplit('.', 1)
-        receiver = self._name_expression(receiver_name, scope, call.span)
+        if call.function_name:
+            receiver_name, method_name = call.function_name.rsplit('.', 1)
+            receiver = self._name_expression(receiver_name, scope, call.span)
+        else:
+            receiver_name = None
+            method_name = call.callee.member
+            receiver = self._expression(call.callee.target, scope)
+            receiver = self._materialize_receiver(receiver, call.callee.target)
         type_decl = self._type_declaration_for(receiver.type_ref)
         method = self._visible_method_for_call(
             type_decl, method_name, call.interface_name
@@ -1651,6 +2010,121 @@ class HIRLoweringPass(SemanticPass):
             receiver,
             implicit_self,
         )
+
+    def _materialize_receiver(
+        self, receiver: HIRExpression, source: Expression
+    ) -> HIRExpression:
+        if not isinstance(receiver, (
+            HIRCallExpression, HIRStructLiteralExpression,
+            HIREnumConstructExpression, HIRMatch,
+        )):
+            return receiver
+        if not self.expression_preludes:
+            raise HIRLoweringError(
+                'Owned temporary receiver is not inside a full expression.', source.span
+            )
+        self.expression_temporary_counter += 1
+        name = f'$jack$expression$temp${self.expression_temporary_counter}'
+        symbol = HIRVariableSymbol(
+            name=name,
+            type_ref=self._copy_type(receiver.type_ref),
+            synthetic=True,
+            span=source.span,
+        )
+        self.expression_preludes[-1].append(
+            HIRVariableDeclaration(
+                symbol=symbol,
+                initializer=receiver,
+                span=source.span,
+            )
+        )
+        return HIRVariableExpression(
+            name=name,
+            type_ref=self._copy_type(receiver.type_ref),
+            read_type=self._read_type(receiver.type_ref),
+            span=source.span,
+        )
+
+    def _stage_effectful_argument(
+        self,
+        argument: HIRExpression,
+        parameter: HIRVariableSymbol | None,
+        source: Expression,
+    ) -> HIRExpression:
+        if not self._hir_expression_has_call(argument):
+            return argument
+        if not self.expression_preludes:
+            return argument
+        self.expression_temporary_counter += 1
+        name = f'$jack$expression$argument${self.expression_temporary_counter}'
+        type_ref = self._copy_type(
+            parameter.type_ref if parameter is not None else argument.type_ref
+        )
+        self.expression_preludes[-1].append(HIRVariableDeclaration(
+            symbol=HIRVariableSymbol(
+                name=name, type_ref=self._copy_type(type_ref), synthetic=True,
+                span=source.span,
+            ),
+            initializer=argument,
+            span=source.span,
+        ))
+        result: HIRExpression = HIRVariableExpression(
+            name=name, type_ref=self._copy_type(type_ref),
+            read_type=self._read_type(type_ref), span=source.span,
+        )
+        if parameter is not None and parameter.type_ref.borrow is None:
+            # The staged slot owns the already copied/constructed argument.
+            # Passing it by value transfers that staged value into the callee,
+            # even when the source-level contract was `copy`.
+            result = HIRMoveExpression(
+                expr=result, type_ref=self._copy_type(type_ref),
+                read_type=self._read_type(type_ref), span=source.span,
+            )
+        return result
+
+    def _hir_expression_has_call(self, expression: HIRExpression) -> bool:
+        if isinstance(expression, HIRCallExpression):
+            return True
+        if isinstance(expression, (HIRBorrowExpression, HIRMoveExpression,
+                                   HIRDereferenceExpression, HIRUnaryExpression)):
+            return self._hir_expression_has_call(expression.expr)
+        if isinstance(expression, HIRFieldAccessExpression):
+            return self._hir_expression_has_call(expression.target)
+        if isinstance(expression, HIRIndexExpression):
+            return self._hir_expression_has_call(expression.target) or self._hir_expression_has_call(expression.index)
+        if isinstance(expression, HIRSliceExpression):
+            return self._hir_expression_has_call(expression.target) or any(
+                item is not None and self._hir_expression_has_call(item)
+                for item in (expression.start, expression.end)
+            )
+        if isinstance(expression, HIRCompositeExpression):
+            return self._hir_expression_has_call(expression.left) or self._hir_expression_has_call(expression.right)
+        if isinstance(expression, HIRStructLiteralExpression):
+            return any(
+                self._hir_expression_has_call(field.expr)
+                for field in expression.fields
+            )
+        if isinstance(expression, HIREnumConstructExpression):
+            return any(
+                self._hir_expression_has_call(argument)
+                for argument in expression.arguments
+            )
+        if isinstance(expression, HIRFormattedStringExpression):
+            return any(
+                isinstance(part, HIRExpression)
+                and self._hir_expression_has_call(part)
+                for part in expression.parts
+            )
+        if isinstance(expression, HIRMatch):
+            return (
+                self._hir_expression_has_call(expression.scrutinee)
+                or any(
+                    arm.expression is not None
+                    and self._hir_expression_has_call(arm.expression)
+                    for arm in expression.arms
+                )
+            )
+        return False
 
     def _composite_result_type(
         self, left: HIRExpression, operator: str

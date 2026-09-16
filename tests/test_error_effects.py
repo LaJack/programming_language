@@ -489,7 +489,10 @@ class ErrorEffectsTests(unittest.TestCase):
         '''), print_handler=None)
 
         self.assertIn('int32_t result = 0;', c_source)
-        self.assertIn('result = value();', c_source)
+        self.assertRegex(
+            c_source,
+            r'__auto_type (\w+) = &\(result\);\s+\*\1 = value\(\);',
+        )
         self.assertIn('if (jack_try(&error_frame_1) == 0) {', c_source)
         self.assertIn('Tracer_deinit(&tracer);', c_source)
         self.assertIn('jack_rethrow(caught_error_1);', c_source)
@@ -565,7 +568,12 @@ class ErrorEffectsTests(unittest.TestCase):
             }
         '''), print_handler=None)
 
-        self.assertIn('Resource_init(&resource, value());', c_source)
+        self.assertRegex(
+            c_source,
+            r'int32_t (jack_expression_argument_\d+) = 0;[\s\S]*?'
+            r'\*assignment_target_\d+ = value\(\);[\s\S]*?'
+            r'Resource_init\(&resource, \1\);',
+        )
         self.assertIn('if (jack_try(&error_frame_1) == 0) {', c_source)
         self.assertIn('Tracer_deinit(&tracer);', c_source)
         self.assertIn('jack_rethrow(caught_error_1);', c_source)
@@ -605,8 +613,15 @@ class ErrorEffectsTests(unittest.TestCase):
             }
         '''), print_handler=None)
 
-        self.assertIn('result = value();', c_source)
-        self.assertIn('consume(value());', c_source)
+        self.assertRegex(
+            c_source,
+            r'__auto_type (\w+) = &\(result\);\s+\*\1 = value\(\);',
+        )
+        self.assertRegex(
+            c_source,
+            r'int32_t (jack_expression_argument_\d+) = 0;[\s\S]*?'
+            r'\*assignment_target_\d+ = value\(\);[\s\S]*?consume\(\1\);',
+        )
         self.assertIn('printf("value() = %" PRId32 "\\n",', c_source)
         self.assertIn('jack_cleanup_return_value_', c_source)
         self.assertIn('jack_cleanup_error_value_', c_source)

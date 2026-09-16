@@ -25,6 +25,7 @@ try:
     from .hir_nodes import (
         HIRAssignment,
         HIRBlock,
+        HIRSequence,
         HIRBorrowExpression,
         HIRCallExpression,
         HIRCallTarget,
@@ -95,6 +96,7 @@ except ImportError:
     from hir_nodes import (
         HIRAssignment,
         HIRBlock,
+        HIRSequence,
         HIRBorrowExpression,
         HIRCallExpression,
         HIRCallTarget,
@@ -821,6 +823,8 @@ class Interpreter:
             return self._execute_hir_try(statement, scope, allow_return)
         elif isinstance(statement, HIRBlock):
             return self._execute_hir_block(statement.body, scope, allow_return)
+        elif isinstance(statement, HIRSequence):
+            return self._execute_hir_statements(statement.body, scope, allow_return)
         elif isinstance(statement, HIRUnsafeBlock):
             return self._execute_hir_block(statement.body, scope, allow_return)
         else:
@@ -859,25 +863,29 @@ class Interpreter:
             scope.declare(symbol.name, value)
             return
 
-        if declaration.initializer is None:
+        initialized = getattr(declaration, 'initialized', True)
+        if not initialized:
+            value = None
+        elif declaration.initializer is None:
             value = self._default_value_for_type(symbol.type_ref, scope)
         else:
             value = self._eval_hir_expression_as_type(
                 declaration.initializer, symbol.type_ref, scope
             )
         scope.declare(symbol.name, value, constant=symbol.constant)
-        if self._value_needs_drop(value):
+        if initialized and self._value_needs_drop(value):
             scope.mark_for_deinit(symbol.name)
         if declaration.constructor_call is not None:
             self._eval_hir_function_call(declaration.constructor_call, scope)
 
     def _execute_hir_assignment(self, assignment: HIRAssignment, scope: SymbolTable) -> None:
+        assign = self._resolve_hir_assignment_target(assignment.target, scope)
         value = self._eval_hir_expression_as_type(assignment.expr, assignment.target_type, scope)
         if isinstance(assignment.target, HIRVariableExpression):
             name = assignment.target.name
             if scope.is_marked_for_deinit(name):
                 self._execute_deinit_name(scope, name)
-        self._assign_hir_expression_target(assignment.target, value, scope)
+        assign(value)
         if (
             isinstance(assignment.target, HIRVariableExpression)
             and self._value_needs_drop(value)
@@ -969,7 +977,19 @@ class Interpreter:
         self, statement: HIRWhile, scope: SymbolTable, allow_return: bool
     ) -> ReturnSignal[object] | None:
         iterations = 0
-        while self._is_truthy(self._eval_hir_expression(statement.condition, scope)):
+        while True:
+            condition_scope = self._child_scope(scope)
+            try:
+                self._execute_hir_statements(
+                    statement.condition_setup, condition_scope, allow_return=False
+                )
+                condition = self._is_truthy(
+                    self._eval_hir_expression(statement.condition, condition_scope)
+                )
+            finally:
+                self._execute_deinit_scope(condition_scope)
+            if not condition:
+                break
             self._check_loop_limit(iterations, 'while')
             returned = self._execute_hir_block(statement.body, scope, allow_return)
             if returned is not None:
@@ -985,9 +1005,19 @@ class Interpreter:
             self._execute_hir_statement(statement.initializer, loop_scope, allow_return=False)
 
         iterations = 0
-        while statement.condition is None or self._is_truthy(
-            self._eval_hir_expression(statement.condition, loop_scope)
-        ):
+        while True:
+            condition_scope = self._child_scope(loop_scope)
+            try:
+                self._execute_hir_statements(
+                    statement.condition_setup, condition_scope, allow_return=False
+                )
+                condition = statement.condition is None or self._is_truthy(
+                    self._eval_hir_expression(statement.condition, condition_scope)
+                )
+            finally:
+                self._execute_deinit_scope(condition_scope)
+            if not condition:
+                break
             self._check_loop_limit(iterations, 'for')
             returned = self._execute_hir_block(statement.body, loop_scope, allow_return)
             if returned is not None:
@@ -2043,46 +2073,43 @@ class Interpreter:
         if self._type_name(value.array.element_type) != self._type_name(expected_type):
             raise EvaluationError(f'Cannot convert slice to type "{type_name}".')
 
-    def _assign_hir_expression_target(
-        self, target: HIRExpression, value: object, scope: SymbolTable
-    ) -> None:
+    def _resolve_hir_assignment_target(
+        self, target: HIRExpression, scope: SymbolTable
+    ) -> Callable[[object], None]:
+        # Capture the place before evaluating an assignment's value.
         if isinstance(target, HIRVariableExpression):
-            scope.assign(target.name, value)
-            return
+            return lambda value: scope.assign(target.name, value)
         if isinstance(target, HIRFieldAccessExpression):
             receiver = self._eval_hir_expression(target.target, scope)
             if isinstance(receiver, (JackBorrow, JackArrayElementBorrow)):
-                try:
-                    receiver.set_field(target.field_name, value)
-                except AttributeError as err:
-                    raise NameResolutionError(
-                        f'Unknown field "{target.field_name}" in HIR assignment.'
-                    ) from err
-                return
+                def assign_field(value):
+                    try:
+                        receiver.set_field(target.field_name, value)
+                    except AttributeError as err:
+                        raise NameResolutionError(
+                            f'Unknown field "{target.field_name}" in HIR assignment.'
+                        ) from err
+                return assign_field
             if not hasattr(receiver, target.field_name):
                 raise NameResolutionError(
                     f'Unknown field "{target.field_name}" in HIR assignment.'
                 )
-            setattr(receiver, target.field_name, value)
-            return
+            return lambda value: setattr(receiver, target.field_name, value)
         if isinstance(target, HIRIndexExpression):
             indexed = self._eval_hir_expression(target.target, scope)
             index = self._hir_index_value(target.index, scope)
-            self._set_indexed_value(indexed, index, value)
-            return
+            return lambda value: self._set_indexed_value(indexed, index, value)
         if isinstance(target, HIRDereferenceExpression):
             pointer = self._eval_hir_expression(target.expr, scope)
             if isinstance(pointer, (JackBorrow, JackArrayElementBorrow)):
                 if not borrow_mode_can_write(pointer.mode):
                     raise EvaluationError('Cannot assign through a read-only borrow.')
-                pointer.value = value
-                return
+                return lambda value: setattr(pointer, 'value', value)
             if pointer is None:
                 raise EvaluationError('Cannot assign through a null raw pointer.')
             if not isinstance(pointer, JackRawPointer):
                 raise EvaluationError('Cannot assign through a non-pointer value.')
-            pointer.set(value)
-            return
+            return pointer.set
         raise EvaluationError(f'Unsupported HIR assignment target "{type(target).__name__}".')
 
     def _thaw_runtime_constant(

@@ -214,7 +214,7 @@ void append_repeated(
     }
 }
 
-void append_escaped(
+pub void append_escaped(
     &inout StringBuilder(SystemAllocator) output,
     str value
 ) raises CapacityError, LayoutError, AllocationError {

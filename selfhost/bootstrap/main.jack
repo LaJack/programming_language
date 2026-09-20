@@ -7,6 +7,9 @@ import bootstrap.frontend;
 import bootstrap.source;
 import bootstrap.syntax;
 import bootstrap.syntax_dump;
+import bootstrap.project_cli;
+import bootstrap.project;
+import bootstrap.names;
 import std.collections.arena;
 import std.collections.vector;
 import std.io;
@@ -213,6 +216,9 @@ i32 main(&in str[] arguments) {
     bool path_set = false;
     bool format_set = false;
     bool dump_set = false;
+    bool check_names = false;
+    bool project_options_seen = false;
+    i32 project_mode = i32(0);
     bool valid = true;
     usize index = usize(1);
     while (index < usize(len(arguments)) && valid) {
@@ -232,7 +238,23 @@ i32 main(&in str[] arguments) {
                 dump_set = true;
                 index = index + usize(1);
                 if (arguments[index] == "syntax") { syntax_mode = true; }
+                elif (arguments[index] == "modules") { project_mode = i32(2); }
+                elif (arguments[index] == "symbols") { project_mode = i32(3); }
                 elif (arguments[index] != "tokens") { valid = false; }
+            }
+        } elif (arguments[index] == "--check-names") {
+            if (check_names || dump_set) { valid = false; }
+            else { check_names = true; project_mode = i32(1); }
+        } elif (arguments[index] == "--module-root"
+            || arguments[index] == "--stub") {
+            project_options_seen = true;
+            if (index + usize(1) >= usize(len(arguments))) { valid = false; }
+            else {
+                index = index + usize(1);
+                if (len(arguments[index]) == usize(0)
+                    || jack_str_byte(arguments[index], usize(0)) == u8(45)) {
+                    valid = false;
+                }
             }
         } else {
             if (path_set || (len(arguments[index]) > usize(0)
@@ -241,12 +263,17 @@ i32 main(&in str[] arguments) {
         }
         index = index + usize(1);
     }
+    if (check_names && dump_set) { valid = false; }
+    if (project_options_seen && project_mode == i32(0)) { valid = false; }
     if (valid == false || path_set == false) {
-        try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] [--dump tokens|syntax] <source>\n"); }
+        try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] [--check-names|--dump tokens|syntax|modules|symbols] [--module-root DIR] [--stub REQUESTED=REPLACEMENT] <source>\n"); }
         catch IoError { }
         return 2;
     }
     try {
+        if (project_mode != i32(0)) {
+            return run_project_mode(arguments, path, format, project_mode);
+        }
         return run(path, format, syntax_mode);
     } catch IoError error {
         report_io(format, error.error_code());
@@ -271,6 +298,10 @@ i32 main(&in str[] arguments) {
         report_locationless(format, "syntax.invalid-reference", "invalid syntax reference");
     } catch ArenaHandleError {
         report_locationless(format, "syntax.invalid-handle", "invalid syntax node handle");
+    } catch ProjectReferenceError {
+        report_locationless(format, "project.invalid-reference", "invalid project reference");
+    } catch NameReferenceError {
+        report_locationless(format, "project.invalid-name", "invalid name reference");
     }
     return 1;
 }

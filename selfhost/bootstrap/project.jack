@@ -132,6 +132,65 @@ pub struct ReferenceOccurrence {
     ReferenceStatus binding(&in self) { return self.status; }
 }
 
+pub struct DeclarationSymbol {
+    NodeRef node;
+    SymbolId symbol;
+    NodeRef syntax_node(&in self) { return self.node; }
+    SymbolId declaration_symbol(&in self) { return self.symbol; }
+}
+
+pub struct NodeScope {
+    NodeRef node;
+    ScopeId scope;
+    NodeRef syntax_node(&in self) { return self.node; }
+    ScopeId lexical_scope(&in self) { return self.scope; }
+}
+
+pub struct ProjectIndexFile {
+    Vector(usize, SystemAllocator) declarations;
+    Vector(usize, SystemAllocator) scopes;
+    Vector(usize, SystemAllocator) last_occurrences;
+
+    void set_declaration(&inout self, usize ordinal, usize value)
+        raises BoundsError, ProjectReferenceError {
+        if (self.declarations.get(ordinal) != usize(0)) { raise ProjectReferenceError { }; }
+        self.declarations.replace(ordinal, value);
+    }
+
+    void set_scope(&inout self, usize ordinal, usize value)
+        raises BoundsError, ProjectReferenceError {
+        if (self.scopes.get(ordinal) != usize(0)) { raise ProjectReferenceError { }; }
+        self.scopes.replace(ordinal, value);
+    }
+
+    void set_last_occurrence(&inout self, usize ordinal, usize value)
+        raises BoundsError {
+        self.last_occurrences.replace(ordinal, value);
+    }
+}
+
+pub struct MemberRecord {
+    SymbolId owner;
+    SymbolId member;
+    SymbolId member_owner(&in self) { return self.owner; }
+    SymbolId member_symbol(&in self) { return self.member; }
+}
+
+pub struct ImportBindingRecord {
+    ScopeId scope;
+    NameId name;
+    SymbolLink symbol;
+    ModuleLink module_link;
+    bool alias;
+    bool poisoned;
+    ScopeId lexical_scope(&in self) { return self.scope; }
+    NameId binding_name(&in self) { return self.name; }
+    SymbolLink imported_symbol(&in self) { return self.symbol; }
+    ModuleLink imported_module(&in self) { return self.module_link; }
+    bool is_alias(&in self) { return self.alias; }
+    bool is_poisoned(&in self) { return self.poisoned; }
+}
+
 pub struct ModuleOverride {
     String(SystemAllocator) requested;
     String(SystemAllocator) replacement;
@@ -197,6 +256,13 @@ pub struct FrontendProject {
     Vector(SymbolRecord, SystemAllocator) symbols;
     Vector(ScopeRecord, SystemAllocator) scopes;
     Vector(ReferenceOccurrence, SystemAllocator) occurrences;
+    Vector(DeclarationSymbol, SystemAllocator) declarations;
+    Vector(NodeScope, SystemAllocator) node_scopes;
+    Vector(ProjectIndexFile, SystemAllocator) index_files;
+    Vector(MemberRecord, SystemAllocator) inherent_members;
+    Vector(MemberRecord, SystemAllocator) interface_members;
+    Vector(MemberRecord, SystemAllocator) implementation_members;
+    Vector(ImportBindingRecord, SystemAllocator) import_bindings;
     bool errors;
     usize deferred;
 
@@ -209,9 +275,19 @@ pub struct FrontendProject {
     usize symbol_count(&in self) { return self.symbols.len(); }
     usize scope_count(&in self) { return self.scopes.len(); }
     usize occurrence_count(&in self) { return self.occurrences.len(); }
+    usize declaration_count(&in self) { return self.declarations.len(); }
+    usize node_scope_count(&in self) { return self.node_scopes.len(); }
+    usize inherent_member_count(&in self) { return self.inherent_members.len(); }
+    usize interface_member_count(&in self) { return self.interface_members.len(); }
+    usize implementation_member_count(&in self) { return self.implementation_members.len(); }
+    usize import_binding_count(&in self) { return self.import_bindings.len(); }
 
     str name(&in self, NameId id) raises ProjectReferenceError {
         try { return self.names.text(id); }
+        catch NameReferenceError { raise ProjectReferenceError { }; }
+    }
+    usize name_index(&in self, NameId id) raises ProjectReferenceError {
+        try { return self.names.index_of(id); }
         catch NameReferenceError { raise ProjectReferenceError { }; }
     }
     ModuleId module_at(&in self, usize index) raises ProjectReferenceError {
@@ -238,11 +314,19 @@ pub struct FrontendProject {
         try { return self.modules.get(id.index); }
         catch BoundsError { raise ProjectReferenceError { }; }
     }
+    usize module_index(&in self, ModuleId id) raises ProjectReferenceError {
+        self.module_record(id);
+        return id.index;
+    }
     &in SymbolRecord symbol(&in self, SymbolId id) raises ProjectReferenceError {
         SymbolId expected = self.symbol_at(id.index);
         if (id.equals(expected) == false) { raise ProjectReferenceError { }; }
         try { return self.symbols.get(id.index); }
         catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    usize symbol_index(&in self, SymbolId id) raises ProjectReferenceError {
+        self.symbol(id);
+        return id.index;
     }
     &in ScopeRecord scope(&in self, ScopeId id) raises ProjectReferenceError {
         ScopeId expected = self.scope_at(id.index);
@@ -250,12 +334,87 @@ pub struct FrontendProject {
         try { return self.scopes.get(id.index); }
         catch BoundsError { raise ProjectReferenceError { }; }
     }
+    usize scope_index(&in self, ScopeId id) raises ProjectReferenceError {
+        self.scope(id);
+        return id.index;
+    }
     &in ReferenceOccurrence occurrence(&in self, usize index) raises ProjectReferenceError {
         try { return self.occurrences.get(index); }
         catch BoundsError { raise ProjectReferenceError { }; }
     }
     &in ImportRecord import_edge(&in self, usize index) raises ProjectReferenceError {
         try { return self.imports.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in DeclarationSymbol declaration(&in self, usize index) raises ProjectReferenceError {
+        try { return self.declarations.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in NodeScope node_scope(&in self, usize index) raises ProjectReferenceError {
+        try { return self.node_scopes.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    SymbolId declaration_symbol(&in self, NodeRef node) raises ProjectReferenceError {
+        try {
+            usize file_index = self.context.file_index(node.file_id());
+            usize ordinal = self.context.node(node).ordinal_value();
+            &in ProjectIndexFile index_file = self.index_files.get(file_index);
+            usize value = index_file.declarations.get(ordinal);
+            if (value == usize(0)) { raise ProjectReferenceError { }; }
+            return self.symbol_at(value - usize(1));
+        } catch FrontendReferenceError { raise ProjectReferenceError { }; }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    ScopeId scope_for_node(&in self, NodeRef node) raises ProjectReferenceError {
+        try {
+            usize file_index = self.context.file_index(node.file_id());
+            usize ordinal = self.context.node(node).ordinal_value();
+            &in ProjectIndexFile index_file = self.index_files.get(file_index);
+            usize value = index_file.scopes.get(ordinal);
+            if (value == usize(0)) { raise ProjectReferenceError { }; }
+            return self.scope_at(value - usize(1));
+        } catch FrontendReferenceError { raise ProjectReferenceError { }; }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in ReferenceOccurrence occurrence_for(&in self, NodeRef node,
+        OccurrenceRole role, SourceSpan span) raises ProjectReferenceError {
+        try { self.context.node(node); }
+        catch FrontendReferenceError { raise ProjectReferenceError { }; }
+        usize index = usize(0);
+        while (index < self.occurrences.len()) {
+            &in ReferenceOccurrence occurrence = self.occurrence(index);
+            if (occurrence.node.equals(node) && occurrence.role == role
+                && occurrence.span.same_range(span)) { return occurrence; }
+            index = index + usize(1);
+        }
+        raise ProjectReferenceError { };
+    }
+    ReferenceStatus latest_status_for(&in self, NodeRef node)
+        raises ProjectReferenceError {
+        try {
+            usize file_index = self.context.file_index(node.file_id());
+            usize ordinal = self.context.node(node).ordinal_value();
+            &in ProjectIndexFile file = self.index_files.get(file_index);
+            usize value = file.last_occurrences.get(ordinal);
+            if (value == usize(0)) { raise ProjectReferenceError { }; }
+            return self.occurrence(value - usize(1)).binding();
+        } catch FrontendReferenceError { raise ProjectReferenceError { }; }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in MemberRecord inherent_member(&in self, usize index) raises ProjectReferenceError {
+        try { return self.inherent_members.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in MemberRecord interface_member(&in self, usize index) raises ProjectReferenceError {
+        try { return self.interface_members.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in MemberRecord implementation_member(&in self, usize index) raises ProjectReferenceError {
+        try { return self.implementation_members.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in ImportBindingRecord import_binding(&in self, usize index) raises ProjectReferenceError {
+        try { return self.import_bindings.get(index); }
         catch BoundsError { raise ProjectReferenceError { }; }
     }
 }
@@ -274,9 +433,28 @@ pub FrontendProject frontend_project()
     Vector(ScopeRecord, SystemAllocator) scopes(scope_allocator, usize(0));
     SystemAllocator occurrence_allocator;
     Vector(ReferenceOccurrence, SystemAllocator) occurrences(occurrence_allocator, usize(0));
+    SystemAllocator declaration_allocator;
+    Vector(DeclarationSymbol, SystemAllocator) declarations(declaration_allocator, usize(0));
+    SystemAllocator node_scope_allocator;
+    Vector(NodeScope, SystemAllocator) node_scopes(node_scope_allocator, usize(0));
+    SystemAllocator index_allocator;
+    Vector(ProjectIndexFile, SystemAllocator) index_files(index_allocator, usize(0));
+    SystemAllocator inherent_allocator;
+    Vector(MemberRecord, SystemAllocator) inherent_members(inherent_allocator, usize(0));
+    SystemAllocator interface_allocator;
+    Vector(MemberRecord, SystemAllocator) interface_members(interface_allocator, usize(0));
+    SystemAllocator implementation_allocator;
+    Vector(MemberRecord, SystemAllocator) implementation_members(implementation_allocator, usize(0));
+    SystemAllocator import_binding_allocator;
+    Vector(ImportBindingRecord, SystemAllocator) import_bindings(import_binding_allocator, usize(0));
     return FrontendProject {
         context = move context, names = move names, modules = move modules, imports = move imports,
         symbols = move symbols, scopes = move scopes, occurrences = move occurrences,
+        declarations = move declarations, node_scopes = move node_scopes,
+        index_files = move index_files,
+        inherent_members = move inherent_members, interface_members = move interface_members,
+        implementation_members = move implementation_members,
+        import_bindings = move import_bindings,
         errors = false, deferred = usize(0),
     };
 }
@@ -304,8 +482,31 @@ pub struct ProjectBuilder {
         }
         ParsedFileId file = parse_recovering_with_options(
             self.value.context, source, tokens, diagnostics, options);
-        &in ParsedFile parsed = self.value.context.file(file);
-        if (parsed.has_errors()) { self.value.errors = true; }
+        usize node_count;
+        bool parsed_errors;
+        {
+            &in ParsedFile parsed = self.value.context.file(file);
+            node_count = parsed.node_count();
+            parsed_errors = parsed.has_errors();
+        }
+        SystemAllocator declaration_allocator;
+        Vector(usize, SystemAllocator) declaration_index(declaration_allocator, node_count);
+        SystemAllocator scope_allocator;
+        Vector(usize, SystemAllocator) scope_index(scope_allocator, node_count);
+        SystemAllocator occurrence_allocator;
+        Vector(usize, SystemAllocator) occurrence_index(occurrence_allocator, node_count);
+        usize node_index = usize(0);
+        while (node_index < node_count) {
+            declaration_index.push(usize(0));
+            scope_index.push(usize(0));
+            occurrence_index.push(usize(0));
+            node_index = node_index + usize(1);
+        }
+        self.value.index_files.push(ProjectIndexFile {
+            declarations = move declaration_index, scopes = move scope_index,
+            last_occurrences = move occurrence_index,
+        });
+        if (parsed_errors) { self.value.errors = true; }
         return file;
     }
 
@@ -467,6 +668,12 @@ pub struct ProjectBuilder {
         self.value.occurrences.push(ReferenceOccurrence {
             node = node, span = span, scope = scope, role = role, status = status,
         });
+        usize file_index = self.value.context.file_index(node.file_id());
+        usize ordinal = self.value.context.node(node).ordinal_value();
+        try {
+            &inout ProjectIndexFile file = self.value.index_files.get_mut(file_index);
+            file.set_last_occurrence(ordinal, index + usize(1));
+        } catch BoundsError { raise ProjectReferenceError { }; }
         match (&in status) {
             .resolved(_) { }
             .deferred(_) { self.value.deferred = self.value.deferred + usize(1); }
@@ -492,6 +699,81 @@ pub struct ProjectBuilder {
             .deferred(_) { self.value.deferred = self.value.deferred + usize(1); }
             .invalid { self.value.errors = true; }
         }
+    }
+
+    void record_declaration(&inout self, NodeRef node, SymbolId symbol)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+            FrontendReferenceError {
+        usize file_index = self.value.context.file_index(node.file_id());
+        usize ordinal = self.value.context.node(node).ordinal_value();
+        self.value.symbol(symbol);
+        usize symbol_value = symbol.index + usize(1);
+        try {
+            &inout ProjectIndexFile file = self.value.index_files.get_mut(file_index);
+            file.set_declaration(ordinal, symbol_value);
+        } catch BoundsError { raise ProjectReferenceError { }; }
+        self.value.declarations.push(DeclarationSymbol { node = node, symbol = symbol });
+    }
+
+    void record_node_scope(&inout self, NodeRef node, ScopeId scope)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+            FrontendReferenceError {
+        usize file_index = self.value.context.file_index(node.file_id());
+        usize ordinal = self.value.context.node(node).ordinal_value();
+        self.value.scope(scope);
+        usize scope_value = scope.index + usize(1);
+        try {
+            &inout ProjectIndexFile file = self.value.index_files.get_mut(file_index);
+            file.set_scope(ordinal, scope_value);
+        } catch BoundsError { raise ProjectReferenceError { }; }
+        self.value.node_scopes.push(NodeScope { node = node, scope = scope });
+    }
+
+    void add_inherent_member(&inout self, SymbolId owner, SymbolId member)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+        self.value.symbol(owner);
+        self.value.symbol(member);
+        self.value.inherent_members.push(MemberRecord { owner = owner, member = member });
+    }
+
+    void add_interface_member(&inout self, SymbolId owner, SymbolId member)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+        self.value.symbol(owner);
+        self.value.symbol(member);
+        self.value.interface_members.push(MemberRecord { owner = owner, member = member });
+    }
+
+    void add_implementation_member(&inout self, SymbolId owner, SymbolId member)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+        self.value.symbol(owner);
+        self.value.symbol(member);
+        self.value.implementation_members.push(MemberRecord { owner = owner, member = member });
+    }
+
+
+    usize add_import_binding(&inout self, ScopeId scope, NameId name,
+        SymbolLink symbol, ModuleLink module_link, bool alias, bool poisoned)
+        raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+        self.value.scope(scope);
+        self.value.name(name);
+        check_symbol_link(self.value, symbol);
+        check_module_link(self.value, module_link);
+        usize index = self.value.import_bindings.len();
+        self.value.import_bindings.push(ImportBindingRecord {
+            scope = scope, name = name, symbol = symbol, module_link = module_link,
+            alias = alias, poisoned = poisoned,
+        });
+        if (poisoned) { self.value.errors = true; }
+        return index;
+    }
+
+    void poison_import_binding(&inout self, usize index)
+        raises ProjectReferenceError {
+        try {
+            &inout ImportBindingRecord binding = self.value.import_bindings.get_mut(index);
+            binding.poisoned = true;
+        } catch BoundsError { raise ProjectReferenceError { }; }
+        self.value.errors = true;
     }
 }
 

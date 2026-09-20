@@ -70,6 +70,11 @@ pub struct FrontendContext {
         catch BoundsError { raise FrontendReferenceError { }; }
     }
 
+    usize file_index(&in self, ParsedFileId id) raises FrontendReferenceError {
+        self.file(id);
+        return id.index;
+    }
+
     NodeRef root(&in self, ParsedFileId id, usize index)
         raises FrontendReferenceError {
         &in ParsedFile file = self.file(id);

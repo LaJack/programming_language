@@ -24,7 +24,7 @@ pub struct ModuleHeader {
 }
 
 // Validate before translating dots into directories, including configured stubs.
-bool valid_module_path(str name) {
+pub bool valid_module_path(str name) {
     bool first = true;
     usize index = usize(0);
     while (index < len(name)) {
@@ -570,12 +570,12 @@ ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLi
     return ModuleLink.present(id);
 }
 
-pub FrontendProject load_module_graph(str entry, &in ProjectOptions options,
+pub void load_module_graph_into(&inout ProjectBuilder builder, str entry,
+    &in ProjectOptions options,
     &inout DiagnosticBag diagnostics)
     raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
         ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
         ProjectReferenceError, NameReferenceError, Utf8Error {
-    ProjectBuilder builder = project_builder();
     try {
         String(SystemAllocator) path = canonical_path(entry);
         String(SystemAllocator) directory = entry_directory(path.as_str());
@@ -584,5 +584,14 @@ pub FrontendProject load_module_graph(str entry, &in ProjectOptions options,
     } catch IoError {
         graph_error(builder, diagnostics, DiagnosticOrigin.none, "module.entry", entry);
     }
+}
+
+pub FrontendProject load_module_graph(str entry, &in ProjectOptions options,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
+        ProjectReferenceError, NameReferenceError, Utf8Error {
+    ProjectBuilder builder = project_builder();
+    load_module_graph_into(builder, entry, options, diagnostics);
     return finish_project(builder);
 }

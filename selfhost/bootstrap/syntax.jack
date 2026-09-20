@@ -302,6 +302,7 @@ pub struct SyntaxNode {
     SyntaxData data;
 
     SourceSpan source_span(&in self) { return self.span; }
+    usize ordinal_value(&in self) { return self.ordinal; }
     SyntaxKind kind(&in self) {
         return match (&in self.data) {
             .invalid_declaration => SyntaxKind.invalid_declaration,

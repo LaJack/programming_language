@@ -1,0 +1,1366 @@
+module bootstrap.analysis;
+
+import bootstrap.diagnostics;
+import bootstrap.frontend;
+import bootstrap.modules;
+import bootstrap.lexer;
+import bootstrap.names;
+import bootstrap.project;
+import bootstrap.source;
+import bootstrap.syntax;
+import std.collections.arena;
+import std.collections.vector;
+import std.memory;
+import std.string;
+
+pub struct AnalysisBinding {
+    ScopeId scope;
+    NameId name;
+    SymbolId symbol;
+    usize visible_after;
+    bool poisoned;
+    usize namespace;
+}
+
+pub struct AnalysisModuleScope {
+    ModuleId module_id;
+    ScopeId scope;
+}
+
+pub struct AnalysisAlias {
+    SymbolId symbol;
+    ModuleId module_id;
+}
+
+pub union MemberContext {
+    none;
+    inherent(SymbolId owner);
+    interface_owner(SymbolId owner);
+    implementation_owner(SymbolId owner);
+}
+
+pub union BindingLookup {
+    missing;
+    poisoned;
+    found(SymbolId symbol);
+}
+
+pub struct AnalysisState {
+    Vector(AnalysisBinding, SystemAllocator) bindings;
+    Vector(usize, SystemAllocator) buckets;
+    Vector(AnalysisModuleScope, SystemAllocator) module_scopes;
+    Vector(AnalysisAlias, SystemAllocator) aliases;
+    usize diagnostics;
+    usize maximum;
+}
+
+AnalysisState analysis_state(usize maximum)
+    raises CapacityError, LayoutError, AllocationError {
+    SystemAllocator binding_allocator;
+    Vector(AnalysisBinding, SystemAllocator) bindings(binding_allocator, usize(0));
+    SystemAllocator bucket_allocator;
+    Vector(usize, SystemAllocator) buckets(bucket_allocator, usize(128));
+    usize bucket_index = usize(0);
+    while (bucket_index < usize(128)) {
+        buckets.push(usize(0));
+        bucket_index = bucket_index + usize(1);
+    }
+    SystemAllocator module_allocator;
+    Vector(AnalysisModuleScope, SystemAllocator) module_scopes(module_allocator, usize(0));
+    SystemAllocator alias_allocator;
+    Vector(AnalysisAlias, SystemAllocator) aliases(alias_allocator, usize(0));
+    if (maximum == usize(0)) { maximum = usize(1); }
+    return AnalysisState {
+        bindings = move bindings, buckets = move buckets, module_scopes = move module_scopes,
+        aliases = move aliases, diagnostics = usize(0), maximum = maximum,
+    };
+}
+
+String(SystemAllocator) analysis_spelling(&in ProjectBuilder builder,
+    ParsedFileId file_id, SourceSpan span)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        SourceMapError, FrontendReferenceError, Utf8Error {
+    &in FrontendProject project = builder.project();
+    &in FrontendContext context = project.frontend();
+    &in SourceMap sources = context.source_map();
+    &in ParsedFile file = context.file(file_id);
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    usize index = usize(0);
+    while (index < file.token_count()) {
+        &in Token token = file.token(index);
+        usize start = token.start_offset();
+        usize end = token.end_offset();
+        if (start >= span.start_offset() && end <= span.end_offset() && end > start) {
+            usize offset = start;
+            while (offset < end) {
+                output.append_byte(sources.byte_at(span.source_id(), offset));
+                offset = offset + usize(1);
+            }
+        }
+        index = index + usize(1);
+    }
+    return finish_string(SystemAllocator, output);
+}
+
+SourceSpan path_token_span(&in ProjectBuilder builder, ParsedFileId file_id,
+    SourceSpan path, bool last)
+    raises FrontendReferenceError, BoundsError {
+    &in ParsedFile file = builder.project().frontend().file(file_id);
+    SourceSpan result = empty_source_span();
+    usize index = usize(0);
+    bool found = false;
+    while (index < file.token_count()) {
+        &in Token token = file.token(index);
+        if (token.start_offset() >= path.start_offset()
+            && token.end_offset() <= path.end_offset()
+            && token.end_offset() > token.start_offset()) {
+            if (found == false || last) {
+                result = token.source_location();
+                found = true;
+            }
+        }
+        index = index + usize(1);
+    }
+    return result;
+}
+
+bool spelling_has_dot(str spelling) {
+    usize index = usize(0);
+    while (index < len(spelling)) {
+        if (jack_str_byte(spelling, index) == u8(46)) { return true; }
+        index = index + usize(1);
+    }
+    return false;
+}
+
+void analysis_error(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, SourceSpan span, str code, str message)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    builder.mark_error();
+    if (state.diagnostics >= state.maximum) { return; }
+    state.diagnostics = state.diagnostics + usize(1);
+    Diagnostic diagnostic = source_diagnostic(DiagnosticSeverity.error, code, span, message);
+    diagnostics.add(diagnostic);
+}
+
+void analysis_duplicate_error(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, SourceSpan current, SourceSpan previous)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    builder.mark_error();
+    if (state.diagnostics >= state.maximum) { return; }
+    state.diagnostics = state.diagnostics + usize(1);
+    Diagnostic diagnostic = source_diagnostic(DiagnosticSeverity.error,
+        "resolve.duplicate-declaration", current, "duplicate declaration in this scope");
+    diagnostic.add_secondary(previous, "the original declaration is here");
+    diagnostics.add(diagnostic);
+}
+
+ScopeId module_scope(&in AnalysisState state, ModuleId module_id)
+    raises ProjectReferenceError, BoundsError {
+    usize index = usize(0);
+    while (index < state.module_scopes.len()) {
+        &in AnalysisModuleScope item = state.module_scopes.get(index);
+        if (item.module_id.equals(module_id)) { return item.scope; }
+        index = index + usize(1);
+    }
+    raise ProjectReferenceError { };
+}
+
+ModuleLink module_for_scope(&in FrontendProject project, ScopeId scope)
+    raises ProjectReferenceError {
+    ScopeId current = scope;
+    bool searching = true;
+    while (searching) {
+        &in ScopeRecord record = project.scope(current);
+        ModuleLink owner = record.module_owner();
+        match (&in owner) {
+            .present(_) { return owner; }
+            .none { }
+        }
+        ScopeLink parent = record.parent_scope();
+        match (&in parent) {
+            .none { searching = false; }
+            .present(value) { current = value; }
+        }
+    }
+    return ModuleLink.none;
+}
+
+SymbolLink declaration_for(&in FrontendProject project, NodeRef node)
+    raises ProjectReferenceError {
+    try { return SymbolLink.present(project.declaration_symbol(node)); }
+    catch ProjectReferenceError { return SymbolLink.none; }
+}
+
+SourceSpan symbol_span(&in FrontendProject project, SymbolId symbol)
+    raises ProjectReferenceError {
+    &in SymbolRecord record = project.symbol(symbol);
+    SymbolOrigin origin = record.declaration_origin();
+    return match (&in origin) {
+        .builtin => empty_source_span(),
+        .source(node, span) => span,
+    };
+}
+
+bool same_scope_name(&in AnalysisBinding binding, ScopeId scope, NameId name) {
+    return binding.scope.equals(scope) && binding.name.equals(name);
+}
+
+usize binding_namespace(&in FrontendProject project, SymbolId symbol)
+    raises ProjectReferenceError {
+    if (project.symbol(symbol).symbol_kind() == SymbolKind.field) { return usize(1); }
+    return usize(0);
+}
+
+usize binding_bucket(&in FrontendProject project,
+    &in Vector(AnalysisBinding, SystemAllocator) bindings,
+    &in Vector(usize, SystemAllocator) buckets,
+    ScopeId scope, NameId name, usize namespace)
+    raises BoundsError, ProjectReferenceError {
+    usize hash = project.scope_index(scope) * usize(33)
+        + project.name_index(name) * usize(65599) + namespace;
+    usize position = hash % buckets.len();
+    bool found = false;
+    while (found == false) {
+        usize occupied = buckets.get(position);
+        if (occupied == usize(0)) {
+            found = true;
+        } else {
+            &in AnalysisBinding existing = bindings.get(occupied - usize(1));
+            if (same_scope_name(existing, scope, name)
+                && existing.namespace == namespace) {
+                found = true;
+            }
+        }
+        if (found == false) {
+            position = (position + usize(1)) % buckets.len();
+        }
+    }
+    return position;
+}
+
+void ensure_binding_buckets(&inout AnalysisState state,
+    &in FrontendProject project)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError {
+    if (state.bindings.len() < state.buckets.len() / usize(2)) { return; }
+    if (state.buckets.len() > usize(18446744073709551615) / usize(2)) {
+        raise LayoutError { };
+    }
+    usize count = state.buckets.len() * usize(2);
+    SystemAllocator allocator;
+    Vector(usize, SystemAllocator) grown(allocator, count);
+    usize index = usize(0);
+    while (index < count) { grown.push(usize(0)); index = index + usize(1); }
+    index = usize(0);
+    while (index < state.bindings.len()) {
+        &in AnalysisBinding binding = state.bindings.get(index);
+        usize bucket = binding_bucket(project, state.bindings, grown,
+            binding.scope, binding.name, binding.namespace);
+        grown.replace(bucket, index + usize(1));
+        index = index + usize(1);
+    }
+    state.buckets = move grown;
+}
+
+void insert_indexed_binding(&inout AnalysisState state,
+    &in FrontendProject project, AnalysisBinding binding)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError {
+    ensure_binding_buckets(state, project);
+    usize bucket = binding_bucket(project, state.bindings, state.buckets,
+        binding.scope, binding.name, binding.namespace);
+    usize index = state.bindings.len();
+    state.bindings.push(binding);
+    state.buckets.replace(bucket, index + usize(1));
+}
+
+void append_binding(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, ScopeId scope, NameId name, SymbolId symbol,
+    usize visible_after, SourceSpan span)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError {
+    usize namespace = binding_namespace(builder.project(), symbol);
+    usize bucket = binding_bucket(builder.project(), state.bindings, state.buckets,
+        scope, name, namespace);
+    usize existing_index = state.buckets.get(bucket);
+    bool duplicate = existing_index != usize(0);
+    if (duplicate) {
+        SymbolId previous_symbol;
+        {
+            &inout AnalysisBinding existing = state.bindings.get_mut(existing_index - usize(1));
+            existing.poisoned = true;
+            previous_symbol = existing.symbol;
+        }
+            builder.poison(previous_symbol);
+            SourceSpan previous = symbol_span(builder.project(), previous_symbol);
+            analysis_duplicate_error(builder, state, diagnostics, span, previous);
+    }
+    if (duplicate) { builder.poison(symbol); }
+    insert_indexed_binding(state, builder.project(), AnalysisBinding {
+        scope = scope, name = name, symbol = symbol,
+        visible_after = visible_after, poisoned = duplicate, namespace = namespace,
+    });
+}
+
+SymbolId declare_symbol(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, NodeRef node, SourceSpan name_span,
+    SymbolKind kind, ScopeId scope, SymbolLink owner, DeclarationModifiers modifiers,
+    usize visible_after)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    String(SystemAllocator) spelling = analysis_spelling(builder, node.file_id(), name_span);
+    NameId name = builder.intern(spelling.as_str());
+    SymbolId symbol = builder.add_symbol(name, kind, scope, owner,
+        SymbolOrigin.source(node, name_span), modifiers);
+    builder.record_declaration(node, symbol);
+    builder.add_occurrence(node, name_span, scope, OccurrenceRole.declaration,
+        ReferenceStatus.resolved(symbol));
+    append_binding(builder, state, diagnostics, scope, name, symbol, visible_after, name_span);
+    return symbol;
+}
+
+SymbolLink predeclared_symbol(&in FrontendProject project, NodeRef node)
+    raises ProjectReferenceError {
+    return declaration_for(project, node);
+}
+
+DeclarationModifiers node_modifiers(&in SyntaxData data) {
+    return match (data) {
+        .struct_declaration(_, modifiers, _, _) => modifiers,
+        .union_declaration(_, modifiers, _, _) => modifiers,
+        .interface_declaration(_, modifiers, _) => modifiers,
+        .view_declaration(_, modifiers, _) => modifiers,
+        .extern_type_declaration(_, modifiers) => modifiers,
+        .function_declaration(_, modifiers, _, _, _, _) => modifiers,
+        .parameter(_, modifiers, _, _) => modifiers,
+        .field_declaration(_, modifiers, _, _) => modifiers,
+        .variable_declaration(_, modifiers, _, _, _) => modifiers,
+        .constant_declaration(_, modifiers, _, _) => modifiers,
+        .comptime_type_declaration(_, modifiers, _) => modifiers,
+        _ => declaration_modifiers(u32(0), false),
+    };
+}
+
+SymbolKind top_level_kind(&in SyntaxData data) {
+    return match (data) {
+        .function_declaration(_, _, _, _, _, _) => SymbolKind.function,
+        .struct_declaration(_, _, _, _) => SymbolKind.structure,
+        .union_declaration(_, _, _, _) => SymbolKind.sum_type,
+        .interface_declaration(_, _, _) => SymbolKind.interface_type,
+        .view_declaration(_, _, _) => SymbolKind.view_type,
+        .extern_type_declaration(_, _) => SymbolKind.structure,
+        .variable_declaration(_, _, _, _, _) => SymbolKind.global,
+        .constant_declaration(_, _, _, _) => SymbolKind.constant,
+        .comptime_type_declaration(_, _, _) => SymbolKind.computed_type,
+        _ => SymbolKind.local,
+    };
+}
+
+bool is_named_declaration(&in SyntaxData data) {
+    return match (data) {
+        .function_declaration(_, _, _, _, _, _) => true,
+        .struct_declaration(_, _, _, _) => true,
+        .union_declaration(_, _, _, _) => true,
+        .interface_declaration(_, _, _) => true,
+        .view_declaration(_, _, _) => true,
+        .extern_type_declaration(_, _) => true,
+        .variable_declaration(_, _, _, _, _) => true,
+        .constant_declaration(_, _, _, _) => true,
+        .comptime_type_declaration(_, _, _) => true,
+        _ => false,
+    };
+}
+
+SourceSpan declaration_name(&in SyntaxData data) {
+    return match (data) {
+        .function_declaration(name, _, _, _, _, _) => name,
+        .struct_declaration(name, _, _, _) => name,
+        .union_declaration(name, _, _, _) => name,
+        .interface_declaration(name, _, _) => name,
+        .view_declaration(name, _, _) => name,
+        .extern_type_declaration(name, _) => name,
+        .variable_declaration(name, _, _, _, _) => name,
+        .constant_declaration(name, _, _, _) => name,
+        .comptime_type_declaration(name, _, _) => name,
+        .parameter(name, _, _, _) => name,
+        .field_declaration(name, _, _, _) => name,
+        .union_variant(name, _) => name,
+        .view_field(name, _, _) => name,
+        .catch_clause(name, _, _) => name,
+        .binding_pattern(name) => name,
+        _ => empty_source_span(),
+    };
+}
+
+bool is_type_parameter(&in ProjectBuilder builder, NodeRef node,
+    &in SyntaxData data)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        SourceMapError, FrontendReferenceError, Utf8Error {
+    match (data) {
+        .parameter(_, modifiers, declared_type, _) {
+            if (modifiers.comptime_flag() == false) { return false; }
+            match (&in declared_type) {
+                .absent { return false; }
+                .present(_) {
+                    NodeRef type_node = builder.project().frontend().child(node, usize(0));
+                    SyntaxData type_data = builder.project().frontend().node(type_node).payload();
+                    match (&in type_data) {
+                        .named_type(name) {
+                            String(SystemAllocator) spelling = analysis_spelling(
+                                builder, node.file_id(), name);
+                            return spelling.as_str() == "type";
+                        }
+                        _ { return false; }
+                    }
+                }
+            }
+        }
+        _ { return false; }
+    }
+}
+
+void predeclare_module(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, ModuleId module_id, ScopeId scope)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    ParsedFileId file = builder.project().module_record(module_id).parsed_file();
+    usize root_count = builder.project().frontend().file(file).root_count();
+    usize index = usize(0);
+    while (index < root_count) {
+        NodeRef node = builder.project().frontend().root(file, index);
+        SyntaxData data = builder.project().frontend().node(node).payload();
+        if (is_named_declaration(data)) {
+            usize visible = usize(0);
+            if (builder.project().frontend().node(node).kind() == SyntaxKind.comptime_type_declaration) {
+                visible = builder.project().frontend().node(node).source_span().end_offset();
+            }
+            declare_symbol(builder, state, diagnostics, node, declaration_name(data),
+                top_level_kind(data), scope, SymbolLink.none, node_modifiers(data), visible);
+        }
+        index = index + usize(1);
+    }
+}
+
+SymbolLink owner_symbol(&in MemberContext context) {
+    return match (&in context) {
+        .none => SymbolLink.none,
+        .inherent(owner) => SymbolLink.present(owner),
+        .interface_owner(owner) => SymbolLink.present(owner),
+        .implementation_owner(owner) => SymbolLink.present(owner),
+    };
+}
+
+bool symbol_link_is_none(&in SymbolLink link) {
+    return match (&in link) { .none => true, .present(_) => false, };
+}
+
+SymbolKind method_kind(&in MemberContext context) {
+    return match (&in context) {
+        .none => SymbolKind.function,
+        .inherent(_) => SymbolKind.inherent_method,
+        .interface_owner(_) => SymbolKind.interface_requirement,
+        .implementation_owner(_) => SymbolKind.implementation_method,
+    };
+}
+
+void record_member(&inout ProjectBuilder builder, &in MemberContext context, SymbolId symbol)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+    match (&in context) {
+        .none { }
+        .inherent(owner) { builder.add_inherent_member(owner, symbol); }
+        .interface_owner(owner) { builder.add_interface_member(owner, symbol); }
+        .implementation_owner(owner) { builder.add_implementation_member(owner, symbol); }
+    }
+}
+
+void index_node(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, NodeRef node, ScopeId scope,
+    MemberContext member_context)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    SyntaxData data = SyntaxData.absent;
+    SyntaxKind kind = SyntaxKind.absent;
+    SourceSpan extent;
+    usize children;
+    {
+        &in SyntaxNode source_node = builder.project().frontend().node(node);
+        data = source_node.payload();
+        kind = source_node.kind();
+        extent = source_node.source_span();
+        children = child_count(source_node);
+    }
+    builder.record_node_scope(node, scope);
+
+    SymbolLink declaration = predeclared_symbol(builder.project(), node);
+    SymbolLink child_owner = owner_symbol(member_context);
+    ScopeId child_scope = scope;
+    MemberContext children_context = member_context;
+
+    if (kind == SyntaxKind.function_declaration) {
+        SymbolId symbol;
+        match (&in declaration) {
+            .present(value) { symbol = value; }
+            .none {
+                symbol = declare_symbol(builder, state, diagnostics, node,
+                    declaration_name(data), method_kind(member_context), scope,
+                    owner_symbol(member_context), node_modifiers(data), usize(0));
+                record_member(builder, member_context, symbol);
+            }
+        }
+        child_scope = builder.add_lexical_scope(scope, SymbolLink.present(symbol), node);
+        children_context = MemberContext.none;
+    } elif (kind == SyntaxKind.struct_declaration || kind == SyntaxKind.union_declaration
+        || kind == SyntaxKind.interface_declaration || kind == SyntaxKind.view_declaration) {
+        SymbolId symbol;
+        match (&in declaration) {
+            .present(value) { symbol = value; }
+            .none {
+                symbol = declare_symbol(builder, state, diagnostics, node,
+                    declaration_name(data), top_level_kind(data), scope, SymbolLink.none,
+                    node_modifiers(data), usize(0));
+            }
+        }
+        child_scope = builder.add_lexical_scope(scope, SymbolLink.present(symbol), node);
+        if (kind == SyntaxKind.interface_declaration) {
+            children_context = MemberContext.interface_owner(symbol);
+        } else { children_context = MemberContext.inherent(symbol); }
+        NameId self_name = builder.intern("Self");
+        DeclarationModifiers modifiers = declaration_modifiers(u32(0), false);
+        SymbolId self_symbol = builder.add_symbol(self_name, SymbolKind.self_type, child_scope,
+            SymbolLink.present(symbol), SymbolOrigin.source(node, declaration_name(data)), modifiers);
+        append_binding(builder, state, diagnostics, child_scope, self_name, self_symbol,
+            usize(0), declaration_name(data));
+    } elif (kind == SyntaxKind.implementation_declaration) {
+        NameId implementation_name = builder.intern("<implementation>");
+        DeclarationModifiers modifiers = declaration_modifiers(u32(0), false);
+        SymbolId symbol = builder.add_symbol(implementation_name, SymbolKind.implementation,
+            scope, SymbolLink.none, SymbolOrigin.source(node, extent), modifiers);
+        builder.record_declaration(node, symbol);
+        child_scope = builder.add_lexical_scope(scope, SymbolLink.present(symbol), node);
+        children_context = MemberContext.implementation_owner(symbol);
+        NameId self_name = builder.intern("Self");
+        SymbolId self_symbol = builder.add_symbol(self_name, SymbolKind.self_type,
+            child_scope, SymbolLink.present(symbol), SymbolOrigin.source(node, extent), modifiers);
+        append_binding(builder, state, diagnostics, child_scope, self_name, self_symbol,
+            usize(0), extent);
+    } elif (kind == SyntaxKind.parameter) {
+        SymbolKind parameter_kind = SymbolKind.parameter;
+        if (is_type_parameter(builder, node, data)) {
+            parameter_kind = SymbolKind.type_parameter;
+        }
+        SymbolId symbol = declare_symbol(builder, state, diagnostics, node,
+            declaration_name(data), parameter_kind, scope, child_owner,
+            node_modifiers(data), extent.end_offset());
+        if (parameter_kind == SymbolKind.type_parameter) {
+            record_member(builder, member_context, symbol);
+        }
+    } elif (kind == SyntaxKind.field_declaration || kind == SyntaxKind.view_field
+        || kind == SyntaxKind.union_variant) {
+        SymbolKind symbol_kind = SymbolKind.field;
+        if (kind == SyntaxKind.union_variant) { symbol_kind = SymbolKind.variant; }
+        SymbolId symbol = declare_symbol(builder, state, diagnostics, node,
+            declaration_name(data), symbol_kind, scope, child_owner,
+            node_modifiers(data), usize(0));
+        record_member(builder, member_context, symbol);
+        if (kind == SyntaxKind.union_variant) {
+            child_scope = builder.add_lexical_scope(scope, SymbolLink.present(symbol), node);
+            children_context = MemberContext.none;
+        }
+    } elif (kind == SyntaxKind.variable_declaration) {
+        ModuleLink module_link = module_for_scope(builder.project(), scope);
+        SymbolKind symbol_kind = SymbolKind.local;
+        SymbolLink variable_owner = SymbolLink.none;
+        match (&in member_context) {
+            .inherent(owner) {
+                symbol_kind = SymbolKind.field;
+                variable_owner = SymbolLink.present(owner);
+            }
+            _ { }
+        }
+        match (&in module_link) {
+            .none { }
+            .present(module_id) {
+                if (scope.equals(module_scope(state, module_id))) {
+                    symbol_kind = SymbolKind.global;
+                }
+            }
+        }
+        if (symbol_link_is_none(declaration)) {
+            usize visible = extent.end_offset();
+            if (symbol_kind == SymbolKind.field) { visible = usize(0); }
+            SymbolId field_symbol = declare_symbol(builder, state, diagnostics, node,
+                declaration_name(data), symbol_kind, scope, variable_owner,
+                node_modifiers(data), visible);
+            if (symbol_kind == SymbolKind.field) {
+                record_member(builder, member_context, field_symbol);
+            }
+        }
+    } elif (kind == SyntaxKind.constant_declaration || kind == SyntaxKind.comptime_type_declaration) {
+        if (symbol_link_is_none(declaration)) {
+            SymbolKind symbol_kind = SymbolKind.constant;
+            if (kind == SyntaxKind.comptime_type_declaration) { symbol_kind = SymbolKind.computed_type; }
+            declare_symbol(builder, state, diagnostics, node, declaration_name(data),
+                symbol_kind, scope, SymbolLink.none, node_modifiers(data), extent.end_offset());
+        }
+    } elif (kind == SyntaxKind.catch_clause) {
+        child_scope = builder.add_lexical_scope(scope, SymbolLink.none, node);
+        SourceSpan name_span = declaration_name(data);
+        if (name_span.end_offset() > name_span.start_offset()) {
+            declare_symbol(builder, state, diagnostics, node, name_span,
+                SymbolKind.catch_binding, child_scope, SymbolLink.none,
+                declaration_modifiers(u32(0), false), usize(0));
+        }
+    } elif (kind == SyntaxKind.match_arm || kind == SyntaxKind.if_branch
+        || kind == SyntaxKind.else_branch || kind == SyntaxKind.for_statement
+        || kind == SyntaxKind.while_statement || kind == SyntaxKind.block_statement
+        || kind == SyntaxKind.unsafe_block) {
+        child_scope = builder.add_lexical_scope(scope, SymbolLink.none, node);
+    } elif (kind == SyntaxKind.binding_pattern) {
+        declare_symbol(builder, state, diagnostics, node, declaration_name(data),
+            SymbolKind.match_binding, scope, SymbolLink.none,
+            declaration_modifiers(u32(0), false), usize(0));
+    }
+
+    usize index = usize(0);
+    while (index < children) {
+        NodeRef child = builder.project().frontend().child(node, index);
+        index_node(builder, state, diagnostics, child, child_scope, children_context);
+        index = index + usize(1);
+    }
+}
+
+void add_builtin(&inout ProjectBuilder builder, &inout AnalysisState state,
+    ScopeId scope, str text, SymbolKind kind)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, ProjectReferenceError,
+        NameReferenceError, FrontendReferenceError {
+    NameId name = builder.intern(text);
+    DeclarationModifiers modifiers = declaration_modifiers(u32(0), false);
+    SymbolId symbol = builder.add_symbol(name, kind, scope, SymbolLink.none,
+        SymbolOrigin.builtin, modifiers);
+    insert_indexed_binding(state, builder.project(), AnalysisBinding {
+        scope = scope, name = name, symbol = symbol,
+        visible_after = usize(0), poisoned = false, namespace = usize(0),
+    });
+}
+
+void add_builtins(&inout ProjectBuilder builder, &inout AnalysisState state,
+    ScopeId scope)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, ProjectReferenceError,
+        NameReferenceError, FrontendReferenceError {
+    add_builtin(builder, state, scope, "void", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "bool", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "b8", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "i8", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "i16", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "i32", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "i64", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "u8", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "u16", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "u32", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "u64", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "isize", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "usize", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "f32", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "f64", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "str", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "type", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "c_char", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "c_void", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "Copyable", SymbolKind.interface_type);
+    add_builtin(builder, state, scope, "MaybeUninit", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "Allocation", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "Union", SymbolKind.builtin_function);
+    add_builtin(builder, state, scope, "UnionVariant", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "UnionField", SymbolKind.builtin_type);
+    add_builtin(builder, state, scope, "variant", SymbolKind.builtin_function);
+    add_builtin(builder, state, scope, "field", SymbolKind.builtin_function);
+    add_builtin(builder, state, scope, "move_field", SymbolKind.builtin_function);
+    add_builtin(builder, state, scope, "len", SymbolKind.builtin_function);
+    add_builtin(builder, state, scope, "sizeof", SymbolKind.builtin_function);
+    add_builtin(builder, state, scope, "alignof", SymbolKind.builtin_function);
+    add_builtin(builder, state, scope, "raw", SymbolKind.builtin_function);
+    add_builtin(builder, state, scope, "initialized_slice", SymbolKind.builtin_function);
+}
+
+bool in_function_return_type(&in FrontendProject project, ScopeId scope, usize offset)
+    raises ProjectReferenceError, FrontendReferenceError, BoundsError {
+    SymbolLink owner = project.scope(scope).symbol_owner();
+    match (&in owner) {
+        .none { return false; }
+        .present(symbol) {
+            if (project.symbol(symbol).symbol_kind() != SymbolKind.function
+                && project.symbol(symbol).symbol_kind() != SymbolKind.inherent_method
+                && project.symbol(symbol).symbol_kind() != SymbolKind.interface_requirement
+                && project.symbol(symbol).symbol_kind() != SymbolKind.implementation_method) {
+                return false;
+            }
+            SymbolOrigin origin = project.symbol(symbol).declaration_origin();
+            match (&in origin) {
+                .builtin { return false; }
+                .source(node, _) {
+                    &in SyntaxNode syntax = project.frontend().node(node);
+                    usize index = usize(0);
+                    while (index < child_count(syntax)) {
+                        if (child_role(syntax, index) == "return_type") {
+                            NodeRef result = project.frontend().child(node, index);
+                            SourceSpan span = project.frontend().node(result).source_span();
+                            return offset >= span.start_offset() && offset < span.end_offset();
+                        }
+                        index = index + usize(1);
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+BindingLookup lookup_name(&in FrontendProject project, &in AnalysisState state,
+    ScopeId scope, NameId name, usize offset)
+    raises BoundsError, ProjectReferenceError, FrontendReferenceError {
+    ScopeId current = scope;
+    bool searching = true;
+    while (searching) {
+        usize bucket = binding_bucket(project, state.bindings, state.buckets,
+            current, name, usize(0));
+        usize found = state.buckets.get(bucket);
+        if (found != usize(0)) {
+            &in AnalysisBinding binding = state.bindings.get(found - usize(1));
+            bool visible = offset >= binding.visible_after;
+            if (visible == false) {
+                SymbolKind kind = project.symbol(binding.symbol).symbol_kind();
+                if (kind == SymbolKind.parameter || kind == SymbolKind.type_parameter) {
+                    visible = in_function_return_type(project, current, offset);
+                }
+            }
+            if (visible) {
+                if (binding.poisoned || project.symbol(binding.symbol).is_poisoned()) {
+                    return BindingLookup.poisoned;
+                }
+                return BindingLookup.found(binding.symbol);
+            }
+        }
+        &in ScopeRecord record = project.scope(current);
+        ScopeLink parent = record.parent_scope();
+        match (&in parent) {
+            .none { searching = false; }
+            .present(value) { current = value; }
+        }
+    }
+    return BindingLookup.missing;
+}
+
+SymbolLink module_public_symbol(&in FrontendProject project,
+    &in AnalysisState state, ModuleId module_id, NameId name)
+    raises BoundsError, ProjectReferenceError {
+    ScopeId scope = module_scope(state, module_id);
+    usize index = usize(0);
+    while (index < project.symbol_count()) {
+        SymbolId symbol = project.symbol_at(index);
+        &in SymbolRecord record = project.symbol(symbol);
+        if (record.lexical_scope().equals(scope) && record.symbol_name().equals(name)
+            && record.contracts().public_flag() && record.is_poisoned() == false) {
+            return SymbolLink.present(symbol);
+        }
+        index = index + usize(1);
+    }
+    return SymbolLink.none;
+}
+
+void bind_import_name(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, ScopeId scope, NameId name,
+    SymbolLink symbol, ModuleLink module_link, bool alias, SourceSpan span)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError {
+    bool conflict = false;
+    usize bucket = binding_bucket(builder.project(), state.bindings, state.buckets,
+        scope, name, usize(0));
+    usize found = state.buckets.get(bucket);
+    if (found != usize(0)) {
+        SymbolId previous;
+        {
+            &in AnalysisBinding existing = state.bindings.get(found - usize(1));
+            previous = existing.symbol;
+        }
+        bool same_import = false;
+        match (&in symbol) {
+            .none { }
+            .present(target) { same_import = target.equals(previous); }
+        }
+        if (same_import == false) {
+            &inout AnalysisBinding existing = state.bindings.get_mut(found - usize(1));
+            existing.poisoned = true;
+            conflict = true;
+        }
+    }
+    builder.add_import_binding(scope, name, symbol, module_link, alias, conflict);
+    if (conflict) {
+        analysis_error(builder, state, diagnostics, span, "module.import-conflict",
+            "import conflicts with another binding in this module");
+    }
+    match (&in symbol) {
+        .none { }
+        .present(target) {
+            if (found == usize(0) || conflict) {
+                insert_indexed_binding(state, builder.project(), AnalysisBinding {
+                    scope = scope, name = name, symbol = target,
+                    visible_after = usize(0), poisoned = conflict,
+                    namespace = usize(0),
+                });
+            }
+        }
+    }
+}
+
+void bind_imports(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    usize edge_index = usize(0);
+    while (edge_index < builder.project().import_count()) {
+        ImportRecord edge = builder.project().import_edge(edge_index);
+        ModuleLink target_link = edge.imported_module();
+        match (&in target_link) {
+            .none { }
+            .present(target_module) {
+                ScopeId scope = module_scope(state, edge.importing_module());
+                NodeRef node = edge.syntax_node();
+                SyntaxData data = SyntaxData.absent;
+                usize children;
+                {
+                    &in SyntaxNode syntax = builder.project().frontend().node(node);
+                    data = syntax.payload();
+                    children = child_count(syntax);
+                }
+                match (&in data) {
+                    .import_declaration(path, alias_span, symbols) {
+                        NameLink alias_name = edge.import_alias();
+                        match (&in alias_name) {
+                            .present(name) {
+                                DeclarationModifiers modifiers = declaration_modifiers(u32(0), false);
+                                SymbolId alias_symbol = builder.add_symbol(name,
+                                    SymbolKind.module_alias, scope, SymbolLink.none,
+                                    SymbolOrigin.source(node, alias_span), modifiers);
+                                builder.add_occurrence(node, alias_span, scope,
+                                    OccurrenceRole.declaration, ReferenceStatus.resolved(alias_symbol));
+                                state.aliases.push(AnalysisAlias {
+                                    symbol = alias_symbol, module_id = target_module,
+                                });
+                                bind_import_name(builder, state, diagnostics, scope, name,
+                                    SymbolLink.present(alias_symbol), ModuleLink.present(target_module),
+                                    true, alias_span);
+                            }
+                            .none {
+                                if (symbols.len() > usize(0)) {
+                                    usize child_index = usize(0);
+                                    while (child_index < children) {
+                                        NodeRef child = builder.project().frontend().child(node, child_index);
+                                        SyntaxData child_data = builder.project().frontend().node(child).payload();
+                                        match (&in child_data) {
+                                            .import_symbol(name_span) {
+                                                String(SystemAllocator) text = analysis_spelling(
+                                                    builder, child.file_id(), name_span);
+                                                NameId name = builder.intern(text.as_str());
+                                                SymbolLink imported = module_public_symbol(
+                                                    builder.project(), state, target_module, name);
+                                                match (&in imported) {
+                                                    .none {
+                                                        analysis_error(builder, state, diagnostics, name_span,
+                                                            "module.private-symbol",
+                                                            "imported symbol is missing or private");
+                                                        builder.add_occurrence(child, name_span, scope,
+                                                            OccurrenceRole.import_use, ReferenceStatus.invalid);
+                                                    }
+                                                    .present(symbol) {
+                                                        bind_import_name(builder, state, diagnostics, scope,
+                                                            name, imported, ModuleLink.present(target_module),
+                                                            false, name_span);
+                                                        builder.add_occurrence(child, name_span, scope,
+                                                            OccurrenceRole.import_use,
+                                                            ReferenceStatus.resolved(symbol));
+                                                    }
+                                                }
+                                            }
+                                            _ { }
+                                        }
+                                        child_index = child_index + usize(1);
+                                    }
+                                } else {
+                                    ScopeId target_scope = module_scope(state, target_module);
+                                    usize symbol_index = usize(0);
+                                    while (symbol_index < builder.project().symbol_count()) {
+                                        SymbolId symbol = builder.project().symbol_at(symbol_index);
+                                        NameLink exported = NameLink.none;
+                                        {
+                                            &in SymbolRecord record = builder.project().symbol(symbol);
+                                            if (record.lexical_scope().equals(target_scope)
+                                                && record.contracts().public_flag()
+                                                && record.is_poisoned() == false) {
+                                                exported = NameLink.present(record.symbol_name());
+                                            }
+                                        }
+                                        match (&in exported) {
+                                            .none { }
+                                            .present(exported_name) {
+                                            bind_import_name(builder, state, diagnostics, scope,
+                                                exported_name, SymbolLink.present(symbol),
+                                                ModuleLink.present(target_module), false, path);
+                                            }
+                                        }
+                                        symbol_index = symbol_index + usize(1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ { }
+                }
+            }
+        }
+        edge_index = edge_index + usize(1);
+    }
+}
+
+ModuleLink alias_target(&in AnalysisState state, SymbolId symbol)
+    raises BoundsError {
+    usize index = usize(0);
+    while (index < state.aliases.len()) {
+        &in AnalysisAlias alias = state.aliases.get(index);
+        if (alias.symbol.equals(symbol)) { return ModuleLink.present(alias.module_id); }
+        index = index + usize(1);
+    }
+    return ModuleLink.none;
+}
+
+SymbolLink owner_member(&in FrontendProject project, SymbolId owner, NameId name)
+    raises ProjectReferenceError {
+    usize index = usize(0);
+    while (index < project.symbol_count()) {
+        SymbolId candidate = project.symbol_at(index);
+        &in SymbolRecord record = project.symbol(candidate);
+        SymbolLink link = record.symbol_owner();
+        match (&in link) {
+            .none { }
+            .present(value) {
+                SymbolId member_owner = value;
+                if (member_owner.equals(owner) && record.symbol_name().equals(name)
+                    && record.is_poisoned() == false) {
+                    return SymbolLink.present(candidate);
+                }
+            }
+        }
+        index = index + usize(1);
+    }
+    return SymbolLink.none;
+}
+
+ReferenceStatus resolve_name(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, NodeRef node, SourceSpan span, ScopeId scope,
+    OccurrenceRole role)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    String(SystemAllocator) text = analysis_spelling(builder, node.file_id(), span);
+    NameId name = builder.intern(text.as_str());
+    BindingLookup result = lookup_name(builder.project(), state, scope, name,
+        span.start_offset());
+    ReferenceStatus status = match (&in result) {
+        .found(symbol) => ReferenceStatus.resolved(symbol),
+        .poisoned => ReferenceStatus.invalid,
+        .missing => ReferenceStatus.invalid,
+    };
+    match (&in result) {
+        .missing {
+            if (text.as_str() == "Self") {
+                analysis_error(builder, state, diagnostics, span,
+                    "resolve.invalid-self", "Self is only valid in a type or implementation");
+            } else {
+                analysis_error(builder, state, diagnostics, span,
+                    "resolve.unknown-name", "unknown name");
+            }
+        }
+        _ { }
+    }
+    builder.add_occurrence(node, span, scope, role, status);
+    return status;
+}
+
+ReferenceStatus latest_node_status(&in FrontendProject project, NodeRef node)
+    raises ProjectReferenceError {
+    try { return project.latest_status_for(node); }
+    catch ProjectReferenceError {
+        return ReferenceStatus.deferred(DeferredReason.receiver_type);
+    }
+}
+
+SymbolLink enclosing_implementation(&in FrontendProject project, ScopeId scope)
+    raises ProjectReferenceError {
+    ScopeId current = scope;
+    bool searching = true;
+    while (searching) {
+        &in ScopeRecord record = project.scope(current);
+        SymbolLink owner = record.symbol_owner();
+        match (&in owner) {
+            .none { }
+            .present(symbol) {
+                if (project.symbol(symbol).symbol_kind() == SymbolKind.implementation) {
+                    return owner;
+                }
+            }
+        }
+        ScopeLink parent = record.parent_scope();
+        match (&in parent) {
+            .none { searching = false; }
+            .present(value) { current = value; }
+        }
+    }
+    return SymbolLink.none;
+}
+
+void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, NodeRef node, OccurrenceRole requested_role)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    ScopeId scope = builder.project().scope_for_node(node);
+    SyntaxData data = SyntaxData.absent;
+    SyntaxKind kind = SyntaxKind.absent;
+    usize children;
+    {
+        &in SyntaxNode source_node = builder.project().frontend().node(node);
+        data = source_node.payload();
+        kind = source_node.kind();
+        children = child_count(source_node);
+    }
+    if (kind == SyntaxKind.name_expression) {
+        match (&in data) {
+            .name_expression(name) {
+                resolve_name(builder, state, diagnostics, node, name, scope, requested_role);
+            }
+            _ { }
+        }
+        return;
+    }
+    if (kind == SyntaxKind.named_type || kind == SyntaxKind.generic_type) {
+        SourceSpan name = empty_source_span();
+        match (&in data) {
+            .named_type(value) { name = value; }
+            .generic_type(value, _) { name = value; }
+            _ { }
+        }
+        String(SystemAllocator) spelling = analysis_spelling(builder, node.file_id(), name);
+        if (spelling_has_dot(spelling.as_str())) {
+            SourceSpan first = path_token_span(builder, node.file_id(), name, false);
+            SourceSpan last = path_token_span(builder, node.file_id(), name, true);
+            ReferenceStatus prefix = resolve_name(builder, state, diagnostics, node,
+                first, scope, OccurrenceRole.type_use);
+            ReferenceStatus member = ReferenceStatus.deferred(
+                DeferredReason.comptime_selection);
+            match (&in prefix) {
+                .invalid { member = ReferenceStatus.invalid; }
+                .deferred(reason) { member = ReferenceStatus.deferred(reason); }
+                .resolved(symbol) {
+                    ModuleLink target = alias_target(state, symbol);
+                    match (&in target) {
+                        .none { }
+                        .present(module_id) {
+                            String(SystemAllocator) final_name = analysis_spelling(
+                                builder, node.file_id(), last);
+                            NameId final_id = builder.intern(final_name.as_str());
+                            SymbolLink declaration = module_public_symbol(
+                                builder.project(), state, module_id, final_id);
+                            match (&in declaration) {
+                                .none { member = ReferenceStatus.invalid; }
+                                .present(found) { member = ReferenceStatus.resolved(found); }
+                            }
+                        }
+                    }
+                }
+            }
+            builder.add_occurrence(node, last, scope, OccurrenceRole.member, member);
+        } else {
+            resolve_name(builder, state, diagnostics, node, name, scope,
+                OccurrenceRole.type_use);
+        }
+    }
+    if (kind == SyntaxKind.member_expression) {
+        NodeRef receiver = builder.project().frontend().child(node, usize(0));
+        resolve_node(builder, state, diagnostics, receiver, OccurrenceRole.read);
+        match (&in data) {
+            .member_expression(name_span, _) {
+                String(SystemAllocator) text = analysis_spelling(builder,
+                    node.file_id(), name_span);
+                NameId name = builder.intern(text.as_str());
+                ReferenceStatus receiver_status = latest_node_status(builder.project(), receiver);
+                ReferenceStatus status = ReferenceStatus.deferred(DeferredReason.receiver_type);
+                match (&in receiver_status) {
+                    .invalid { status = ReferenceStatus.invalid; }
+                    .deferred(reason) { status = ReferenceStatus.deferred(reason); }
+                    .resolved(receiver_symbol) {
+                        SymbolLink member = SymbolLink.none;
+                        ModuleLink alias = alias_target(state, receiver_symbol);
+                        match (&in alias) {
+                            .present(module_id) {
+                                member = module_public_symbol(builder.project(), state,
+                                    module_id, name);
+                            }
+                            .none {
+                                member = owner_member(builder.project(), receiver_symbol, name);
+                            }
+                        }
+                        match (&in member) {
+                            .present(symbol) { status = ReferenceStatus.resolved(symbol); }
+                            .none {
+                                SymbolKind owner_kind = builder.project().symbol(
+                                    receiver_symbol).symbol_kind();
+                                if (owner_kind == SymbolKind.module_alias
+                                    || owner_kind == SymbolKind.structure
+                                    || owner_kind == SymbolKind.sum_type
+                                    || owner_kind == SymbolKind.interface_type
+                                    || owner_kind == SymbolKind.view_type) {
+                                    status = ReferenceStatus.invalid;
+                                    analysis_error(builder, state, diagnostics, name_span,
+                                        "resolve.missing-member", "unknown member");
+                                }
+                            }
+                        }
+                    }
+                }
+                builder.add_occurrence(node, name_span, scope, OccurrenceRole.member, status);
+            }
+            _ { }
+        }
+        return;
+    }
+    if (kind == SyntaxKind.struct_literal) {
+        ReferenceStatus owner = ReferenceStatus.deferred(DeferredReason.receiver_type);
+        usize field_index = usize(0);
+        while (field_index < children) {
+            NodeRef child;
+            str role;
+            {
+                &in SyntaxNode syntax = builder.project().frontend().node(node);
+                child = builder.project().frontend().child(node, field_index);
+                role = child_role(syntax, field_index);
+            }
+            if (role == "type") {
+                resolve_node(builder, state, diagnostics, child, OccurrenceRole.type_use);
+                owner = latest_node_status(builder.project(), child);
+            } else {
+                SyntaxData field_data = builder.project().frontend().node(child).payload();
+                match (&in field_data) {
+                    .struct_literal_field(name, _) {
+                        ReferenceStatus status = ReferenceStatus.deferred(
+                            DeferredReason.receiver_type);
+                        match (&in owner) {
+                            .invalid { status = ReferenceStatus.invalid; }
+                            .deferred(reason) { status = ReferenceStatus.deferred(reason); }
+                            .resolved(symbol) {
+                                if (builder.project().symbol(symbol).symbol_kind()
+                                    == SymbolKind.structure) {
+                                    String(SystemAllocator) spelling = analysis_spelling(
+                                        builder, child.file_id(), name);
+                                    NameId field_name = builder.intern(spelling.as_str());
+                                    SymbolLink member = owner_member(builder.project(),
+                                        symbol, field_name);
+                                    match (&in member) {
+                                        .none {
+                                            status = ReferenceStatus.invalid;
+                                            analysis_error(builder, state, diagnostics, name,
+                                                "resolve.missing-member", "unknown struct field");
+                                        }
+                                        .present(found) {
+                                            if (builder.project().symbol(found).symbol_kind()
+                                                == SymbolKind.field) {
+                                                status = ReferenceStatus.resolved(found);
+                                            } else {
+                                                status = ReferenceStatus.invalid;
+                                                analysis_error(builder, state, diagnostics, name,
+                                                    "resolve.missing-member", "unknown struct field");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        builder.add_occurrence(child, name, scope,
+                            OccurrenceRole.member, status);
+                    }
+                    _ { }
+                }
+                resolve_node(builder, state, diagnostics, child, OccurrenceRole.read);
+            }
+            field_index = field_index + usize(1);
+        }
+        return;
+    }
+    if (kind == SyntaxKind.variant_pattern) {
+        match (&in data) {
+            .variant_pattern(name, _) {
+                builder.add_occurrence(node, name, scope, OccurrenceRole.pattern,
+                    ReferenceStatus.deferred(DeferredReason.pattern_type));
+            }
+            _ { }
+        }
+    } elif (kind == SyntaxKind.union_variant_expression) {
+        match (&in data) {
+            .union_variant_expression(name, _) {
+                builder.add_occurrence(node, name, scope, OccurrenceRole.member,
+                    ReferenceStatus.deferred(DeferredReason.receiver_type));
+            }
+            _ { }
+        }
+    } elif (kind == SyntaxKind.implementation_use) {
+        match (&in data) {
+            .implementation_use(name) {
+                ReferenceStatus status = ReferenceStatus.deferred(DeferredReason.generic_type);
+                SymbolLink implementation = enclosing_implementation(builder.project(), scope);
+                match (&in implementation) {
+                    .none { }
+                    .present(implementation_symbol) {
+                        SymbolOrigin origin = builder.project().symbol(
+                            implementation_symbol).declaration_origin();
+                        match (&in origin) {
+                            .builtin { }
+                            .source(implementation_node, _) {
+                                NodeRef target = builder.project().frontend().child(
+                                    implementation_node, usize(0));
+                                ReferenceStatus target_status = latest_node_status(
+                                    builder.project(), target);
+                                match (&in target_status) {
+                                    .invalid { status = ReferenceStatus.invalid; }
+                                    .deferred(reason) { status = ReferenceStatus.deferred(reason); }
+                                    .resolved(target_symbol) {
+                                        String(SystemAllocator) spelling = analysis_spelling(
+                                            builder, node.file_id(), name);
+                                        NameId member_name = builder.intern(spelling.as_str());
+                                        SymbolLink member = owner_member(builder.project(),
+                                            target_symbol, member_name);
+                                        match (&in member) {
+                                            .present(found) { status = ReferenceStatus.resolved(found); }
+                                            .none {
+                                                status = ReferenceStatus.invalid;
+                                                analysis_error(builder, state, diagnostics, name,
+                                                    "resolve.missing-member", "unknown inherent method");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                builder.add_occurrence(node, name, scope, OccurrenceRole.member, status);
+            }
+            _ { }
+        }
+    }
+
+    usize index = usize(0);
+    while (index < children) {
+        NodeRef child;
+        OccurrenceRole role = OccurrenceRole.read;
+        str child_name;
+        {
+            &in SyntaxNode source_node = builder.project().frontend().node(node);
+            child = builder.project().frontend().child(node, index);
+            child_name = child_role(source_node, index);
+        }
+        if (kind == SyntaxKind.call_expression && child_name == "callee") {
+            role = OccurrenceRole.call;
+        } elif (kind == SyntaxKind.assignment_statement && child_name == "target") {
+            role = OccurrenceRole.write;
+        }
+        resolve_node(builder, state, diagnostics, child, role);
+        index = index + usize(1);
+    }
+}
+
+void validate_analysis(&in FrontendProject project)
+    raises ProjectReferenceError, FrontendReferenceError {
+    usize index = usize(0);
+    while (index < project.declaration_count()) {
+        &in DeclarationSymbol declaration = project.declaration(index);
+        project.frontend().node(declaration.syntax_node());
+        project.symbol(declaration.declaration_symbol());
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < project.node_scope_count()) {
+        &in NodeScope binding = project.node_scope(index);
+        project.frontend().node(binding.syntax_node());
+        project.scope(binding.lexical_scope());
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < project.occurrence_count()) {
+        &in ReferenceOccurrence occurrence = project.occurrence(index);
+        project.frontend().node(occurrence.syntax_node());
+        project.scope(occurrence.lexical_scope());
+        match (occurrence.binding()) {
+            .resolved(symbol) { project.symbol(symbol); }
+            .deferred(_) { }
+            .invalid { }
+        }
+        index = index + usize(1);
+    }
+}
+
+pub FrontendProject analyze_project(str entry, &in ProjectOptions options,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
+        ProjectReferenceError, NameReferenceError, Utf8Error {
+    ProjectBuilder builder = project_builder();
+    load_module_graph_into(builder, entry, options, diagnostics);
+    AnalysisState state = analysis_state(options.maximum_diagnostics());
+    ScopeId builtin_scope = builder.add_scope(ScopeLink.none, ModuleLink.none, SymbolLink.none);
+    add_builtins(builder, state, builtin_scope);
+
+    usize module_index = usize(0);
+    while (module_index < builder.project().module_count()) {
+        ModuleId module_id = builder.project().module_at(module_index);
+        ScopeId scope = builder.add_scope(ScopeLink.present(builtin_scope),
+            ModuleLink.present(module_id), SymbolLink.none);
+        state.module_scopes.push(AnalysisModuleScope { module_id = module_id, scope = scope });
+        module_index = module_index + usize(1);
+    }
+    module_index = usize(0);
+    while (module_index < builder.project().module_count()) {
+        ModuleId module_id = builder.project().module_at(module_index);
+        predeclare_module(builder, state, diagnostics, module_id,
+            module_scope(state, module_id));
+        module_index = module_index + usize(1);
+    }
+    module_index = usize(0);
+    while (module_index < builder.project().module_count()) {
+        ModuleId module_id = builder.project().module_at(module_index);
+        ScopeId scope = module_scope(state, module_id);
+        ParsedFileId file = builder.project().module_record(module_id).parsed_file();
+        usize root_index = usize(0);
+        while (root_index < builder.project().frontend().file(file).root_count()) {
+            NodeRef root = builder.project().frontend().root(file, root_index);
+            index_node(builder, state, diagnostics, root, scope, MemberContext.none);
+            root_index = root_index + usize(1);
+        }
+        module_index = module_index + usize(1);
+    }
+    bind_imports(builder, state, diagnostics);
+    module_index = usize(0);
+    while (module_index < builder.project().module_count()) {
+        ModuleId module_id = builder.project().module_at(module_index);
+        ParsedFileId file = builder.project().module_record(module_id).parsed_file();
+        usize root_index = usize(0);
+        while (root_index < builder.project().frontend().file(file).root_count()) {
+            NodeRef root = builder.project().frontend().root(file, root_index);
+            SyntaxKind kind = builder.project().frontend().node(root).kind();
+            if (kind != SyntaxKind.module_declaration && kind != SyntaxKind.import_declaration) {
+                resolve_node(builder, state, diagnostics, root, OccurrenceRole.read);
+            }
+            root_index = root_index + usize(1);
+        }
+        module_index = module_index + usize(1);
+    }
+    validate_analysis(builder.project());
+    return finish_project(builder);
+}

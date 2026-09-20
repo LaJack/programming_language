@@ -1,0 +1,218 @@
+module bootstrap.project_dump;
+
+import bootstrap.diagnostics;
+import bootstrap.frontend;
+import bootstrap.project;
+import bootstrap.source;
+import std.memory;
+import std.string;
+
+void field(&inout StringBuilder(SystemAllocator) output, str text)
+    raises CapacityError, LayoutError, AllocationError {
+    output.append("\t");
+    append_escaped(output, text);
+}
+
+void number(&inout StringBuilder(SystemAllocator) output, usize value)
+    raises CapacityError, LayoutError, AllocationError {
+    output.append("\t");
+    output.append_usize(value);
+}
+
+void append_module_name(&inout StringBuilder(SystemAllocator) output,
+    &in FrontendProject project, ModuleLink link)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+    match (&in link) {
+        .none { field(output, "-"); }
+        .present(id) { append_name(output, project, project.module_record(id).module_name()); }
+    }
+}
+
+void append_name(&inout StringBuilder(SystemAllocator) output,
+    &in FrontendProject project, NameLink link)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+    match (&in link) {
+        .none { field(output, "-"); }
+        .present(id) { field(output, project.name(id)); }
+    }
+}
+
+str module_state(ModuleState state) {
+    return match (&in state) {
+        .loading => "loading", .loaded => "loaded", .incomplete => "incomplete",
+    };
+}
+
+str import_state(ImportState state) {
+    return match (&in state) {
+        .pending => "pending", .resolved => "resolved", .invalid => "invalid",
+    };
+}
+
+str symbol_kind(SymbolKind kind) {
+    return match (&in kind) {
+        .builtin_type => "builtin_type", .builtin_function => "builtin_function",
+        .module_alias => "module_alias", .function => "function",
+        .structure => "structure", .sum_type => "sum_type",
+        .view_type => "view_type", .interface_type => "interface_type",
+        .implementation => "implementation", .inherent_method => "inherent_method",
+        .interface_requirement => "interface_requirement",
+        .implementation_method => "implementation_method", .global => "global",
+        .constant => "constant", .computed_type => "computed_type",
+        .type_parameter => "type_parameter", .parameter => "parameter",
+        .local => "local", .field => "field", .variant => "variant",
+        .catch_binding => "catch_binding", .match_binding => "match_binding",
+        .self_type => "self_type",
+    };
+}
+
+str occurrence_role(OccurrenceRole role) {
+    return match (&in role) {
+        .declaration => "declaration", .read => "read", .write => "write",
+        .call => "call", .type_use => "type_use", .import_use => "import_use",
+        .member => "member", .pattern => "pattern",
+    };
+}
+
+str deferred_reason(DeferredReason reason) {
+    return match (&in reason) {
+        .receiver_type => "receiver_type", .generic_type => "generic_type",
+        .computed_type => "computed_type", .pattern_type => "pattern_type",
+        .comptime_selection => "comptime_selection",
+    };
+}
+
+usize module_id(&in FrontendProject project, ModuleId id)
+    raises ProjectReferenceError {
+    return project.module_index(id);
+}
+
+usize symbol_id(&in FrontendProject project, SymbolId id)
+    raises ProjectReferenceError {
+    return project.symbol_index(id);
+}
+
+usize scope_id(&in FrontendProject project, ScopeId id)
+    raises ProjectReferenceError {
+    return project.scope_index(id);
+}
+
+pub String(SystemAllocator) dump_modules(&in FrontendProject project)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+        Utf8Error {
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    usize index = usize(0);
+    while (index < project.module_count()) {
+        ModuleId id = project.module_at(index);
+        &in ModuleRecord record = project.module_record(id);
+        output.append("module"); number(output, index);
+        append_name(output, project, record.module_name());
+        field(output, project.name(record.canonical_path()));
+        field(output, module_state(record.load_state()));
+        output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < project.import_count()) {
+        &in ImportRecord edge = project.import_edge(index);
+        output.append("import"); number(output, index);
+        number(output, module_id(project, edge.importing_module()));
+        append_name(output, project, edge.requested_name());
+        append_name(output, project, edge.effective_name());
+        append_name(output, project, edge.import_alias());
+        append_module_name(output, project, edge.imported_module());
+        field(output, import_state(edge.load_state()));
+        output.append("\n");
+        index = index + usize(1);
+    }
+    return finish_string(SystemAllocator, output);
+}
+
+void symbol_link(&inout StringBuilder(SystemAllocator) output,
+    &in FrontendProject project, SymbolLink link)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+    match (&in link) {
+        .none { field(output, "-"); }
+        .present(id) { number(output, symbol_id(project, id)); }
+    }
+}
+
+void scope_link(&inout StringBuilder(SystemAllocator) output,
+    &in FrontendProject project, ScopeLink link)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+    match (&in link) {
+        .none { field(output, "-"); }
+        .present(id) { number(output, scope_id(project, id)); }
+    }
+}
+
+void module_link(&inout StringBuilder(SystemAllocator) output,
+    &in FrontendProject project, ModuleLink link)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError {
+    match (&in link) {
+        .none { field(output, "-"); }
+        .present(id) { number(output, module_id(project, id)); }
+    }
+}
+
+pub String(SystemAllocator) dump_symbols(&in FrontendProject project)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+        SourceMapError, Utf8Error {
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    usize index = usize(0);
+    while (index < project.scope_count()) {
+        ScopeId id = project.scope_at(index);
+        &in ScopeRecord scope = project.scope(id);
+        output.append("scope"); number(output, index);
+        scope_link(output, project, scope.parent_scope());
+        module_link(output, project, scope.module_owner());
+        symbol_link(output, project, scope.symbol_owner());
+        output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < project.symbol_count()) {
+        SymbolId id = project.symbol_at(index);
+        &in SymbolRecord symbol = project.symbol(id);
+        output.append("symbol"); number(output, index);
+        field(output, project.name(symbol.symbol_name()));
+        field(output, symbol_kind(symbol.symbol_kind()));
+        number(output, scope_id(project, symbol.lexical_scope()));
+        symbol_link(output, project, symbol.symbol_owner());
+        match (symbol.declaration_origin()) {
+            .builtin { field(output, "-"); number(output, usize(0)); number(output, usize(0)); }
+            .source(_, span) {
+                field(output, project.frontend().source_map().path(span.source_id()));
+                number(output, span.start_offset()); number(output, span.end_offset());
+            }
+        }
+        if (symbol.is_poisoned()) { field(output, "poisoned"); }
+        else { field(output, "valid"); }
+        output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < project.occurrence_count()) {
+        &in ReferenceOccurrence occurrence = project.occurrence(index);
+        SourceSpan span = occurrence.name_span();
+        output.append("reference"); number(output, index);
+        field(output, project.frontend().source_map().path(span.source_id()));
+        number(output, span.start_offset()); number(output, span.end_offset());
+        number(output, scope_id(project, occurrence.lexical_scope()));
+        field(output, occurrence_role(occurrence.occurrence_role()));
+        match (occurrence.binding()) {
+            .resolved(id) {
+                field(output, "resolved"); number(output, symbol_id(project, id));
+            }
+            .deferred(reason) {
+                field(output, "deferred"); field(output, deferred_reason(reason));
+            }
+            .invalid { field(output, "invalid"); field(output, "-"); }
+        }
+        output.append("\n");
+        index = index + usize(1);
+    }
+    return finish_string(SystemAllocator, output);
+}

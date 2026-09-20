@@ -42,6 +42,11 @@ pub struct NameInterner {
         return NameId { owner = self.identity, index = index };
     }
 
+    usize index_of(&in self, NameId id) raises NameReferenceError {
+        if (self.contains(id) == false) { raise NameReferenceError { }; }
+        return id.index;
+    }
+
     str text(&in self, NameId id) raises NameReferenceError {
         if (self.contains(id) == false) { raise NameReferenceError { }; }
         try {

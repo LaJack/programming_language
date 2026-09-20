@@ -153,11 +153,32 @@ edges and never supply guessed paths. Dotted names are reconstructed from tokens
 so whitespace and comments do not change their identity. Parsing and graph errors
 remain recorded even when the caller's diagnostic bag is full.
 
-This is not yet a completed project analyzer. Declaration/scoping passes, import
-visibility and binding checks, name resolution, project CLI modes, and stage-0
-name-resolution differential acceptance remain to be implemented. The eventual
-`analyze_project` API will compose these passes. Existing token and syntax CLI
-behavior is unchanged.
+`bootstrap.analysis.analyze_project(entry, options, diagnostics)` composes the
+loader with declaration indexing, import binding, lexical scopes, and source-name
+resolution. It indexes declarations in intact regions of recovered files and
+continues through independent modules after errors. Builtins have non-source
+symbols; inherent, interface, and implementation members remain distinct.
+Resolved uses point to the original declaration, including selective imports.
+Receiver-dependent and computed members carry explicit deferral reasons instead
+of guessed bindings. This pass does not execute comptime code.
+
+The executable exposes the recovering project analysis separately from its
+unchanged token and syntax dump modes:
+
+```sh
+./jack-bootstrap --check-names --module-root selfhost --module-root jack selfhost/bootstrap/main.jack
+./jack-bootstrap --dump modules --module-root selfhost --module-root jack selfhost/bootstrap/main.jack
+./jack-bootstrap --dump symbols --module-root selfhost --module-root jack selfhost/bootstrap/main.jack
+```
+
+`--module-root` and `--stub REQUESTED=REPLACEMENT` are repeatable in project
+modes. The symbol dump uses traversal-ordered IDs, not process identities.
+Exit status 0 means no authoritative module or name errors; it does not mean
+the program type-checks or compiles. Status 1 means diagnosed errors, and 2
+means invalid invocation. `--diagnostic-format stable` is available for
+machine-readable diagnostics. Type checking, comptime evaluation, interface
+coherence, specialization, ownership validation, and HIR lowering remain stage-0
+or later self-hosting work.
 
 ## Verification And Measurements
 
@@ -175,6 +196,15 @@ and recovery cases compare interpreter, C, and LLVM output at `-O0` and native
 reparsing, strict failure with full diagnostic bags, and injected allocation
 failures. These tests establish structural parity on the tested corpus, not
 semantic correctness or equivalence for every possible malformed input.
+
+`tests/test_bootstrap_analysis.py` exercises the native project CLI, lexical
+scope boundaries, imports, poisoned declarations, implementation `use`,
+comptime non-execution, and deterministic symbol dumps. The complete bootstrap
+module graph passes `--check-names` with explicit `selfhost` and `jack` roots.
+The current graph dump records 32,528 source-name occurrences with no invalid
+bindings; 3,852 receiver-dependent members, 1,396 pattern variants, and two
+comptime-selected names remain explicitly deferred. These are observations,
+not frozen output counts or evidence of type correctness.
 
 See [the frontend benchmark](../benchmarks/frontend/README.md) for parser-only
 throughput, node layout, retained storage, and scratch high-water measurements.

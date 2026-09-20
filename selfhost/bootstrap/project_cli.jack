@@ -1,0 +1,82 @@
+module bootstrap.project_cli;
+
+import bootstrap.analysis;
+import bootstrap.diagnostics;
+import bootstrap.frontend;
+import bootstrap.modules;
+import bootstrap.names;
+import bootstrap.project;
+import bootstrap.project_dump;
+import bootstrap.source;
+import bootstrap.syntax;
+import std.collections.arena;
+import std.collections.vector;
+import std.io;
+import std.memory;
+import std.string;
+
+bool add_stub_option(&inout ProjectOptions options, str value)
+    raises CapacityError, LayoutError, AllocationError, Utf8Error {
+    SystemAllocator left_allocator;
+    StringBuilder(SystemAllocator) left(left_allocator);
+    SystemAllocator right_allocator;
+    StringBuilder(SystemAllocator) right(right_allocator);
+    bool separator = false;
+    bool duplicate = false;
+    usize index = usize(0);
+    while (index < len(value)) {
+        u8 byte = jack_str_byte(value, index);
+        if (byte == u8(61)) {
+            if (separator) { duplicate = true; }
+            separator = true;
+        } elif (separator) { right.append_byte(byte); }
+        else { left.append_byte(byte); }
+        index = index + usize(1);
+    }
+    if (separator == false || duplicate || left.len() == usize(0)
+        || right.len() == usize(0)) { return false; }
+    String(SystemAllocator) requested = finish_string(SystemAllocator, left);
+    String(SystemAllocator) replacement = finish_string(SystemAllocator, right);
+    if (valid_module_path(requested.as_str()) == false
+        || valid_module_path(replacement.as_str()) == false) { return false; }
+    options.add_stub(requested.as_str(), replacement.as_str());
+    return true;
+}
+
+pub i32 run_project_mode(&in str[] arguments, str entry,
+    DiagnosticFormat format, i32 mode)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
+        ProjectReferenceError, NameReferenceError, Utf8Error, IoError {
+    ProjectOptions options = project_options();
+    usize index = usize(1);
+    while (index < usize(len(arguments))) {
+        if (arguments[index] == "--module-root") {
+            index = index + usize(1);
+            options.add_module_root(arguments[index]);
+        } elif (arguments[index] == "--stub") {
+            index = index + usize(1);
+            if (add_stub_option(options, arguments[index]) == false) {
+                write_stderr("usage: jack-bootstrap [--check-names|--dump modules|symbols] [--module-root DIR] [--stub REQUESTED=REPLACEMENT] <source>\n");
+                return 2;
+            }
+        }
+        index = index + usize(1);
+    }
+    DiagnosticBag diagnostics(options.maximum_diagnostics());
+    FrontendProject project = analyze_project(entry, options, diagnostics);
+    if (mode == i32(2)) {
+        String(SystemAllocator) output = dump_modules(project);
+        write_stdout(output.as_str());
+    } elif (mode == i32(3)) {
+        String(SystemAllocator) output = dump_symbols(project);
+        write_stdout(output.as_str());
+    }
+    if (diagnostics.is_empty() == false || diagnostics.omitted() > usize(0)) {
+        &in SourceMap sources = project.frontend().source_map();
+        String(SystemAllocator) output = render_diagnostics(sources, diagnostics, format);
+        write_stderr(output.as_str());
+    }
+    if (project.has_errors()) { return 1; }
+    return 0;
+}

@@ -59,6 +59,29 @@ pub struct Diagnostic {
 
     str code_text(&in self) { return self.code.as_str(); }
     str message_text(&in self) { return self.message.as_str(); }
+    DiagnosticOrigin source_origin(&in self) { return self.origin; }
+    usize label_count(&in self) { return self.labels.len(); }
+    SourceSpan label_span(&in self, usize index) raises BoundsError {
+        return self.labels.get(index).span;
+    }
+
+    Diagnostic duplicate(&in self)
+        raises CapacityError, LayoutError, AllocationError, BoundsError {
+        Diagnostic result = make_diagnostic(self.severity, self.origin,
+            self.code.as_str(), self.message.as_str());
+        usize index = usize(0);
+        while (index < self.labels.len()) {
+            &in DiagnosticLabel label = self.labels.get(index);
+            result.add_label(label.span, label.primary, label.message.as_str());
+            index = index + usize(1);
+        }
+        index = usize(0);
+        while (index < self.notes.len()) {
+            result.add_note(self.notes.get(index).as_str());
+            index = index + usize(1);
+        }
+        return result;
+    }
 
     void add_primary(&inout self, SourceSpan span, str message)
         raises CapacityError, LayoutError, AllocationError
@@ -171,17 +194,24 @@ pub struct DiagnosticBag {
     void add(&inout self, move Diagnostic diagnostic)
         raises CapacityError, LayoutError, AllocationError, BoundsError
     {
+        self.add_limited(diagnostic, usize(18446744073709551615));
+    }
+
+    bool add_limited(&inout self, move Diagnostic diagnostic, usize remaining)
+        raises CapacityError, LayoutError, AllocationError, BoundsError {
         usize index = usize(0);
         while (index < self.diagnostics.len()) {
             &in Diagnostic existing = self.diagnostics.get(index);
-            if (existing.same_identity(diagnostic)) { return; }
+            if (existing.same_identity(diagnostic)) { return false; }
             index = index + usize(1);
         }
-        if (self.diagnostics.len() < self.maximum) {
+        if (remaining > usize(0) && self.diagnostics.len() < self.maximum) {
             self.diagnostics.push(diagnostic);
+            return true;
         } else {
             self.omitted_count = self.omitted_count + usize(1);
         }
+        return false;
     }
 
     usize len(&in self) { return self.diagnostics.len(); }

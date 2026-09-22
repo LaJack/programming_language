@@ -1,0 +1,74 @@
+module bootstrap.token_index;
+
+import bootstrap.syntax;
+import std.collections.vector;
+import std.memory;
+
+// Embedded formatted-string tokens are appended after the file's main token stream.
+pub struct TokenIndex {
+    Vector(usize, SystemAllocator) order;
+
+    usize at(&in self, usize index) raises BoundsError { return self.order.get(index); }
+    usize len(&in self) { return self.order.len(); }
+    usize lower_bound(&in self, &in ParsedFile file, usize offset) raises BoundsError {
+        usize low = usize(0);
+        usize high = self.order.len();
+        while (low < high) {
+            usize middle = low + (high - low) / usize(2);
+            if (file.token(self.order.get(middle)).start_offset() < offset) {
+                low = middle + usize(1);
+            } else { high = middle; }
+        }
+        return low;
+    }
+}
+
+bool before(&in ParsedFile file, usize left, usize right) raises BoundsError {
+    usize a = file.token(left).start_offset();
+    usize b = file.token(right).start_offset();
+    return a < b || (a == b && left < right);
+}
+
+void sift(&in ParsedFile file, &inout Vector(usize, SystemAllocator) order,
+    usize start, usize count) raises BoundsError {
+    usize root = start;
+    bool searching = true;
+    while (searching) {
+        if (root >= count / usize(2)) { searching = false; }
+        else {
+            usize child = root * usize(2) + usize(1);
+            if (child + usize(1) < count
+                && before(file, order.get(child), order.get(child + usize(1)))) {
+                child = child + usize(1);
+            }
+            if (before(file, order.get(root), order.get(child))) {
+                usize value = order.get(root);
+                usize child_value = order.get(child);
+                order.replace(root, child_value);
+                order.replace(child, value);
+                root = child;
+            } else { searching = false; }
+        }
+    }
+}
+
+pub TokenIndex token_index(&in ParsedFile file)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    SystemAllocator allocator;
+    Vector(usize, SystemAllocator) order(allocator, file.token_count());
+    usize index = usize(0);
+    while (index < file.token_count()) { order.push(index + usize(0)); index = index + usize(1); }
+    index = order.len() / usize(2);
+    usize count = order.len();
+    while (index > usize(0)) { index = index - usize(1); sift(file, order, index, count); }
+    index = order.len();
+    while (index > usize(1)) {
+        index = index - usize(1);
+        usize value = order.get(usize(0));
+        usize last = order.get(index);
+        order.replace(usize(0), last);
+        order.replace(index, value);
+        sift(file, order, usize(0), index);
+    }
+    return TokenIndex { order = move order };
+}

@@ -4,6 +4,7 @@ import bootstrap.diagnostics;
 import bootstrap.frontend;
 import bootstrap.project;
 import bootstrap.source;
+import std.collections.vector;
 import std.memory;
 import std.string;
 
@@ -53,6 +54,7 @@ str symbol_kind(SymbolKind kind) {
     return match (&in kind) {
         .builtin_type => "builtin_type", .builtin_function => "builtin_function",
         .module_alias => "module_alias", .function => "function",
+        .unavailable_import => "unavailable_import",
         .structure => "structure", .sum_type => "sum_type",
         .view_type => "view_type", .interface_type => "interface_type",
         .implementation => "implementation", .inherent_method => "inherent_method",
@@ -158,10 +160,37 @@ void module_link(&inout StringBuilder(SystemAllocator) output,
 
 pub String(SystemAllocator) dump_symbols(&in FrontendProject project)
     raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
-        SourceMapError, Utf8Error {
+        SourceMapError, Utf8Error, BoundsError {
     SystemAllocator allocator;
     StringBuilder(SystemAllocator) output(allocator);
     usize index = usize(0);
+    while (index < project.issue_count()) {
+        IssueId id = project.issue_at(index);
+        &in Diagnostic diagnostic = project.issue(id).detail();
+        output.append("issue"); number(output, index);
+        field(output, diagnostic.code_text());
+        match (diagnostic.source_origin()) {
+            .none { field(output, "-"); number(output, usize(0)); number(output, usize(0)); }
+            .source(span) {
+                field(output, project.frontend().source_map().path(span.source_id()));
+                number(output, span.start_offset()); number(output, span.end_offset());
+            }
+        }
+        field(output, diagnostic.message_text()); output.append("\n");
+        usize label_index = usize(0);
+        while (label_index < diagnostic.label_count()) {
+            SourceSpan label = diagnostic.label_span(label_index);
+            output.append("issue_label"); number(output, index);
+            number(output, label_index);
+            field(output, project.frontend().source_map().path(label.source_id()));
+            number(output, label.start_offset());
+            number(output, label.end_offset());
+            output.append("\n");
+            label_index = label_index + usize(1);
+        }
+        index = index + usize(1);
+    }
+    index = usize(0);
     while (index < project.scope_count()) {
         ScopeId id = project.scope_at(index);
         &in ScopeRecord scope = project.scope(id);
@@ -209,7 +238,7 @@ pub String(SystemAllocator) dump_symbols(&in FrontendProject project)
             .deferred(reason) {
                 field(output, "deferred"); field(output, deferred_reason(reason));
             }
-            .invalid { field(output, "invalid"); field(output, "-"); }
+            .invalid(cause) { field(output, "invalid"); number(output, project.issue_index(cause)); }
         }
         output.append("\n");
         index = index + usize(1);

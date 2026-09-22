@@ -8,6 +8,7 @@ from pathlib import Path
 from jack.compiler_driver import CompilationOptions, CompilerDriver
 from jack.interpreter import Interpreter
 from jack.runtime_externs import default_runtime_externs, malloc
+from tests.bootstrap_interpreter_runner import run_hir_isolated
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -243,19 +244,37 @@ i32 run() raises CapacityError, LayoutError, AllocationError, NameReferenceError
     catch ProjectReferenceError { rejected = true; }
     if (rejected == false) { return 25; }
     rejected = false;
-    try { builder.bind_occurrence(usize(999), ReferenceStatus.invalid); }
+    IssueId invalid_issue;
+    try { builder.bind_occurrence(usize(999), ReferenceStatus.invalid(invalid_issue)); }
     catch ProjectReferenceError { rejected = true; }
     if (rejected == false) { return 26; }
-    other.poison(foreign_symbol);
+    Diagnostic failure = locationless_diagnostic(DiagnosticSeverity.error, "test.poison", "poison");
+    IssueId foreign_issue = other.report_issue(diagnostics, failure);
+    other.poison(foreign_symbol, foreign_issue);
+    rejected = false;
+    try { builder.bind_occurrence(deferred_index, ReferenceStatus.invalid(foreign_issue)); }
+    catch ProjectReferenceError { rejected = true; }
+    if (rejected == false) { return 34; }
+    other.set_diagnostic_budget(usize(1));
+    Diagnostic omitted = locationless_diagnostic(DiagnosticSeverity.error, "test.omitted", "omitted");
+    IssueId omitted_issue = other.report_issue(diagnostics, omitted);
+    Diagnostic repeated = locationless_diagnostic(DiagnosticSeverity.error, "test.omitted", "omitted");
+    IssueId repeated_issue = other.report_issue(diagnostics, repeated);
+    if (omitted_issue.equals(repeated_issue) == false) { return 35; }
+    if (diagnostics.len() != usize(1) || diagnostics.omitted() != usize(1)) { return 36; }
     if (true) {
         &in FrontendProject failed = other.project();
         &in SymbolRecord poisoned = failed.symbol(foreign_symbol);
         if (failed.has_errors() == false || poisoned.is_poisoned() == false) { return 27; }
     }
+    FrontendProject failed_project = finish_project(other);
+    FrontendProject moved_failed_project = move failed_project;
+    if (moved_failed_project.issue_count() != usize(2)) { return 37; }
+    if (moved_failed_project.issue(omitted_issue).detail().code_text() != "test.omitted") { return 38; }
 
     SourceSpan outside = source_span(span.source_id(), usize(0), usize(999), usize(1), usize(1));
     rejected = false;
-    try { builder.add_occurrence(node, outside, scope_id, OccurrenceRole.read, ReferenceStatus.invalid); }
+    try { builder.add_occurrence(node, outside, scope_id, OccurrenceRole.read, ReferenceStatus.invalid(invalid_issue)); }
     catch ProjectReferenceError { rejected = true; }
     if (rejected == false) { return 28; }
     rejected = false;
@@ -321,7 +340,128 @@ i32 main(&in str[] arguments) {
 '''
 
 
+
+ANALYSIS_BUDGET_PROGRAM = '''
+import bootstrap.analysis;
+import bootstrap.diagnostics;
+import bootstrap.frontend;
+import bootstrap.names;
+import bootstrap.project;
+import bootstrap.source;
+import bootstrap.syntax;
+import std.collections.arena;
+import std.collections.vector;
+import std.memory;
+import std.string;
+
+i32 verify(str bad_path, str good_path)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+           SourceMapError, ArenaHandleError, SyntaxValidationError,
+           FrontendReferenceError, ProjectReferenceError, NameReferenceError,
+           Utf8Error
+{
+    ProjectOptions options = project_options();
+    options.set_maximum_diagnostics(usize(1));
+
+    DiagnosticBag full(usize(1));
+    full.add(locationless_diagnostic(DiagnosticSeverity.error,
+        "test.preexisting", "preexisting"));
+    full.add(locationless_diagnostic(DiagnosticSeverity.error,
+        "test.preexisting", "preexisting"));
+    if (full.len() != usize(1)) { return 1; }
+    FrontendProject first = analyze_project(bad_path, options, full);
+    if (first.has_errors() == false || first.issue_count() != usize(2)) { return 2; }
+    if (full.len() != usize(1) || full.omitted() != usize(2)) { return 3; }
+
+    usize invalid = usize(0);
+    usize index = usize(0);
+    while (index < first.occurrence_count()) {
+        ReferenceStatus status = first.occurrence(index).binding();
+        match (&in status) {
+            .invalid(cause) { first.issue(cause); invalid = invalid + usize(1); }
+            _ { }
+        }
+        index = index + usize(1);
+    }
+    if (invalid != usize(2)) { return 4; }
+
+    DiagnosticBag empty(usize(0));
+    FrontendProject second = analyze_project(bad_path, options, empty);
+    if (empty.len() != usize(1) || empty.omitted() != usize(1)
+        || second.has_errors() == false || second.issue_count() != usize(2)) {
+        return 5;
+    }
+
+    IssueId foreign = first.issue_at(usize(0));
+    bool rejected = false;
+    try { second.issue(foreign); }
+    catch ProjectReferenceError { rejected = true; }
+    if (rejected == false) { return 6; }
+    FrontendProject moved = move first;
+    moved.issue(foreign);
+
+    DiagnosticBag unrelated(usize(2));
+    unrelated.add(locationless_diagnostic(DiagnosticSeverity.error,
+        "test.preexisting", "preexisting"));
+    FrontendProject valid = analyze_project(good_path, options, unrelated);
+    if (valid.has_errors() || valid.issue_count() != usize(0)
+        || unrelated.len() != usize(1) || unrelated.omitted() != usize(0)) {
+        return 7;
+    }
+    return 0;
+}
+
+i32 main(&in str[] arguments) {
+    try { return verify(arguments[1], arguments[2]); }
+    catch CapacityError { return 10; }
+    catch LayoutError { return 11; }
+    catch AllocationError { return 12; }
+    catch BoundsError { return 13; }
+    catch SourceMapError { return 14; }
+    catch ArenaHandleError { return 15; }
+    catch SyntaxValidationError { return 16; }
+    catch FrontendReferenceError { return 17; }
+    catch ProjectReferenceError { return 18; }
+    catch NameReferenceError { return 19; }
+    catch Utf8Error { return 20; }
+}
+'''
+
 class BootstrapProjectTests(unittest.TestCase):
+    def test_analysis_budget_and_issue_identity_match_all_runtimes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "budget.jack"
+            bad = root / "bad.jack"
+            good = root / "good.jack"
+            entry.write_text(ANALYSIS_BUDGET_PROGRAM)
+            bad.write_text("module bad; i32 result = missing_one + missing_two;")
+            good.write_text("module good; i32 result = 42;")
+            options = CompilationOptions(module_roots=(ROOT / "selfhost", ROOT / "jack"))
+            driver = CompilerDriver(print_handler=None)
+            program = driver.compile_hir(entry, options)
+            arguments = ["budget", str(bad), str(good)]
+            status, stdout, stderr = run_hir_isolated(
+                program, arguments, timeout=240, label="analysis-budget",
+            )
+            self.assertEqual((0, "", ""), (status, stdout, stderr))
+            for backend, optimization in (("c", 0), ("llvm", 0),
+                                          ("c", 2), ("llvm", 2)):
+                with self.subTest(backend=backend, optimization=optimization):
+                    output = root / f"{backend}-{optimization}"
+                    driver.compile_executable(
+                        entry, CompilationOptions(
+                            module_roots=options.module_roots, backend=backend,
+                            optimization=optimization, output=output,
+                        ),
+                    )
+                    result = subprocess.run(
+                        [str(output), str(bad), str(good)],
+                        capture_output=True, text=True, timeout=45,
+                    )
+                    self.assertEqual((0, "", ""),
+                                     (result.returncode, result.stdout, result.stderr))
+
     def test_checked_project_storage_and_movement(self):
         with tempfile.TemporaryDirectory() as directory:
             entry = Path(directory) / 'storage.jack'

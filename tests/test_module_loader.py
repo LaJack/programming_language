@@ -17,6 +17,25 @@ from jack.semantic_pass import SemanticError
 
 
 class ModuleLoaderTests(unittest.TestCase):
+    def test_local_declaration_shadows_bare_import_but_not_selective_import(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "api.jack").write_text("module api; pub i32 value = 1;")
+            entry = root / "main.jack"
+            entry.write_text(
+                "module app; import api; i32 value = 2; print(value);"
+            )
+            program = lower_to_hir(apply_compile_time_pass(load_source_file(entry)))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                Interpreter().eval_hir_program(program)
+            self.assertEqual("value = 2\n", output.getvalue())
+            entry.write_text(
+                "module app; import api.{value}; i32 value = 2; print(value);"
+            )
+            with self.assertRaises(ModuleLoadError):
+                load_source_file(entry)
+
     def test_load_source_graph_tracks_dependencies_and_overlays(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

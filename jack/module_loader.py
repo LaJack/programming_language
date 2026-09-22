@@ -347,6 +347,8 @@ class ModuleResolver:
             for symbol in exposed_symbols:
                 self._validate_imported_public_symbol(binding.module_name, symbol)
                 if symbol in local_names:
+                    if binding.symbols is None:
+                        continue
                     raise ModuleLoadError(
                         f'Imported symbol "{symbol}" from module "{binding.module_name}" conflicts with a local declaration.'
                     )

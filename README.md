@@ -244,7 +244,12 @@ files through `std.io`, stores tokens dynamically, and uses a tagged
 `TokenKind` union while preserving deterministic source spans. Its recovering
 parser builds typed, arena-backed syntax trees owned by a multi-file frontend
 context. Structural differential tests compare these trees with the Python
-parser; semantic analysis in Jack remains deferred. See the
+parser. The self-hosted project pass loads imports, indexes declarations,
+builds lexical scopes, and resolves source names without executing comptime
+code. Independent tests compare its bindings with stage 0 and account for
+identifiers throughout the complete bootstrap graph. Type checking,
+specialization, and ownership validation remain in stage 0.
+See the
 [self-hosting documentation](selfhost/README.md) for APIs, syntax dumps, and
 measurements. The Python compiler remains stage 0.
 

@@ -23,6 +23,11 @@ pub struct ModuleHeader {
     DiagnosticOrigin origin;
 }
 
+pub union ModuleResolution {
+    resolved(ModuleId module_id);
+    failed(IssueId cause);
+}
+
 // Validate before translating dots into directories, including configured stubs.
 pub bool valid_module_path(str name) {
     bool first = true;
@@ -52,12 +57,12 @@ Diagnostic graph_diagnostic(DiagnosticOrigin origin, str code, str message)
     };
 }
 
-void graph_error(&inout ProjectBuilder builder, &inout DiagnosticBag diagnostics,
+IssueId graph_error(&inout ProjectBuilder builder, &inout DiagnosticBag diagnostics,
     DiagnosticOrigin origin, str code, str message)
     raises CapacityError, LayoutError, AllocationError, BoundsError {
     builder.mark_error();
     Diagnostic diagnostic = graph_diagnostic(origin, code, message);
-    diagnostics.add(diagnostic);
+    return builder.report_issue(diagnostics, diagnostic);
 }
 
 SourceSpan graph_span(&in ProjectBuilder builder, NodeRef reference)
@@ -128,10 +133,11 @@ String(SystemAllocator) graph_spelling(&in ProjectBuilder builder,
     &in ParsedFile file = context.file(id);
     SystemAllocator allocator;
     StringBuilder(SystemAllocator) output(allocator);
-    usize index = usize(0);
+    usize index = project.token_lower_bound(id, span.start_offset());
+    usize end_index = project.token_lower_bound(id, span.end_offset());
     bool finished = false;
-    while (index < file.token_count() && finished == false) {
-        &in Token token = file.token(index);
+    while (index < end_index && finished == false) {
+        &in Token token = project.indexed_token(id, index);
         usize start = token.start_offset();
         usize end = token.end_offset();
         if (start >= span.start_offset() && end <= span.end_offset() && end > start) {
@@ -334,11 +340,12 @@ ModuleHeader read_module_header(&inout ProjectBuilder builder, ParsedFileId file
     return result;
 }
 
-void report_cycle(&inout ProjectBuilder builder, &inout DiagnosticBag diagnostics, DiagnosticOrigin origin)
+IssueId report_cycle(&inout ProjectBuilder builder, &inout DiagnosticBag diagnostics, DiagnosticOrigin origin)
     raises CapacityError, LayoutError, AllocationError, BoundsError,
         FrontendReferenceError, ProjectReferenceError {
     builder.mark_error();
     Diagnostic diagnostic = graph_diagnostic(origin, "module.cycle", "cyclic module import");
+    {
     &in FrontendProject project = builder.project();
     &in FrontendContext context = project.frontend();
     usize index = usize(0);
@@ -355,10 +362,11 @@ void report_cycle(&inout ProjectBuilder builder, &inout DiagnosticBag diagnostic
         }
         index = index + usize(1);
     }
-    diagnostics.add(diagnostic);
+    }
+    return builder.report_issue(diagnostics, diagnostic);
 }
 
-ModuleLink load_named_module(&inout ProjectBuilder builder, NameId name, str directory,
+ModuleResolution load_named_module(&inout ProjectBuilder builder, NameId name, str directory,
     &in ProjectOptions options, &inout DiagnosticBag diagnostics, DiagnosticOrigin origin)
     raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
         ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
@@ -368,25 +376,26 @@ ModuleLink load_named_module(&inout ProjectBuilder builder, NameId name, str dir
         .none { }
         .present(id) {
             if (graph_module_state(builder, id) == ModuleState.loading) {
-                report_cycle(builder, diagnostics, origin);
-                return ModuleLink.none;
+                return ModuleResolution.failed(report_cycle(builder, diagnostics, origin));
             }
-            return ModuleLink.present(id);
+            return ModuleResolution.resolved(id);
         }
     }
     String(SystemAllocator) text = graph_name_text(builder, name);
     try {
         String(SystemAllocator) path = resolve_module_path(text.as_str(), directory, options);
-        return load_canonical_module(builder, path.as_str(), NameLink.present(name), directory, options, diagnostics, origin);
+        return load_canonical_module(builder, path.as_str(), NameLink.present(name),
+            directory, options, diagnostics, origin);
     } catch ModuleNotFound {
-        graph_error(builder, diagnostics, origin, "module.not-found", text.as_str());
+        return ModuleResolution.failed(
+            graph_error(builder, diagnostics, origin, "module.not-found", text.as_str()));
     } catch IoError {
-        graph_error(builder, diagnostics, origin, "module.path", text.as_str());
+        return ModuleResolution.failed(
+            graph_error(builder, diagnostics, origin, "module.path", text.as_str()));
     }
-    return ModuleLink.none;
 }
 
-ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLink expected,
+ModuleResolution load_canonical_module(&inout ProjectBuilder builder, str path, NameLink expected,
     str directory, &in ProjectOptions options, &inout DiagnosticBag diagnostics, DiagnosticOrigin origin)
     raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
         ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
@@ -404,18 +413,17 @@ ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLi
                         .none { }
                         .present(name) {
                             if (requested.equals(name) == false) {
-                                graph_error(builder, diagnostics, origin, "module.identity-conflict", path);
-                                return ModuleLink.none;
+                                return ModuleResolution.failed(graph_error(builder, diagnostics,
+                                    origin, "module.identity-conflict", path));
                             }
                         }
                     }
                 }
             }
             if (graph_module_state(builder, id) == ModuleState.loading) {
-                report_cycle(builder, diagnostics, origin);
-                return ModuleLink.none;
+                return ModuleResolution.failed(report_cycle(builder, diagnostics, origin));
             }
-            return ModuleLink.present(id);
+            return ModuleResolution.resolved(id);
         }
     }
     ParsedFileId file;
@@ -426,11 +434,11 @@ ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLi
         close(input);
         file = builder.parse_source(path, text, diagnostics, options.parser_options());
     } catch IoError {
-        graph_error(builder, diagnostics, origin, "module.read", path);
-        return ModuleLink.none;
+        return ModuleResolution.failed(graph_error(builder, diagnostics,
+            origin, "module.read", path));
     } catch Utf8Error {
-        graph_error(builder, diagnostics, origin, "module.utf8", path);
-        return ModuleLink.none;
+        return ModuleResolution.failed(graph_error(builder, diagnostics,
+            origin, "module.utf8", path));
     }
     ModuleHeader header = read_module_header(builder, file, diagnostics);
     NameLink actual = header.name;
@@ -459,7 +467,7 @@ ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLi
                                 .none { }
                                 .source(span) { diagnostic.add_secondary(span, "requested by this import"); }
                             }
-                            diagnostics.add(diagnostic);
+                            builder.report_issue(diagnostics, diagnostic);
                             header.valid = false;
                         }
                     }
@@ -520,21 +528,23 @@ ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLi
                     alias = NameLink.present(builder.intern(alias_text.as_str()));
                 }
                 usize edge = builder.add_import(id, node, requested, effective, alias);
-                ModuleLink target = ModuleLink.none;
-                match (&in effective) {
-                    .none {
-                        graph_error(builder, diagnostics, DiagnosticOrigin.source(span),
-                            "module.invalid-name", "expected a dotted import or stub replacement name");
-                    }
-                    .present(name) {
-                        target = load_named_module(builder, name, directory, options, diagnostics, DiagnosticOrigin.source(span));
-                    }
-                }
-                builder.resolve_import(edge, target);
+                ModuleResolution target = match (&in effective) {
+                    .none => ModuleResolution.failed(graph_error(builder, diagnostics,
+                        DiagnosticOrigin.source(span), "module.invalid-name",
+                        "expected a dotted import or stub replacement name")),
+                    .present(name) => load_named_module(builder, name, directory, options,
+                        diagnostics, DiagnosticOrigin.source(span)),
+                };
                 match (&in target) {
-                    .none { incomplete = true; }
-                    .present(imported) {
-                        if (graph_module_state(builder, imported) == ModuleState.incomplete) { incomplete = true; }
+                    .failed(cause) {
+                        builder.fail_import(edge, cause);
+                        incomplete = true;
+                    }
+                    .resolved(imported) {
+                        builder.resolve_import(edge, ModuleLink.present(imported));
+                        if (graph_module_state(builder, imported) == ModuleState.incomplete) {
+                            incomplete = true;
+                        }
                     }
                 }
             }
@@ -543,7 +553,16 @@ ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLi
                 String(SystemAllocator) first = graph_spelling(builder, file, span, true);
                 if (first.as_str() == "import") {
                     usize edge = builder.add_import(id, node, NameLink.none, NameLink.none, NameLink.none);
-                    builder.resolve_import(edge, ModuleLink.none);
+                    IssueLink syntax_cause = builder.project().issue_for_span(span);
+                    match (&in syntax_cause) {
+                        .present(cause) { builder.fail_import(edge, cause); }
+                        .none {
+                            IssueId cause = graph_error(builder, diagnostics,
+                                DiagnosticOrigin.source(span), "module.invalid-import",
+                                "invalid import declaration");
+                            builder.fail_import(edge, cause);
+                        }
+                    }
                     incomplete = true;
                 } else {
                     if (first.as_str() != "module" && damaged_header == false) { seen_body = true; }
@@ -567,7 +586,7 @@ ModuleLink load_canonical_module(&inout ProjectBuilder builder, str path, NameLi
     ModuleState state = ModuleState.loaded;
     if (incomplete) { state = ModuleState.incomplete; }
     builder.set_module_state(id, state);
-    return ModuleLink.present(id);
+    return ModuleResolution.resolved(id);
 }
 
 pub void load_module_graph_into(&inout ProjectBuilder builder, str entry,
@@ -576,6 +595,7 @@ pub void load_module_graph_into(&inout ProjectBuilder builder, str entry,
     raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
         ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
         ProjectReferenceError, NameReferenceError, Utf8Error {
+    builder.set_diagnostic_budget(options.maximum_diagnostics());
     try {
         String(SystemAllocator) path = canonical_path(entry);
         String(SystemAllocator) directory = entry_directory(path.as_str());

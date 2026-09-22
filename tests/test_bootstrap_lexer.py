@@ -1,17 +1,16 @@
-import io
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from jack.compiler_driver import CompilationOptions, CompilerDriver
-from jack.interpreter import Interpreter
 from jack.parser import Lexer, ParseError, parse
 from tests.bootstrap_syntax_normalization import (
     bootstrap_nodes, first_difference, python_node, read_dump, root_source_ranges,
 )
-from jack.runtime_externs import default_runtime_externs
+from tests.bootstrap_interpreter_runner import run_hir_isolated
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,12 +43,16 @@ class BootstrapLexerTests(unittest.TestCase):
         cls.build = tempfile.TemporaryDirectory()
         cls.root = Path(cls.build.name)
         driver = CompilerDriver(print_handler=None)
+        started = time.perf_counter()
         cls.program = driver.compile_hir(
             ENTRY, CompilationOptions(module_roots=(SELFHOST_ROOT,))
         )
+        print(f"bootstrap HIR build: {time.perf_counter() - started:.2f}s",
+              file=sys.stderr, flush=True)
         cls.executables = {}
         cls.compilation_results = {}
         for backend in ('c', 'llvm'):
+            started = time.perf_counter()
             output = cls.root / f'bootstrap-{backend}'
             cls.compilation_results[backend] = driver.compile_executable(
                 ENTRY,
@@ -60,7 +63,10 @@ class BootstrapLexerTests(unittest.TestCase):
                 ),
             )
             cls.executables[backend] = output
+            print(f"bootstrap {backend} -O0 build: {time.perf_counter() - started:.2f}s",
+                  file=sys.stderr, flush=True)
         for backend in ('llvm', 'c'):
+            started = time.perf_counter()
             optimized = cls.root / f'bootstrap-{backend}-o2'
             driver.compile_executable(
                 ENTRY,
@@ -70,28 +76,23 @@ class BootstrapLexerTests(unittest.TestCase):
                 ),
             )
             cls.executables[f'{backend}-o2'] = optimized
+            print(f"bootstrap {backend} -O2 build: {time.perf_counter() - started:.2f}s",
+                  file=sys.stderr, flush=True)
 
     @classmethod
     def tearDownClass(cls):
         cls.build.cleanup()
 
     def run_interpreter(self, path: Path | None, *arguments: str):
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            status = Interpreter(
-                externs=default_runtime_externs()
-            ).eval_hir_program(
-                self.program,
-                [
-                    'jack-bootstrap',
-                    *arguments,
-                    *([] if path is None else [str(path)]),
-                ],
-            )
-        return status, stdout.getvalue(), stderr.getvalue()
+        return run_hir_isolated(
+            self.program,
+            ['jack-bootstrap', *arguments,
+             *([] if path is None else [str(path)])],
+            timeout=180, label=path.name if path is not None else "no-entry",
+        )
 
     def run_native(self, backend: str, *arguments: str):
+        started = time.perf_counter()
         result = subprocess.run(
             [str(self.executables[backend]), *arguments],
             capture_output=True,
@@ -99,6 +100,9 @@ class BootstrapLexerTests(unittest.TestCase):
             timeout=20,
             check=False,
         )
+        label = Path(arguments[-1]).name if arguments else "no-entry"
+        print(f"{backend} {label}: {time.perf_counter() - started:.2f}s",
+              file=sys.stderr, flush=True)
         return result.returncode, result.stdout, result.stderr
 
     def assert_runtime_parity(self, path: Path, expected_stdout: str, status: int = 0,
@@ -110,6 +114,37 @@ class BootstrapLexerTests(unittest.TestCase):
                 self.assertEqual(status, result[0])
                 self.assertEqual(expected_stdout, result[1])
                 self.assertEqual(expected_stderr, result[2])
+
+    def test_name_analysis_parity_across_backends(self):
+        api = self.root / 'api.jack'
+        api.write_text('module api; pub i32 add(i32 left, i32 right) { return left + right; }')
+        valid = self.root / 'project-valid.jack'
+        valid.write_text('''module app;
+import api as a;
+struct Item { i32 field; }
+i32 use(i32 n) {
+    i32 x = a.add(n, 2);
+    Item item = Item { field = x };
+    return item.field;
+}
+''')
+        malformed = self.root / 'project-malformed.jack'
+        malformed.write_text('''module bad;
+import missing as m;
+i32 value = m.number + unknown;
+i32 later = 2;
+''')
+        for path, status in ((valid, 0), (malformed, 1)):
+            with self.subTest(path=path.name):
+                options = ('--dump', 'symbols', '--diagnostic-format', 'stable')
+                expected = self.run_interpreter(path, *options)
+                self.assertEqual(status, expected[0])
+                for backend in ('c', 'llvm', 'c-o2', 'llvm-o2'):
+                    with self.subTest(backend=backend):
+                        self.assertEqual(
+                            expected,
+                            self.run_native(backend, *options, str(path)),
+                        )
 
     def test_checked_in_examples_match_python_lexer(self):
         for path in sorted((ROOT / 'examples').glob('*.jack')):
@@ -178,8 +213,12 @@ class BootstrapLexerTests(unittest.TestCase):
     def test_usage_and_missing_file_contracts(self):
         for backend in ('c', 'llvm'):
             status, stdout, stderr = self.run_native(backend)
-            self.assertEqual((2, '', 'usage: jack-bootstrap [--diagnostic-format human|stable] [--dump tokens|syntax] <source>\n'),
-                             (status, stdout, stderr))
+            self.assertEqual(
+                (2, '', 'usage: jack-bootstrap [--diagnostic-format human|stable] '
+                 '[--check-names|--dump tokens|syntax|modules|symbols] '
+                 '[--module-root DIR] [--stub REQUESTED=REPLACEMENT] <source>\n'),
+                (status, stdout, stderr),
+            )
             status, stdout, stderr = self.run_native(
                 backend, str(self.root / 'missing.jack')
             )

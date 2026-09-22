@@ -138,6 +138,13 @@ occurrences retain checked syntax references, spans, roles, and explicit
 resolved/deferred/invalid states. Error state is independent of diagnostic-bag
 capacity, and rebinding maintains the deferred count.
 
+Invalid references carry a checked `IssueId` into project-owned diagnostic
+records. Failed aliases and selective imports reuse their originating issue,
+while unrelated unknown names still receive separate diagnostics. Issue records
+survive diagnostic omission and project movement. Loading, parsing, indexing,
+and resolution share the project's diagnostic budget; the caller's bag may
+impose a smaller display limit. Repeated issues do not increase omitted counts.
+
 `bootstrap.modules.load_module_graph(entry, options, diagnostics)` builds the
 recovering transitive import graph without executing comptime code. Search uses
 the canonical entry directory followed by explicit roots, trying `.jack` before
@@ -173,6 +180,10 @@ unchanged token and syntax dump modes:
 
 `--module-root` and `--stub REQUESTED=REPLACEMENT` are repeatable in project
 modes. The symbol dump uses traversal-ordered IDs, not process identities.
+It includes escaped `issue ID CODE PATH START END MESSAGE` records; invalid
+`reference` records end with the corresponding issue ID. Locationless issues
+use `-` for the path and zero offsets.
+`issue_label ISSUE_ID LABEL_INDEX PATH START END` records retain related locations.
 Exit status 0 means no authoritative module or name errors; it does not mean
 the program type-checks or compiles. Status 1 means diagnosed errors, and 2
 means invalid invocation. `--diagnostic-format stable` is available for
@@ -197,14 +208,25 @@ reparsing, strict failure with full diagnostic bags, and injected allocation
 failures. These tests establish structural parity on the tested corpus, not
 semantic correctness or equivalence for every possible malformed input.
 
-`tests/test_bootstrap_analysis.py` exercises the native project CLI, lexical
-scope boundaries, imports, poisoned declarations, implementation `use`,
-comptime non-execution, and deterministic symbol dumps. The complete bootstrap
-module graph passes `--check-names` with explicit `selfhost` and `jack` roots.
-The current graph dump records 32,528 source-name occurrences with no invalid
-bindings; 3,852 receiver-dependent members, 1,396 pattern variants, and two
-comptime-selected names remain explicitly deferred. These are observations,
-not frozen output counts or evidence of type correctness.
+`tests/test_bootstrap_analysis.py` compares source-level bindings against an
+independent stage-0 AST projection that reparses original files without running
+comptime. Its complete bootstrap-graph check matches 29,919 references by
+canonical declaration location, role, and UTF-8 byte span. An exhaustive syntax
+classification accounts for identifier tokens across all 22 loaded modules,
+including formatted expressions; recovered invalid regions are classified
+individually. Focused cases test each deferral reason, poisoned dependencies,
+visibility, and comptime non-execution. Interpreter, C, and LLVM agree on
+focused valid and malformed project dumps at `-O0` and native `-O2`.
+
+In a local five-run LLVM `-O2` measurement, the graph contained 22 modules,
+64,340 syntax nodes, 5,585 symbols, and 35,359 occurrences, with no authoritative
+name errors. Median CPU times were 0.218 s loading, 0.037 s indexing, 0.062 s
+resolving, and 0.013 s validating; the separate compiler build took 78 s.
+Deferred occurrences included 4,399 receiver-dependent members, 16
+computed-type members, and 1,459 pattern variants. The corpus contains no
+generic-type or comptime-selection deferrals; focused fixtures verify both.
+These measurements are informational, not frozen counts or proof of type
+correctness. `--check-names` does not execute comptime or perform type checking.
 
 See [the frontend benchmark](../benchmarks/frontend/README.md) for parser-only
 throughput, node layout, retained storage, and scratch high-water measurements.

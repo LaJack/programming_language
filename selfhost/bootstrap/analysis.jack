@@ -19,7 +19,9 @@ pub struct AnalysisBinding {
     SymbolId symbol;
     usize visible_after;
     bool poisoned;
+    IssueLink cause;
     usize namespace;
+    usize import_record;
 }
 
 pub struct AnalysisModuleScope {
@@ -41,8 +43,15 @@ pub union MemberContext {
 
 pub union BindingLookup {
     missing;
-    poisoned;
+    poisoned(IssueId cause);
     found(SymbolId symbol);
+}
+
+pub struct AnalysisMember {
+    SymbolId owner;
+    NameId name;
+    usize category;
+    SymbolId symbol;
 }
 
 pub struct AnalysisState {
@@ -50,11 +59,17 @@ pub struct AnalysisState {
     Vector(usize, SystemAllocator) buckets;
     Vector(AnalysisModuleScope, SystemAllocator) module_scopes;
     Vector(AnalysisAlias, SystemAllocator) aliases;
-    usize diagnostics;
-    usize maximum;
+    Vector(AnalysisMember, SystemAllocator) members;
+    Vector(usize, SystemAllocator) member_buckets;
+    usize project_identity;
+    usize module_count;
+    usize import_count;
+    usize symbol_count;
+    usize scope_count;
+    bool indexed;
 }
 
-AnalysisState analysis_state(usize maximum)
+AnalysisState analysis_state()
     raises CapacityError, LayoutError, AllocationError {
     SystemAllocator binding_allocator;
     Vector(AnalysisBinding, SystemAllocator) bindings(binding_allocator, usize(0));
@@ -69,10 +84,21 @@ AnalysisState analysis_state(usize maximum)
     Vector(AnalysisModuleScope, SystemAllocator) module_scopes(module_allocator, usize(0));
     SystemAllocator alias_allocator;
     Vector(AnalysisAlias, SystemAllocator) aliases(alias_allocator, usize(0));
-    if (maximum == usize(0)) { maximum = usize(1); }
+    SystemAllocator member_allocator;
+    Vector(AnalysisMember, SystemAllocator) members(member_allocator, usize(0));
+    SystemAllocator member_bucket_allocator;
+    Vector(usize, SystemAllocator) member_buckets(member_bucket_allocator, usize(128));
+    usize member_index = usize(0);
+    while (member_index < usize(128)) {
+        member_buckets.push(usize(0));
+        member_index = member_index + usize(1);
+    }
     return AnalysisState {
         bindings = move bindings, buckets = move buckets, module_scopes = move module_scopes,
-        aliases = move aliases, diagnostics = usize(0), maximum = maximum,
+        aliases = move aliases, members = move members,
+        member_buckets = move member_buckets, project_identity = usize(0),
+        module_count = usize(0), import_count = usize(0),
+        symbol_count = usize(0), scope_count = usize(0), indexed = false,
     };
 }
 
@@ -86,9 +112,10 @@ String(SystemAllocator) analysis_spelling(&in ProjectBuilder builder,
     &in ParsedFile file = context.file(file_id);
     SystemAllocator allocator;
     StringBuilder(SystemAllocator) output(allocator);
-    usize index = usize(0);
-    while (index < file.token_count()) {
-        &in Token token = file.token(index);
+    usize index = project.token_lower_bound(file_id, span.start_offset());
+    usize end_index = project.token_lower_bound(file_id, span.end_offset());
+    while (index < end_index) {
+        &in Token token = project.indexed_token(file_id, index);
         usize start = token.start_offset();
         usize end = token.end_offset();
         if (start >= span.start_offset() && end <= span.end_offset() && end > start) {
@@ -108,10 +135,11 @@ SourceSpan path_token_span(&in ProjectBuilder builder, ParsedFileId file_id,
     raises FrontendReferenceError, BoundsError {
     &in ParsedFile file = builder.project().frontend().file(file_id);
     SourceSpan result = empty_source_span();
-    usize index = usize(0);
+    usize index = builder.project().token_lower_bound(file_id, path.start_offset());
+    usize end_index = builder.project().token_lower_bound(file_id, path.end_offset());
     bool found = false;
-    while (index < file.token_count()) {
-        &in Token token = file.token(index);
+    while (index < end_index) {
+        &in Token token = builder.project().indexed_token(file_id, index);
         if (token.start_offset() >= path.start_offset()
             && token.end_offset() <= path.end_offset()
             && token.end_offset() > token.start_offset()) {
@@ -134,26 +162,20 @@ bool spelling_has_dot(str spelling) {
     return false;
 }
 
-void analysis_error(&inout ProjectBuilder builder, &inout AnalysisState state,
+IssueId analysis_error(&inout ProjectBuilder builder, &inout AnalysisState state,
     &inout DiagnosticBag diagnostics, SourceSpan span, str code, str message)
     raises CapacityError, LayoutError, AllocationError, BoundsError {
-    builder.mark_error();
-    if (state.diagnostics >= state.maximum) { return; }
-    state.diagnostics = state.diagnostics + usize(1);
     Diagnostic diagnostic = source_diagnostic(DiagnosticSeverity.error, code, span, message);
-    diagnostics.add(diagnostic);
+    return builder.report_issue(diagnostics, diagnostic);
 }
 
-void analysis_duplicate_error(&inout ProjectBuilder builder, &inout AnalysisState state,
+IssueId analysis_duplicate_error(&inout ProjectBuilder builder, &inout AnalysisState state,
     &inout DiagnosticBag diagnostics, SourceSpan current, SourceSpan previous)
     raises CapacityError, LayoutError, AllocationError, BoundsError {
-    builder.mark_error();
-    if (state.diagnostics >= state.maximum) { return; }
-    state.diagnostics = state.diagnostics + usize(1);
     Diagnostic diagnostic = source_diagnostic(DiagnosticSeverity.error,
         "resolve.duplicate-declaration", current, "duplicate declaration in this scope");
     diagnostic.add_secondary(previous, "the original declaration is here");
-    diagnostics.add(diagnostic);
+    return builder.report_issue(diagnostics, diagnostic);
 }
 
 ScopeId module_scope(&in AnalysisState state, ModuleId module_id)
@@ -286,6 +308,7 @@ void append_binding(&inout ProjectBuilder builder, &inout AnalysisState state,
         scope, name, namespace);
     usize existing_index = state.buckets.get(bucket);
     bool duplicate = existing_index != usize(0);
+    IssueLink cause = IssueLink.none;
     if (duplicate) {
         SymbolId previous_symbol;
         {
@@ -293,14 +316,18 @@ void append_binding(&inout ProjectBuilder builder, &inout AnalysisState state,
             existing.poisoned = true;
             previous_symbol = existing.symbol;
         }
-            builder.poison(previous_symbol);
-            SourceSpan previous = symbol_span(builder.project(), previous_symbol);
-            analysis_duplicate_error(builder, state, diagnostics, span, previous);
+        SourceSpan previous = symbol_span(builder.project(), previous_symbol);
+        IssueId issue = analysis_duplicate_error(builder, state, diagnostics, span, previous);
+        cause = IssueLink.present(issue);
+        builder.poison(previous_symbol, issue);
+        builder.poison(symbol, issue);
+        &inout AnalysisBinding existing = state.bindings.get_mut(existing_index - usize(1));
+        existing.cause = cause;
     }
-    if (duplicate) { builder.poison(symbol); }
     insert_indexed_binding(state, builder.project(), AnalysisBinding {
         scope = scope, name = name, symbol = symbol,
         visible_after = visible_after, poisoned = duplicate, namespace = namespace,
+        cause = cause, import_record = usize(0),
     });
 }
 
@@ -642,6 +669,7 @@ void add_builtin(&inout ProjectBuilder builder, &inout AnalysisState state,
     insert_indexed_binding(state, builder.project(), AnalysisBinding {
         scope = scope, name = name, symbol = symbol,
         visible_after = usize(0), poisoned = false, namespace = usize(0),
+        cause = IssueLink.none, import_record = usize(0),
     });
 }
 
@@ -737,7 +765,15 @@ BindingLookup lookup_name(&in FrontendProject project, &in AnalysisState state,
             }
             if (visible) {
                 if (binding.poisoned || project.symbol(binding.symbol).is_poisoned()) {
-                    return BindingLookup.poisoned;
+                    IssueLink cause = binding.cause;
+                    match (&in cause) {
+                        .none { cause = project.symbol(binding.symbol).poison_cause(); }
+                        .present(_) { }
+                    }
+                    match (&in cause) {
+                        .none { raise ProjectReferenceError { }; }
+                        .present(issue) { return BindingLookup.poisoned(issue); }
+                    }
                 }
                 return BindingLookup.found(binding.symbol);
             }
@@ -755,16 +791,15 @@ BindingLookup lookup_name(&in FrontendProject project, &in AnalysisState state,
 SymbolLink module_public_symbol(&in FrontendProject project,
     &in AnalysisState state, ModuleId module_id, NameId name)
     raises BoundsError, ProjectReferenceError {
-    ScopeId scope = module_scope(state, module_id);
-    usize index = usize(0);
-    while (index < project.symbol_count()) {
-        SymbolId symbol = project.symbol_at(index);
-        &in SymbolRecord record = project.symbol(symbol);
-        if (record.lexical_scope().equals(scope) && record.symbol_name().equals(name)
-            && record.contracts().public_flag() && record.is_poisoned() == false) {
-            return SymbolLink.present(symbol);
+    SymbolLink candidate = module_any_symbol(project, state, module_id, name);
+    match (&in candidate) {
+        .none { }
+        .present(symbol) {
+            &in SymbolRecord record = project.symbol(symbol);
+            if (record.contracts().public_flag() && record.is_poisoned() == false) {
+                return SymbolLink.present(symbol);
+            }
         }
-        index = index + usize(1);
     }
     return SymbolLink.none;
 }
@@ -775,14 +810,16 @@ void bind_import_name(&inout ProjectBuilder builder, &inout AnalysisState state,
     raises CapacityError, LayoutError, AllocationError, BoundsError,
         ProjectReferenceError {
     bool conflict = false;
+    usize previous_import = usize(0);
+    SymbolId previous;
     usize bucket = binding_bucket(builder.project(), state.bindings, state.buckets,
         scope, name, usize(0));
     usize found = state.buckets.get(bucket);
     if (found != usize(0)) {
-        SymbolId previous;
         {
             &in AnalysisBinding existing = state.bindings.get(found - usize(1));
             previous = existing.symbol;
+            previous_import = existing.import_record;
         }
         bool same_import = false;
         match (&in symbol) {
@@ -795,11 +832,22 @@ void bind_import_name(&inout ProjectBuilder builder, &inout AnalysisState state,
             conflict = true;
         }
     }
-    builder.add_import_binding(scope, name, symbol, module_link, alias, conflict);
+    IssueLink cause = IssueLink.none;
     if (conflict) {
-        analysis_error(builder, state, diagnostics, span, "module.import-conflict",
+        Diagnostic diagnostic = source_diagnostic(DiagnosticSeverity.error,
+            "module.import-conflict", span,
             "import conflicts with another binding in this module");
+        diagnostic.add_secondary(symbol_span(builder.project(), previous),
+            "the previous binding is here");
+        IssueId issue = builder.report_issue(diagnostics, diagnostic);
+        cause = IssueLink.present(issue);
+        &inout AnalysisBinding existing = state.bindings.get_mut(found - usize(1));
+        existing.cause = cause;
+        if (previous_import != usize(0)) {
+            builder.poison_import_binding(previous_import - usize(1), issue);
+        }
     }
+    usize import_record = builder.add_import_binding(scope, name, symbol, module_link, alias, cause);
     match (&in symbol) {
         .none { }
         .present(target) {
@@ -808,10 +856,31 @@ void bind_import_name(&inout ProjectBuilder builder, &inout AnalysisState state,
                     scope = scope, name = name, symbol = target,
                     visible_after = usize(0), poisoned = conflict,
                     namespace = usize(0),
+                    cause = cause, import_record = import_record + usize(1),
                 });
             }
         }
     }
+}
+
+void bind_failed_import(&inout ProjectBuilder builder, &inout AnalysisState state,
+    NodeRef node, SourceSpan span, ScopeId scope, IssueId cause, bool alias)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    String(SystemAllocator) text = analysis_spelling(builder, node.file_id(), span);
+    NameId name = builder.intern(text.as_str());
+    SymbolId symbol = builder.add_symbol(name, SymbolKind.unavailable_import, scope,
+        SymbolLink.none, SymbolOrigin.source(node, span), declaration_modifiers(u32(0), false));
+    builder.poison(symbol, cause);
+    insert_indexed_binding(state, builder.project(), AnalysisBinding {
+        scope = scope, name = name, symbol = symbol, visible_after = usize(0),
+        poisoned = true, cause = IssueLink.present(cause), namespace = usize(0),
+        import_record = usize(0),
+    });
+    builder.add_import_binding(scope, name, SymbolLink.present(symbol), ModuleLink.none,
+        alias, IssueLink.present(cause));
+    builder.add_occurrence(node, span, scope, OccurrenceRole.import_use,
+        ReferenceStatus.invalid(cause));
 }
 
 void bind_imports(&inout ProjectBuilder builder, &inout AnalysisState state,
@@ -823,7 +892,39 @@ void bind_imports(&inout ProjectBuilder builder, &inout AnalysisState state,
         ImportRecord edge = builder.project().import_edge(edge_index);
         ModuleLink target_link = edge.imported_module();
         match (&in target_link) {
-            .none { }
+            .none {
+                NodeRef node = edge.syntax_node();
+                ScopeId scope = module_scope(state, edge.importing_module());
+                IssueLink link = edge.failure_cause();
+                match (&in link) {
+                    .none { raise ProjectReferenceError { }; }
+                    .present(cause) {
+                        SyntaxData data = builder.project().frontend().node(node).payload();
+                        match (&in data) {
+                            .import_declaration(_, alias, _) {
+                                if (alias.end_offset() > alias.start_offset()) {
+                                    bind_failed_import(builder, state, node, alias, scope, cause, true);
+                                } else {
+                                    usize index = usize(0);
+                                    usize count = child_count(builder.project().frontend().node(node));
+                                    while (index < count) {
+                                        NodeRef child = builder.project().frontend().child(node, index);
+                                        SyntaxData child_data = builder.project().frontend().node(child).payload();
+                                        match (&in child_data) {
+                                            .import_symbol(name) {
+                                                bind_failed_import(builder, state, child, name, scope, cause, false);
+                                            }
+                                            _ { }
+                                        }
+                                        index = index + usize(1);
+                                    }
+                                }
+                            }
+                            _ { }
+                        }
+                    }
+                }
+            }
             .present(target_module) {
                 ScopeId scope = module_scope(state, edge.importing_module());
                 NodeRef node = edge.syntax_node();
@@ -867,11 +968,11 @@ void bind_imports(&inout ProjectBuilder builder, &inout AnalysisState state,
                                                     builder.project(), state, target_module, name);
                                                 match (&in imported) {
                                                     .none {
-                                                        analysis_error(builder, state, diagnostics, name_span,
+                                                        IssueId cause = analysis_error(builder, state, diagnostics, name_span,
                                                             "module.private-symbol",
                                                             "imported symbol is missing or private");
-                                                        builder.add_occurrence(child, name_span, scope,
-                                                            OccurrenceRole.import_use, ReferenceStatus.invalid);
+                                                        bind_failed_import(builder, state, child,
+                                                            name_span, scope, cause, false);
                                                     }
                                                     .present(symbol) {
                                                         bind_import_name(builder, state, diagnostics, scope,
@@ -904,9 +1005,23 @@ void bind_imports(&inout ProjectBuilder builder, &inout AnalysisState state,
                                         match (&in exported) {
                                             .none { }
                                             .present(exported_name) {
-                                            bind_import_name(builder, state, diagnostics, scope,
-                                                exported_name, SymbolLink.present(symbol),
-                                                ModuleLink.present(target_module), false, path);
+                                                BindingLookup existing = lookup_name(builder.project(), state,
+                                                    scope, exported_name, usize(18446744073709551615));
+                                                bool local = false;
+                                                match (&in existing) {
+                                                    .found(found) {
+                                                        &in SymbolRecord record = builder.project().symbol(found);
+                                                        local = record.lexical_scope().equals(scope)
+                                                            && record.symbol_kind() != SymbolKind.module_alias
+                                                            && record.symbol_kind() != SymbolKind.unavailable_import;
+                                                    }
+                                                    _ { }
+                                                }
+                                                if (local == false) {
+                                                    bind_import_name(builder, state, diagnostics, scope,
+                                                        exported_name, SymbolLink.present(symbol),
+                                                        ModuleLink.present(target_module), false, path);
+                                                }
                                             }
                                         }
                                         symbol_index = symbol_index + usize(1);
@@ -934,60 +1049,260 @@ ModuleLink alias_target(&in AnalysisState state, SymbolId symbol)
     return ModuleLink.none;
 }
 
-SymbolLink owner_member(&in FrontendProject project, SymbolId owner, NameId name)
-    raises ProjectReferenceError {
+usize member_category(SymbolKind kind) {
+    return match (&in kind) {
+        .field => usize(1),
+        .variant => usize(2),
+        .inherent_method => usize(3),
+        .interface_requirement => usize(4),
+        .implementation_method => usize(5),
+        _ => usize(0),
+    };
+}
+
+usize member_bucket(&in FrontendProject project,
+    &in Vector(AnalysisMember, SystemAllocator) members,
+    &in Vector(usize, SystemAllocator) buckets,
+    SymbolId owner, NameId name, usize category)
+    raises BoundsError, ProjectReferenceError {
+    usize hash = project.symbol_index(owner) * usize(33)
+        + project.name_index(name) * usize(65599) + category * usize(4099);
+    usize position = hash % buckets.len();
+    bool found = false;
+    while (found == false) {
+        usize occupied = buckets.get(position);
+        if (occupied == usize(0)) { found = true; }
+        else {
+            &in AnalysisMember entry = members.get(occupied - usize(1));
+            if (entry.owner.equals(owner) && entry.name.equals(name)
+                && entry.category == category) { found = true; }
+            else { position = (position + usize(1)) % buckets.len(); }
+        }
+    }
+    return position;
+}
+
+void ensure_member_buckets(&inout AnalysisState state, &in FrontendProject project)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, ProjectReferenceError {
+    if (state.members.len() < state.member_buckets.len() / usize(2)) { return; }
+    if (state.member_buckets.len() > usize(18446744073709551615) / usize(2)) {
+        raise LayoutError { };
+    }
+    usize count = state.member_buckets.len() * usize(2);
+    SystemAllocator allocator;
+    Vector(usize, SystemAllocator) grown(allocator, count);
+    usize index = usize(0);
+    while (index < count) { grown.push(usize(0)); index = index + usize(1); }
+    index = usize(0);
+    while (index < state.members.len()) {
+        &in AnalysisMember member = state.members.get(index);
+        usize bucket = member_bucket(project, state.members, grown, member.owner,
+            member.name, member.category);
+        grown.replace(bucket, index + usize(1));
+        index = index + usize(1);
+    }
+    state.member_buckets = move grown;
+}
+
+void index_member_table(&inout AnalysisState state, &in FrontendProject project)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, ProjectReferenceError {
     usize index = usize(0);
     while (index < project.symbol_count()) {
-        SymbolId candidate = project.symbol_at(index);
-        &in SymbolRecord record = project.symbol(candidate);
-        SymbolLink link = record.symbol_owner();
-        match (&in link) {
-            .none { }
-            .present(value) {
-                SymbolId member_owner = value;
-                if (member_owner.equals(owner) && record.symbol_name().equals(name)
-                    && record.is_poisoned() == false) {
-                    return SymbolLink.present(candidate);
+        SymbolId symbol = project.symbol_at(index);
+        &in SymbolRecord record = project.symbol(symbol);
+        usize category = member_category(record.symbol_kind());
+        if (category != usize(0)) {
+            SymbolLink owner_link = record.symbol_owner();
+            match (&in owner_link) {
+                .none { raise ProjectReferenceError { }; }
+                .present(owner) {
+                    NameId name = record.symbol_name();
+                    ensure_member_buckets(state, project);
+                    usize bucket = member_bucket(project, state.members,
+                        state.member_buckets, owner, name, category);
+                    usize position = state.members.len();
+                    state.members.push(AnalysisMember {
+                        owner = owner, name = name, category = category, symbol = symbol,
+                    });
+                    state.member_buckets.replace(bucket, position + usize(1));
                 }
             }
         }
         index = index + usize(1);
     }
+}
+
+SymbolLink owner_member(&in FrontendProject project, &in AnalysisState state,
+    SymbolId owner, NameId name, SymbolKind required)
+    raises BoundsError, ProjectReferenceError {
+    usize category = member_category(required);
+    if (category == usize(0)) { return SymbolLink.none; }
+    usize bucket = member_bucket(project, state.members, state.member_buckets,
+        owner, name, category);
+    usize position = state.member_buckets.get(bucket);
+    if (position == usize(0)) { return SymbolLink.none; }
+    SymbolId symbol = state.members.get(position - usize(1)).symbol;
+    if (project.symbol(symbol).is_poisoned()) { return SymbolLink.none; }
+    return SymbolLink.present(symbol);
+}
+
+SymbolLink module_any_symbol(&in FrontendProject project, &in AnalysisState state,
+    ModuleId module_id, NameId name)
+    raises BoundsError, ProjectReferenceError {
+    ScopeId scope = module_scope(state, module_id);
+    usize bucket = binding_bucket(project, state.bindings, state.buckets,
+        scope, name, usize(0));
+    usize found = state.buckets.get(bucket);
+    if (found == usize(0)) { return SymbolLink.none; }
+    SymbolId symbol = state.bindings.get(found - usize(1)).symbol;
+    if (project.symbol(symbol).lexical_scope().equals(scope)) {
+        return SymbolLink.present(symbol);
+    }
     return SymbolLink.none;
+}
+
+ReferenceStatus resolve_member(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, NodeRef node, SourceSpan span, ScopeId scope,
+    ReferenceStatus receiver, OccurrenceRole role)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    match (&in receiver) {
+        .invalid(cause) { return ReferenceStatus.invalid(cause); }
+        .deferred(reason) { return ReferenceStatus.deferred(reason); }
+        .resolved(owner) {
+            SymbolKind kind = builder.project().symbol(owner).symbol_kind();
+            if (kind == SymbolKind.type_parameter || kind == SymbolKind.self_type) {
+                return ReferenceStatus.deferred(DeferredReason.generic_type);
+            }
+            if (kind == SymbolKind.computed_type) {
+                return ReferenceStatus.deferred(DeferredReason.computed_type);
+            }
+            String(SystemAllocator) spelling = analysis_spelling(builder, node.file_id(), span);
+            NameId name = builder.intern(spelling.as_str());
+            ModuleLink module_id = alias_target(state, owner);
+            match (&in module_id) {
+                .present(imported_module) {
+                    SymbolLink candidate = module_any_symbol(builder.project(), state, imported_module, name);
+                    match (&in candidate) {
+                        .none {
+                            IssueId cause = analysis_error(builder, state, diagnostics, span,
+                                "resolve.missing-member", "unknown qualified member");
+                            return ReferenceStatus.invalid(cause);
+                        }
+                        .present(symbol) {
+                            bool poisoned;
+                            bool public_flag;
+                            IssueLink poison = IssueLink.none;
+                            {
+                                &in SymbolRecord record = builder.project().symbol(symbol);
+                                poisoned = record.is_poisoned();
+                                public_flag = record.contracts().public_flag();
+                                poison = record.poison_cause();
+                            }
+                            if (poisoned) {
+                                match (&in poison) {
+                                    .present(cause) { return ReferenceStatus.invalid(cause); }
+                                    .none { raise ProjectReferenceError { }; }
+                                }
+                            }
+                            if (public_flag) { return ReferenceStatus.resolved(symbol); }
+                            SourceSpan declaration = symbol_span(builder.project(), symbol);
+                            Diagnostic diagnostic = source_diagnostic(DiagnosticSeverity.error,
+                                "module.private-symbol", span, "qualified member is private");
+                            diagnostic.add_secondary(declaration, "declared here");
+                            IssueId cause = builder.report_issue(diagnostics, diagnostic);
+                            return ReferenceStatus.invalid(cause);
+                        }
+                    }
+                }
+                .none { }
+            }
+            SymbolLink member = SymbolLink.none;
+            if (kind == SymbolKind.sum_type) {
+                member = owner_member(builder.project(), state, owner, name, SymbolKind.variant);
+            } elif (kind == SymbolKind.interface_type) {
+                member = owner_member(builder.project(), state, owner, name,
+                    SymbolKind.interface_requirement);
+            } elif (kind == SymbolKind.structure || kind == SymbolKind.view_type) {
+                if (role == OccurrenceRole.call) {
+                    member = owner_member(builder.project(), state, owner, name,
+                        SymbolKind.inherent_method);
+                } else {
+                    member = owner_member(builder.project(), state, owner, name, SymbolKind.field);
+                    if (symbol_link_is_none(member)) {
+                        member = owner_member(builder.project(), state, owner, name,
+                            SymbolKind.inherent_method);
+                    }
+                }
+            } else {
+                return ReferenceStatus.deferred(DeferredReason.receiver_type);
+            }
+            match (&in member) {
+                .present(symbol) { return ReferenceStatus.resolved(symbol); }
+                .none {
+                    IssueId cause = analysis_error(builder, state, diagnostics, span,
+                        "resolve.missing-member", "unknown member");
+                    return ReferenceStatus.invalid(cause);
+                }
+            }
+        }
+    }
+}
+ReferenceStatus unresolved_name(&inout ProjectBuilder builder, &inout AnalysisState state,
+    &inout DiagnosticBag diagnostics, SourceSpan span, str code, str message,
+    bool comptime_selection)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    if (comptime_selection && code != "resolve.invalid-self") {
+        return ReferenceStatus.deferred(DeferredReason.comptime_selection);
+    }
+    return ReferenceStatus.invalid(
+        analysis_error(builder, state, diagnostics, span, code, message));
 }
 
 ReferenceStatus resolve_name(&inout ProjectBuilder builder, &inout AnalysisState state,
     &inout DiagnosticBag diagnostics, NodeRef node, SourceSpan span, ScopeId scope,
-    OccurrenceRole role)
+    OccurrenceRole role, bool comptime_selection)
     raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
         FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
     String(SystemAllocator) text = analysis_spelling(builder, node.file_id(), span);
     NameId name = builder.intern(text.as_str());
     BindingLookup result = lookup_name(builder.project(), state, scope, name,
         span.start_offset());
+    str code = "resolve.unknown-name";
+    str message = "unknown name";
+    if (text.as_str() == "Self") {
+        code = "resolve.invalid-self";
+        message = "Self is only valid in a type or implementation";
+    }
     ReferenceStatus status = match (&in result) {
         .found(symbol) => ReferenceStatus.resolved(symbol),
-        .poisoned => ReferenceStatus.invalid,
-        .missing => ReferenceStatus.invalid,
+        .poisoned(cause) => ReferenceStatus.invalid(cause),
+        .missing => unresolved_name(builder, state, diagnostics, span, code, message,
+            comptime_selection),
     };
-    match (&in result) {
-        .missing {
-            if (text.as_str() == "Self") {
-                analysis_error(builder, state, diagnostics, span,
-                    "resolve.invalid-self", "Self is only valid in a type or implementation");
-            } else {
-                analysis_error(builder, state, diagnostics, span,
-                    "resolve.unknown-name", "unknown name");
-            }
-        }
-        _ { }
-    }
     builder.add_occurrence(node, span, scope, role, status);
     return status;
 }
 
-ReferenceStatus latest_node_status(&in FrontendProject project, NodeRef node)
-    raises ProjectReferenceError {
+ReferenceStatus expression_status(&in FrontendProject project, NodeRef node)
+    raises ProjectReferenceError, FrontendReferenceError {
+    &in SyntaxNode syntax = project.frontend().node(node);
+    SyntaxKind kind = syntax.kind();
+    if (kind == SyntaxKind.parenthesized_expression && child_count(syntax) > usize(0)) {
+        return expression_status(project, project.frontend().child(node, usize(0)));
+    }
+    if (kind == SyntaxKind.call_expression || kind == SyntaxKind.index_expression
+        || kind == SyntaxKind.slice_expression) {
+        if (child_count(syntax) > usize(0)) {
+            ReferenceStatus source = expression_status(project,
+                project.frontend().child(node, usize(0)));
+            match (&in source) {
+                .invalid(cause) { return ReferenceStatus.invalid(cause); }
+                _ { }
+            }
+        }
+        return ReferenceStatus.deferred(DeferredReason.receiver_type);
+    }
     try { return project.latest_status_for(node); }
     catch ProjectReferenceError {
         return ReferenceStatus.deferred(DeferredReason.receiver_type);
@@ -1019,7 +1334,8 @@ SymbolLink enclosing_implementation(&in FrontendProject project, ScopeId scope)
 }
 
 void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
-    &inout DiagnosticBag diagnostics, NodeRef node, OccurrenceRole requested_role)
+    &inout DiagnosticBag diagnostics, NodeRef node, OccurrenceRole requested_role,
+    bool comptime_selection, bool selection_root)
     raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
         FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
     ScopeId scope = builder.project().scope_for_node(node);
@@ -1035,7 +1351,8 @@ void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
     if (kind == SyntaxKind.name_expression) {
         match (&in data) {
             .name_expression(name) {
-                resolve_name(builder, state, diagnostics, node, name, scope, requested_role);
+                resolve_name(builder, state, diagnostics, node, name, scope,
+                    requested_role, comptime_selection);
             }
             _ { }
         }
@@ -1048,84 +1365,41 @@ void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
             .generic_type(value, _) { name = value; }
             _ { }
         }
-        String(SystemAllocator) spelling = analysis_spelling(builder, node.file_id(), name);
-        if (spelling_has_dot(spelling.as_str())) {
-            SourceSpan first = path_token_span(builder, node.file_id(), name, false);
-            SourceSpan last = path_token_span(builder, node.file_id(), name, true);
-            ReferenceStatus prefix = resolve_name(builder, state, diagnostics, node,
-                first, scope, OccurrenceRole.type_use);
-            ReferenceStatus member = ReferenceStatus.deferred(
-                DeferredReason.comptime_selection);
-            match (&in prefix) {
-                .invalid { member = ReferenceStatus.invalid; }
-                .deferred(reason) { member = ReferenceStatus.deferred(reason); }
-                .resolved(symbol) {
-                    ModuleLink target = alias_target(state, symbol);
-                    match (&in target) {
-                        .none { }
-                        .present(module_id) {
-                            String(SystemAllocator) final_name = analysis_spelling(
-                                builder, node.file_id(), last);
-                            NameId final_id = builder.intern(final_name.as_str());
-                            SymbolLink declaration = module_public_symbol(
-                                builder.project(), state, module_id, final_id);
-                            match (&in declaration) {
-                                .none { member = ReferenceStatus.invalid; }
-                                .present(found) { member = ReferenceStatus.resolved(found); }
-                            }
-                        }
-                    }
+        usize cursor = builder.project().token_lower_bound(node.file_id(), name.start_offset());
+        usize limit = builder.project().token_lower_bound(node.file_id(), name.end_offset());
+        bool first = true;
+        ReferenceStatus prefix = ReferenceStatus.deferred(DeferredReason.receiver_type);
+        while (cursor < limit) {
+            SourceSpan segment = empty_source_span();
+            bool identifier = false;
+            {
+                &in Token token = builder.project().indexed_token(node.file_id(), cursor);
+                identifier = token.kind_value() == u8(1);
+                if (identifier) { segment = token.source_location(); }
+            }
+            if (identifier) {
+                if (first) {
+                    prefix = resolve_name(builder, state, diagnostics, node, segment, scope,
+                        OccurrenceRole.type_use, comptime_selection);
+                    first = false;
+                } else {
+                    prefix = resolve_member(builder, state, diagnostics, node, segment,
+                        scope, prefix, OccurrenceRole.type_use);
+                    builder.add_occurrence(node, segment, scope, OccurrenceRole.member, prefix);
                 }
             }
-            builder.add_occurrence(node, last, scope, OccurrenceRole.member, member);
-        } else {
-            resolve_name(builder, state, diagnostics, node, name, scope,
-                OccurrenceRole.type_use);
+            cursor = cursor + usize(1);
         }
     }
     if (kind == SyntaxKind.member_expression) {
         NodeRef receiver = builder.project().frontend().child(node, usize(0));
-        resolve_node(builder, state, diagnostics, receiver, OccurrenceRole.read);
+        resolve_node(builder, state, diagnostics, receiver, OccurrenceRole.read,
+            comptime_selection, false);
         match (&in data) {
             .member_expression(name_span, _) {
-                String(SystemAllocator) text = analysis_spelling(builder,
-                    node.file_id(), name_span);
-                NameId name = builder.intern(text.as_str());
-                ReferenceStatus receiver_status = latest_node_status(builder.project(), receiver);
-                ReferenceStatus status = ReferenceStatus.deferred(DeferredReason.receiver_type);
-                match (&in receiver_status) {
-                    .invalid { status = ReferenceStatus.invalid; }
-                    .deferred(reason) { status = ReferenceStatus.deferred(reason); }
-                    .resolved(receiver_symbol) {
-                        SymbolLink member = SymbolLink.none;
-                        ModuleLink alias = alias_target(state, receiver_symbol);
-                        match (&in alias) {
-                            .present(module_id) {
-                                member = module_public_symbol(builder.project(), state,
-                                    module_id, name);
-                            }
-                            .none {
-                                member = owner_member(builder.project(), receiver_symbol, name);
-                            }
-                        }
-                        match (&in member) {
-                            .present(symbol) { status = ReferenceStatus.resolved(symbol); }
-                            .none {
-                                SymbolKind owner_kind = builder.project().symbol(
-                                    receiver_symbol).symbol_kind();
-                                if (owner_kind == SymbolKind.module_alias
-                                    || owner_kind == SymbolKind.structure
-                                    || owner_kind == SymbolKind.sum_type
-                                    || owner_kind == SymbolKind.interface_type
-                                    || owner_kind == SymbolKind.view_type) {
-                                    status = ReferenceStatus.invalid;
-                                    analysis_error(builder, state, diagnostics, name_span,
-                                        "resolve.missing-member", "unknown member");
-                                }
-                            }
-                        }
-                    }
-                }
+                ReferenceStatus receiver_status = expression_status(builder.project(), receiver);
+                ReferenceStatus status = resolve_member(builder, state, diagnostics, node,
+                    name_span, scope, receiver_status, requested_role);
                 builder.add_occurrence(node, name_span, scope, OccurrenceRole.member, status);
             }
             _ { }
@@ -1144,8 +1418,23 @@ void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
                 role = child_role(syntax, field_index);
             }
             if (role == "type") {
-                resolve_node(builder, state, diagnostics, child, OccurrenceRole.type_use);
-                owner = latest_node_status(builder.project(), child);
+                resolve_node(builder, state, diagnostics, child, OccurrenceRole.type_use,
+                    comptime_selection, false);
+                owner = expression_status(builder.project(), child);
+                if (builder.project().frontend().node(child).kind()
+                    == SyntaxKind.call_expression) {
+                    NodeRef callee = builder.project().frontend().child(child, usize(0));
+                    ReferenceStatus constructor = expression_status(builder.project(), callee);
+                    match (&in constructor) {
+                        .resolved(symbol) {
+                            if (builder.project().symbol(symbol).symbol_kind()
+                                == SymbolKind.structure) {
+                                owner = ReferenceStatus.resolved(symbol);
+                            }
+                        }
+                        _ { }
+                    }
+                }
             } else {
                 SyntaxData field_data = builder.project().frontend().node(child).payload();
                 match (&in field_data) {
@@ -1153,7 +1442,7 @@ void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
                         ReferenceStatus status = ReferenceStatus.deferred(
                             DeferredReason.receiver_type);
                         match (&in owner) {
-                            .invalid { status = ReferenceStatus.invalid; }
+                            .invalid(cause) { status = ReferenceStatus.invalid(cause); }
                             .deferred(reason) { status = ReferenceStatus.deferred(reason); }
                             .resolved(symbol) {
                                 if (builder.project().symbol(symbol).symbol_kind()
@@ -1161,22 +1450,22 @@ void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
                                     String(SystemAllocator) spelling = analysis_spelling(
                                         builder, child.file_id(), name);
                                     NameId field_name = builder.intern(spelling.as_str());
-                                    SymbolLink member = owner_member(builder.project(),
-                                        symbol, field_name);
+                                    SymbolLink member = owner_member(builder.project(), state,
+                                        symbol, field_name, SymbolKind.field);
                                     match (&in member) {
                                         .none {
-                                            status = ReferenceStatus.invalid;
-                                            analysis_error(builder, state, diagnostics, name,
+                                            IssueId cause = analysis_error(builder, state, diagnostics, name,
                                                 "resolve.missing-member", "unknown struct field");
+                                            status = ReferenceStatus.invalid(cause);
                                         }
                                         .present(found) {
                                             if (builder.project().symbol(found).symbol_kind()
                                                 == SymbolKind.field) {
                                                 status = ReferenceStatus.resolved(found);
                                             } else {
-                                                status = ReferenceStatus.invalid;
-                                                analysis_error(builder, state, diagnostics, name,
+                                                IssueId cause = analysis_error(builder, state, diagnostics, name,
                                                     "resolve.missing-member", "unknown struct field");
+                                                status = ReferenceStatus.invalid(cause);
                                             }
                                         }
                                     }
@@ -1188,7 +1477,8 @@ void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
                     }
                     _ { }
                 }
-                resolve_node(builder, state, diagnostics, child, OccurrenceRole.read);
+                resolve_node(builder, state, diagnostics, child, OccurrenceRole.read,
+                    comptime_selection, false);
             }
             field_index = field_index + usize(1);
         }
@@ -1225,23 +1515,32 @@ void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
                             .source(implementation_node, _) {
                                 NodeRef target = builder.project().frontend().child(
                                     implementation_node, usize(0));
-                                ReferenceStatus target_status = latest_node_status(
+                                ReferenceStatus target_status = expression_status(
                                     builder.project(), target);
                                 match (&in target_status) {
-                                    .invalid { status = ReferenceStatus.invalid; }
+                                    .invalid(cause) { status = ReferenceStatus.invalid(cause); }
                                     .deferred(reason) { status = ReferenceStatus.deferred(reason); }
                                     .resolved(target_symbol) {
                                         String(SystemAllocator) spelling = analysis_spelling(
                                             builder, node.file_id(), name);
                                         NameId member_name = builder.intern(spelling.as_str());
-                                        SymbolLink member = owner_member(builder.project(),
-                                            target_symbol, member_name);
+                                        SymbolLink member = owner_member(builder.project(), state,
+                                            target_symbol, member_name, SymbolKind.inherent_method);
                                         match (&in member) {
-                                            .present(found) { status = ReferenceStatus.resolved(found); }
+                                            .present(found) {
+                                                if (builder.project().symbol(found).symbol_kind()
+                                                    == SymbolKind.inherent_method) {
+                                                    status = ReferenceStatus.resolved(found);
+                                                } else {
+                                                    IssueId cause = analysis_error(builder, state, diagnostics, name,
+                                                        "resolve.missing-member", "use requires an inherent method");
+                                                    status = ReferenceStatus.invalid(cause);
+                                                }
+                                            }
                                             .none {
-                                                status = ReferenceStatus.invalid;
-                                                analysis_error(builder, state, diagnostics, name,
+                                                IssueId cause = analysis_error(builder, state, diagnostics, name,
                                                     "resolve.missing-member", "unknown inherent method");
+                                                status = ReferenceStatus.invalid(cause);
                                             }
                                         }
                                     }
@@ -1268,52 +1567,262 @@ void resolve_node(&inout ProjectBuilder builder, &inout AnalysisState state,
         }
         if (kind == SyntaxKind.call_expression && child_name == "callee") {
             role = OccurrenceRole.call;
+            if (requested_role == OccurrenceRole.type_use) {
+                role = OccurrenceRole.type_use;
+            }
         } elif (kind == SyntaxKind.assignment_statement && child_name == "target") {
             role = OccurrenceRole.write;
         }
-        resolve_node(builder, state, diagnostics, child, role);
+        bool selected = comptime_selection;
+        bool child_root = false;
+        if (kind == SyntaxKind.comptime_statement && comptime_selection == false) {
+            SyntaxKind child_kind = builder.project().frontend().node(child).kind();
+            if (child_kind == SyntaxKind.if_statement || child_kind == SyntaxKind.for_statement
+                || child_kind == SyntaxKind.while_statement) {
+                selected = true;
+                child_root = true;
+            }
+        } elif (selection_root && kind == SyntaxKind.if_statement) {
+            child_root = true;
+        } elif (selection_root && kind == SyntaxKind.if_branch
+            && child_name == "condition") {
+            selected = false;
+        } elif (selection_root && kind == SyntaxKind.for_statement
+            && (child_name == "initializer" || child_name == "condition")) {
+            selected = false;
+        } elif (selection_root && kind == SyntaxKind.while_statement
+            && child_name == "condition") {
+            selected = false;
+        }
+        resolve_node(builder, state, diagnostics, child, role, selected, child_root);
         index = index + usize(1);
     }
 }
 
-void validate_analysis(&in FrontendProject project)
-    raises ProjectReferenceError, FrontendReferenceError {
+void validate_source_span(&in FrontendProject project, SourceSpan span)
+    raises ProjectReferenceError, SourceMapError {
+    &in SourceMap sources = project.frontend().source_map();
+    if (sources.contains(span.source_id()) == false
+        || span.start_offset() > span.end_offset()
+        || span.end_offset() > sources.source_len(span.source_id())) {
+        raise ProjectReferenceError { };
+    }
+}
+
+void validate_node_span(&in FrontendProject project, NodeRef node, SourceSpan span)
+    raises ProjectReferenceError, FrontendReferenceError, SourceMapError {
+    validate_source_span(project, span);
+    SourceSpan owner = project.frontend().node(node).source_span();
+    if (owner.source_id().equals(span.source_id()) == false
+        || span.start_offset() < owner.start_offset()
+        || span.end_offset() > owner.end_offset()) {
+        raise ProjectReferenceError { };
+    }
+}
+
+pub void validate_analysis(&in FrontendProject project)
+    raises ProjectReferenceError, FrontendReferenceError, SourceMapError, BoundsError {
     usize index = usize(0);
+    while (index < project.module_count()) {
+        ModuleId id = project.module_at(index);
+        &in ModuleRecord record = project.module_record(id);
+        &in ParsedFile file = project.frontend().file(record.parsed_file());
+        if (project.name(record.canonical_path())
+            != project.frontend().source_map().path(file.source_id())) {
+            raise ProjectReferenceError { };
+        }
+        match (record.module_name()) {
+            .none { }
+            .present(name) { project.name(name); }
+        }
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < project.import_count()) {
+        &in ImportRecord edge = project.import_edge(index);
+        &in ModuleRecord owner = project.module_record(edge.importing_module());
+        NodeRef node = edge.syntax_node();
+        if (node.file_id().equals(owner.parsed_file()) == false) {
+            raise ProjectReferenceError { };
+        }
+        validate_node_span(project, node, project.frontend().node(node).source_span());
+        match (edge.load_state()) {
+            .pending { raise ProjectReferenceError { }; }
+            .resolved {
+                match (edge.imported_module()) {
+                    .none { raise ProjectReferenceError { }; }
+                    .present(id) { project.module_record(id); }
+                }
+                match (edge.failure_cause()) {
+                    .none { }
+                    .present(_) { raise ProjectReferenceError { }; }
+                }
+            }
+            .invalid {
+                match (edge.failure_cause()) {
+                    .none { raise ProjectReferenceError { }; }
+                    .present(cause) { project.issue(cause); }
+                }
+            }
+        }
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < project.scope_count()) {
+        ScopeId id = project.scope_at(index);
+        &in ScopeRecord record = project.scope(id);
+        match (record.parent_scope()) {
+            .none { }
+            .present(parent) {
+                if (project.scope_index(parent) >= index) { raise ProjectReferenceError { }; }
+                match (project.scope(parent).module_owner()) {
+                    .none { }
+                    .present(parent_module) {
+                        match (record.module_owner()) {
+                            .none { raise ProjectReferenceError { }; }
+                            .present(child_module) {
+                                if (child_module.equals(parent_module) == false) {
+                                    raise ProjectReferenceError { };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match (record.module_owner()) {
+            .none { }
+            .present(module_id) { project.module_record(module_id); }
+        }
+        match (record.symbol_owner()) {
+            .none { }
+            .present(symbol) { project.symbol(symbol); }
+        }
+        match (record.source_location()) {
+            .builtin { }
+            .module_file(file) { project.frontend().file(file); }
+            .source(node) { project.frontend().node(node); }
+        }
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < project.symbol_count()) {
+        SymbolId id = project.symbol_at(index);
+        &in SymbolRecord symbol = project.symbol(id);
+        project.name(symbol.symbol_name());
+        ScopeId scope = symbol.lexical_scope();
+        project.scope(scope);
+        match (symbol.symbol_owner()) {
+            .none { }
+            .present(owner) {
+                if (project.symbol_index(owner) >= index) { raise ProjectReferenceError { }; }
+            }
+        }
+        match (symbol.declaration_origin()) {
+            .builtin { }
+            .source(node, span) {
+                validate_node_span(project, node, span);
+                ModuleLink module_link = module_for_scope(project, scope);
+                match (&in module_link) {
+                    .none { raise ProjectReferenceError { }; }
+                    .present(module_id) {
+                        if (node.file_id().equals(
+                            project.module_record(module_id).parsed_file()) == false) {
+                            raise ProjectReferenceError { };
+                        }
+                    }
+                }
+            }
+        }
+        if (symbol.is_poisoned()) {
+            match (symbol.poison_cause()) {
+                .none { raise ProjectReferenceError { }; }
+                .present(cause) { project.issue(cause); }
+            }
+        }
+        index = index + usize(1);
+    }
+    index = usize(0);
     while (index < project.declaration_count()) {
         &in DeclarationSymbol declaration = project.declaration(index);
-        project.frontend().node(declaration.syntax_node());
-        project.symbol(declaration.declaration_symbol());
+        if (project.declaration_symbol(declaration.syntax_node()).equals(
+            declaration.declaration_symbol()) == false) {
+            raise ProjectReferenceError { };
+        }
         index = index + usize(1);
     }
     index = usize(0);
     while (index < project.node_scope_count()) {
         &in NodeScope binding = project.node_scope(index);
-        project.frontend().node(binding.syntax_node());
-        project.scope(binding.lexical_scope());
+        if (project.scope_for_node(binding.syntax_node()).equals(
+            binding.lexical_scope()) == false) {
+            raise ProjectReferenceError { };
+        }
         index = index + usize(1);
     }
+    usize deferred = usize(0);
     index = usize(0);
     while (index < project.occurrence_count()) {
         &in ReferenceOccurrence occurrence = project.occurrence(index);
-        project.frontend().node(occurrence.syntax_node());
+        NodeRef node = occurrence.syntax_node();
+        SourceSpan span = occurrence.name_span();
+        validate_node_span(project, node, span);
         project.scope(occurrence.lexical_scope());
+        project.occurrence_for(node, occurrence.occurrence_role(), span);
+        usize previous = project.previous_occurrence(index);
+        if (previous > index) { raise ProjectReferenceError { }; }
         match (occurrence.binding()) {
             .resolved(symbol) { project.symbol(symbol); }
-            .deferred(_) { }
-            .invalid { }
+            .deferred(_) { deferred = deferred + usize(1); }
+            .invalid(cause) { project.issue(cause); }
+        }
+        index = index + usize(1);
+    }
+    if (deferred != project.deferred_count()) { raise ProjectReferenceError { }; }
+    index = usize(0);
+    while (index < project.issue_count()) {
+        &in Diagnostic diagnostic = project.issue(project.issue_at(index)).detail();
+        match (diagnostic.source_origin()) {
+            .none { }
+            .source(span) { validate_source_span(project, span); }
+        }
+        usize label_index = usize(0);
+        while (label_index < diagnostic.label_count()) {
+            validate_source_span(project, diagnostic.label_span(label_index));
+            label_index = label_index + usize(1);
+        }
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < project.import_binding_count()) {
+        &in ImportBindingRecord binding = project.import_binding(index);
+        project.scope(binding.lexical_scope());
+        project.name(binding.binding_name());
+        match (binding.imported_symbol()) {
+            .none { }
+            .present(symbol) { project.symbol(symbol); }
+        }
+        match (binding.imported_module()) {
+            .none { }
+            .present(module_id) { project.module_record(module_id); }
+        }
+        if (binding.is_poisoned()) {
+            match (binding.failure_cause()) {
+                .none { raise ProjectReferenceError { }; }
+                .present(cause) { project.issue(cause); }
+            }
         }
         index = index + usize(1);
     }
 }
 
-pub FrontendProject analyze_project(str entry, &in ProjectOptions options,
+pub AnalysisState index_project(&inout ProjectBuilder builder,
     &inout DiagnosticBag diagnostics)
     raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
-        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
-        ProjectReferenceError, NameReferenceError, Utf8Error {
-    ProjectBuilder builder = project_builder();
-    load_module_graph_into(builder, entry, options, diagnostics);
-    AnalysisState state = analysis_state(options.maximum_diagnostics());
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    if (builder.project().scope_count() != usize(0)) { raise ProjectReferenceError { }; }
+    AnalysisState state = analysis_state();
+    state.project_identity = builder.project().identity_value();
     ScopeId builtin_scope = builder.add_scope(ScopeLink.none, ModuleLink.none, SymbolLink.none);
     add_builtins(builder, state, builtin_scope);
 
@@ -1345,8 +1854,79 @@ pub FrontendProject analyze_project(str entry, &in ProjectOptions options,
         }
         module_index = module_index + usize(1);
     }
+    index_member_table(state, builder.project());
+    state.module_count = builder.project().module_count();
+    state.import_count = builder.project().import_count();
+    state.symbol_count = builder.project().symbol_count();
+    state.scope_count = builder.project().scope_count();
+    state.indexed = true;
+    return state;
+}
+
+void validate_analysis_indexes(&in FrontendProject project, &in AnalysisState state)
+    raises BoundsError, ProjectReferenceError {
+    if (state.buckets.len() == usize(0) || state.member_buckets.len() == usize(0)) {
+        raise ProjectReferenceError { };
+    }
+    usize index = usize(0);
+    while (index < state.buckets.len()) {
+        usize occupied = state.buckets.get(index);
+        if (occupied != usize(0)) {
+            if (occupied > state.bindings.len()) { raise ProjectReferenceError { }; }
+            &in AnalysisBinding binding = state.bindings.get(occupied - usize(1));
+            if (binding_bucket(project, state.bindings, state.buckets,
+                binding.scope, binding.name, binding.namespace) != index) {
+                raise ProjectReferenceError { };
+            }
+            project.scope(binding.scope);
+            project.name(binding.name);
+            project.symbol(binding.symbol);
+            if (binding.import_record != usize(0)) {
+                &in ImportBindingRecord record =
+                    project.import_binding(binding.import_record - usize(1));
+                if (record.lexical_scope().equals(binding.scope) == false
+                    || record.binding_name().equals(binding.name) == false) {
+                    raise ProjectReferenceError { };
+                }
+            }
+        }
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < state.member_buckets.len()) {
+        usize occupied = state.member_buckets.get(index);
+        if (occupied != usize(0)) {
+            if (occupied > state.members.len()) { raise ProjectReferenceError { }; }
+            &in AnalysisMember member = state.members.get(occupied - usize(1));
+            if (member_bucket(project, state.members, state.member_buckets,
+                member.owner, member.name, member.category) != index) {
+                raise ProjectReferenceError { };
+            }
+            project.symbol(member.owner);
+            project.name(member.name);
+            &in SymbolRecord record = project.symbol(member.symbol);
+            if (record.symbol_name().equals(member.name) == false
+                || member_category(record.symbol_kind()) != member.category) {
+                raise ProjectReferenceError { };
+            }
+        }
+        index = index + usize(1);
+    }
+}
+
+pub void resolve_project(&inout ProjectBuilder builder, move AnalysisState state,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    if (state.indexed == false || state.project_identity != builder.project().identity_value()
+        || state.module_count != builder.project().module_count()
+        || state.import_count != builder.project().import_count()
+        || state.symbol_count != builder.project().symbol_count()
+        || state.scope_count != builder.project().scope_count()) {
+        raise ProjectReferenceError { };
+    }
     bind_imports(builder, state, diagnostics);
-    module_index = usize(0);
+    usize module_index = usize(0);
     while (module_index < builder.project().module_count()) {
         ModuleId module_id = builder.project().module_at(module_index);
         ParsedFileId file = builder.project().module_record(module_id).parsed_file();
@@ -1355,12 +1935,25 @@ pub FrontendProject analyze_project(str entry, &in ProjectOptions options,
             NodeRef root = builder.project().frontend().root(file, root_index);
             SyntaxKind kind = builder.project().frontend().node(root).kind();
             if (kind != SyntaxKind.module_declaration && kind != SyntaxKind.import_declaration) {
-                resolve_node(builder, state, diagnostics, root, OccurrenceRole.read);
+                resolve_node(builder, state, diagnostics, root, OccurrenceRole.read,
+                    false, false);
             }
             root_index = root_index + usize(1);
         }
         module_index = module_index + usize(1);
     }
+    validate_analysis_indexes(builder.project(), state);
+}
+
+pub FrontendProject analyze_project(str entry, &in ProjectOptions options,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
+        ProjectReferenceError, NameReferenceError, Utf8Error {
+    ProjectBuilder builder = project_builder();
+    load_module_graph_into(builder, entry, options, diagnostics);
+    AnalysisState state = index_project(builder, diagnostics);
+    resolve_project(builder, state, diagnostics);
     validate_analysis(builder.project());
     return finish_project(builder);
 }

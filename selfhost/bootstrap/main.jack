@@ -240,11 +240,17 @@ i32 main(&in str[] arguments) {
                 if (arguments[index] == "syntax") { syntax_mode = true; }
                 elif (arguments[index] == "modules") { project_mode = i32(2); }
                 elif (arguments[index] == "symbols") { project_mode = i32(3); }
+                elif (arguments[index] == "types") { project_mode = i32(5); }
                 elif (arguments[index] != "tokens") { valid = false; }
             }
-        } elif (arguments[index] == "--check-names") {
+        } elif (arguments[index] == "--check-names"
+            || arguments[index] == "--check-types") {
             if (check_names || dump_set) { valid = false; }
-            else { check_names = true; project_mode = i32(1); }
+            else {
+                check_names = true;
+                if (arguments[index] == "--check-types") { project_mode = i32(4); }
+                else { project_mode = i32(1); }
+            }
         } elif (arguments[index] == "--module-root"
             || arguments[index] == "--stub") {
             project_options_seen = true;
@@ -266,7 +272,7 @@ i32 main(&in str[] arguments) {
     if (check_names && dump_set) { valid = false; }
     if (project_options_seen && project_mode == i32(0)) { valid = false; }
     if (valid == false || path_set == false) {
-        try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] [--check-names|--dump tokens|syntax|modules|symbols] [--module-root DIR] [--stub REQUESTED=REPLACEMENT] <source>\n"); }
+        try { write_stderr("usage: jack-bootstrap [--diagnostic-format human|stable] [--check-names|--check-types|--dump tokens|syntax|modules|symbols|types] [--module-root DIR] [--stub REQUESTED=REPLACEMENT] <source>\n"); }
         catch IoError { }
         return 2;
     }

@@ -174,8 +174,10 @@ unchanged token and syntax dump modes:
 
 ```sh
 ./jack-bootstrap --check-names --module-root selfhost --module-root jack selfhost/bootstrap/main.jack
+./jack-bootstrap --check-types --module-root selfhost --module-root jack selfhost/bootstrap/main.jack
 ./jack-bootstrap --dump modules --module-root selfhost --module-root jack selfhost/bootstrap/main.jack
 ./jack-bootstrap --dump symbols --module-root selfhost --module-root jack selfhost/bootstrap/main.jack
+./jack-bootstrap --dump types --module-root selfhost --module-root jack selfhost/bootstrap/main.jack
 ```
 
 `--module-root` and `--stub REQUESTED=REPLACEMENT` are repeatable in project
@@ -184,12 +186,41 @@ It includes escaped `issue ID CODE PATH START END MESSAGE` records; invalid
 `reference` records end with the corresponding issue ID. Locationless issues
 use `-` for the path and zero offsets.
 `issue_label ISSUE_ID LABEL_INDEX PATH START END` records retain related locations.
-Exit status 0 means no authoritative module or name errors; it does not mean
-the program type-checks or compiles. Status 1 means diagnosed errors, and 2
-means invalid invocation. `--diagnostic-format stable` is available for
-machine-readable diagnostics. Type checking, comptime evaluation, interface
-coherence, specialization, ownership validation, and HIR lowering remain stage-0
-or later self-hosting work.
+Exit status 0 from `--check-names` means no authoritative module or name errors;
+it does not mean the program type-checks or compiles. The initial `--check-types`
+pass interns canonical primitive and nominal identities, records generic
+arguments and callable signatures, and checks concrete field access,
+initializers for variables, fields, and constants, direct call arity and
+arguments, numeric literal ranges in initializers/calls/assignments/returns,
+assignment and return compatibility, boolean conditions, basic operators,
+integer indexes, and straight-line/branch return paths. Type and callable identifiers are not
+misreported as deferred value expressions. A concrete typed function can
+therefore return status 0. Status 3 means diagnosed-error-free work is genuinely
+pending, such as generic/computed dependencies, unresolved members and match
+payloads, inferred error sets, comptime execution, or unsupported expression
+forms. Comptime statements are recorded as pending and are never executed.
+`--dump types` emits deterministic type, signature, source-backed occurrence,
+pending-obligation, and check-error records. Occurrences distinguish values,
+places, type names, and callables. Each pending record includes its check kind,
+source range, dependency range, and deferral reason. A deferred expression is
+represented by one deduplicated obligation; completeness is computed from that
+obligation table rather than separately recounting deferred occurrences.
+Stable diagnostics include deferred-work counts grouped by reason.
+
+This remains a partial type checker, not proof of compilation validity. Concrete
+by-value recursion through struct fields, union payloads, and fixed arrays is
+rejected; pointer, borrow, and slice edges stop layout traversal. Layouts that
+depend on generic substitution remain pending. Nullable pointer returns that
+may depend on a branch refinement are also pending until flow-sensitive
+refinement is implemented. Field access works for known struct receivers;
+method calls and other receiver-dependent members still need fuller resolution.
+Constructor resolution, interface coherence, comprehensive match checking,
+unsafe access, complete error propagation, and other expression forms remain
+unfinished.
+Ownership dataflow, lifetime/alias validation, comptime execution,
+specialization, and HIR lowering are later passes. Status 1 means diagnosed
+errors, and 2 means invalid invocation. `--diagnostic-format stable` is
+available for machine-readable diagnostics.
 
 ## Verification And Measurements
 
@@ -226,7 +257,7 @@ Deferred occurrences included 4,399 receiver-dependent members, 16
 computed-type members, and 1,459 pattern variants. The corpus contains no
 generic-type or comptime-selection deferrals; focused fixtures verify both.
 These measurements are informational, not frozen counts or proof of type
-correctness. `--check-names` does not execute comptime or perform type checking.
+correctness. Neither `--check-names` nor `--check-types` executes comptime code.
 
 See [the frontend benchmark](../benchmarks/frontend/README.md) for parser-only
 throughput, node layout, retained storage, and scratch high-water measurements.

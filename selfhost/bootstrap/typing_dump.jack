@@ -1,0 +1,168 @@
+module bootstrap.typing_dump;
+
+import bootstrap.diagnostics;
+import bootstrap.frontend;
+import bootstrap.project;
+import bootstrap.source;
+import bootstrap.syntax;
+import bootstrap.types;
+import std.memory;
+import std.string;
+
+str shape_name(TypeShape shape) {
+    return match (&in shape) {
+        .primitive(_) => "primitive",
+        .nominal(_, _, _) => "nominal",
+        .parameter(_) => "parameter",
+        .contextual_self(_) => "self",
+        .computed(_) => "computed",
+        .array(_, _) => "array",
+        .symbolic_array(_, _) => "symbolic_array",
+        .slice(_) => "slice",
+        .borrow(_, _) => "borrow",
+        .pointer(_, _, _) => "pointer",
+    };
+}
+
+str pending_name(TypeDeferred reason) {
+    return match (&in reason) {
+        .computed_type => "computed_type",
+        .comptime_value => "comptime_value",
+        .generic_body => "generic_body",
+        .inferred_errors => "inferred_errors",
+        .interface_obligation => "interface_obligation",
+        .dependent_member => "dependent_member",
+        .dependent_match => "dependent_match",
+        .dependent_expression => "dependent_expression",
+    };
+}
+
+void number(&inout StringBuilder(SystemAllocator) output, usize value)
+    raises CapacityError, LayoutError, AllocationError {
+    output.append("\t");
+    output.append_usize(value);
+}
+
+void field(&inout StringBuilder(SystemAllocator) output, str value)
+    raises CapacityError, LayoutError, AllocationError {
+    output.append("\t");
+    append_escaped(output, value);
+}
+
+str type_result_name(TypeResult result) {
+    return match (&in result) {
+        .known(_) => "known", .deferred(_) => "deferred", .invalid(_) => "invalid",
+    };
+}
+
+str check_kind_name(TypeCheckKind kind) {
+    return match (&in kind) {
+        .declaration => "declaration",
+        .expression => "expression",
+        .initializer => "initializer",
+        .assignment => "assignment",
+        .call => "call",
+        .return_value => "return",
+        .condition => "condition",
+        .operator => "operator",
+        .match_check => "match",
+        .layout => "layout",
+        .flow => "flow",
+        .copyability => "copyability",
+    };
+}
+
+str category_name(TypeCategory category) {
+    return match (&in category) {
+        .value => "value",
+        .place => "place",
+        .type_name => "type",
+        .callable => "callable",
+    };
+}
+
+pub String(SystemAllocator) dump_types(&in TypedProject typed)
+    raises CapacityError, LayoutError, AllocationError, ProjectReferenceError,
+        FrontendReferenceError, SourceMapError, Utf8Error {
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) output(allocator);
+    usize index = usize(0);
+    while (index < typed.type_count()) {
+        TypeId id = typed.type_at(index);
+        TypeShape shape = typed.type_record(id).type_shape();
+        output.append("type");
+        number(output, index);
+        field(output, shape_name(shape));
+        output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < typed.signature_count()) {
+        SignatureId id = typed.signature_at(index);
+        &in SignatureRecord signature = typed.signature(id);
+        output.append("signature");
+        number(output, index);
+        number(output, typed.project().symbol_index(signature.declaration()));
+        number(output, signature.parameter_count());
+        field(output, type_result_name(signature.result_type()));
+        number(output, signature.raises_count());
+        if (signature.raises_pending()) { field(output, "inferred"); }
+        else { field(output, "explicit"); }
+        output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < typed.occurrence_count()) {
+        &in TypedOccurrence occurrence = typed.occurrence(index);
+        SourceSpan span = typed.project().frontend().node(
+            occurrence.syntax_node()).source_span();
+        output.append("typed");
+        number(output, index);
+        field(output, typed.project().frontend().source_map().path(
+            typed.project().frontend().file(
+                occurrence.syntax_node().file_id()).source_id()));
+        number(output, span.start_offset());
+        number(output, span.end_offset());
+        field(output, type_result_name(occurrence.type_result()));
+        field(output, category_name(occurrence.expression_category()));
+        if (occurrence.is_writable()) { field(output, "writable"); }
+        else { field(output, "readonly"); }
+        output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < typed.pending_count()) {
+        PendingType pending = typed.pending_at(index);
+        SourceSpan span = typed.project().frontend().node(
+            pending.syntax_node()).source_span();
+        output.append("pending");
+        field(output, typed.project().frontend().source_map().path(
+            typed.project().frontend().file(pending.syntax_node().file_id()).source_id()));
+        number(output, span.start_offset());
+        number(output, span.end_offset());
+        field(output, pending_name(pending.deferred_reason()));
+        field(output, check_kind_name(pending.check_kind()));
+        SourceSpan dependency_span = typed.project().frontend().node(
+            pending.depends_on()).source_span();
+        number(output, dependency_span.start_offset());
+        number(output, dependency_span.end_offset());
+        output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < typed.failure_count()) {
+        &in TypeCheckFailure failure = typed.failure(index);
+        SourceSpan span = typed.project().frontend().node(
+            failure.checked_node()).source_span();
+        output.append("check-error");
+        number(output, typed.project().issue_index(failure.issue_cause()));
+        field(output, typed.project().frontend().source_map().path(
+            typed.project().frontend().file(failure.checked_node().file_id()).source_id()));
+        number(output, span.start_offset());
+        number(output, span.end_offset());
+        field(output, check_kind_name(failure.check_kind()));
+        output.append("\n");
+        index = index + usize(1);
+    }
+    return finish_string(SystemAllocator, output);
+}

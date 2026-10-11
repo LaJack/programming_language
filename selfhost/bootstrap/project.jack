@@ -39,6 +39,7 @@ pub struct ModuleId {
 pub struct SymbolId {
     usize project;
     usize index;
+    usize project_identity(&in self) { return self.project; }
     bool equals(&in self, SymbolId other) {
         return self.project == other.project && self.index == other.index;
     }

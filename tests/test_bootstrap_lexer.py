@@ -215,7 +215,7 @@ i32 later = 2;
             status, stdout, stderr = self.run_native(backend)
             self.assertEqual(
                 (2, '', 'usage: jack-bootstrap [--diagnostic-format human|stable] '
-                 '[--check-names|--dump tokens|syntax|modules|symbols] '
+                 '[--check-names|--check-types|--dump tokens|syntax|modules|symbols|types] '
                  '[--module-root DIR] [--stub REQUESTED=REPLACEMENT] <source>\n'),
                 (status, stdout, stderr),
             )

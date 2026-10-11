@@ -9,6 +9,9 @@ import bootstrap.project;
 import bootstrap.project_dump;
 import bootstrap.source;
 import bootstrap.syntax;
+import bootstrap.typing;
+import bootstrap.types;
+import bootstrap.typing_dump;
 import std.collections.arena;
 import std.collections.vector;
 import std.io;
@@ -43,6 +46,26 @@ bool add_stub_option(&inout ProjectOptions options, str value)
     return true;
 }
 
+void append_deferred_summary(&inout StringBuilder(SystemAllocator) output,
+    &in TypedProject typed, TypeDeferred reason, bool stable)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    usize count = typed.deferred_count(reason);
+    if (count == usize(0)) { return; }
+    if (stable) {
+        output.append("deferred\t");
+        output.append(type_deferred_name(reason));
+        output.append("\t");
+        output.append_usize(count);
+        output.append("\n");
+    } else {
+        output.append("note: ");
+        output.append_usize(count);
+        output.append(" checks deferred for ");
+        output.append(type_deferred_name(reason));
+        output.append("\n");
+    }
+}
+
 pub i32 run_project_mode(&in str[] arguments, str entry,
     DiagnosticFormat format, i32 mode)
     raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
@@ -57,13 +80,45 @@ pub i32 run_project_mode(&in str[] arguments, str entry,
         } elif (arguments[index] == "--stub") {
             index = index + usize(1);
             if (add_stub_option(options, arguments[index]) == false) {
-                write_stderr("usage: jack-bootstrap [--check-names|--dump modules|symbols] [--module-root DIR] [--stub REQUESTED=REPLACEMENT] <source>\n");
+                write_stderr("usage: jack-bootstrap [--check-names|--check-types|--dump modules|symbols|types] [--module-root DIR] [--stub REQUESTED=REPLACEMENT] <source>\n");
                 return 2;
             }
         }
         index = index + usize(1);
     }
     DiagnosticBag diagnostics(options.maximum_diagnostics());
+    if (mode == i32(4) || mode == i32(5)) {
+        TypedProject typed = analyze_typed_project(entry, options, diagnostics);
+        if (mode == i32(5)) {
+            String(SystemAllocator) dump = dump_types(typed);
+            write_stdout(dump.as_str());
+        }
+        if (diagnostics.is_empty() == false || diagnostics.omitted() > usize(0)) {
+            &in SourceMap sources = typed.project().frontend().source_map();
+            String(SystemAllocator) rendered =
+                render_diagnostics(sources, diagnostics, format);
+            write_stderr(rendered.as_str());
+        }
+        TypeStatus status = typed.status();
+        if (typed.pending_count() > usize(0)) {
+            SystemAllocator allocator;
+            StringBuilder(SystemAllocator) summary(allocator);
+            bool stable = format == DiagnosticFormat.stable;
+            append_deferred_summary(summary, typed, TypeDeferred.computed_type, stable);
+            append_deferred_summary(summary, typed, TypeDeferred.comptime_value, stable);
+            append_deferred_summary(summary, typed, TypeDeferred.generic_body, stable);
+            append_deferred_summary(summary, typed, TypeDeferred.inferred_errors, stable);
+            append_deferred_summary(summary, typed, TypeDeferred.interface_obligation, stable);
+            append_deferred_summary(summary, typed, TypeDeferred.dependent_member, stable);
+            append_deferred_summary(summary, typed, TypeDeferred.dependent_match, stable);
+            append_deferred_summary(summary, typed, TypeDeferred.dependent_expression, stable);
+            String(SystemAllocator) text = finish_string(SystemAllocator, summary);
+            write_stderr(text.as_str());
+        }
+        if (status == TypeStatus.invalid) { return 1; }
+        if (status == TypeStatus.incomplete) { return 3; }
+        return 0;
+    }
     FrontendProject project = analyze_project(entry, options, diagnostics);
     if (mode == i32(2)) {
         String(SystemAllocator) output = dump_modules(project);

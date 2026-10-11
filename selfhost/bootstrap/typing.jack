@@ -1,0 +1,2240 @@
+module bootstrap.typing;
+
+import bootstrap.analysis;
+import bootstrap.diagnostics;
+import bootstrap.frontend;
+import bootstrap.modules;
+import bootstrap.names;
+import bootstrap.project;
+import bootstrap.source;
+import bootstrap.syntax;
+import bootstrap.types;
+import std.collections.arena;
+import std.collections.vector;
+import std.memory;
+import std.string;
+
+IssueId typing_error(&inout ProjectBuilder builder, &inout DiagnosticBag diagnostics,
+    SourceSpan span, str code, str message)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    Diagnostic diagnostic = source_diagnostic(DiagnosticSeverity.error, code, span, message);
+    return builder.report_issue(diagnostics, diagnostic);
+}
+
+TypeResult type_failure(&inout ProjectBuilder builder, &inout DiagnosticBag diagnostics,
+    SourceSpan span, str code, str message)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    return TypeResult.invalid(typing_error(builder, diagnostics, span, code, message));
+}
+
+NodeRef linked_child(&in FrontendProject project, NodeRef owner, NodeLink link)
+    raises ProjectReferenceError, FrontendReferenceError {
+    match (&in link) {
+        .present(handle) {
+            return project.frontend().reference(owner.file_id(), handle);
+        }
+        .absent { raise ProjectReferenceError { }; }
+    }
+}
+
+TypeAccess access_for(&in FrontendProject project, NodeRef node, SourceSpan mode)
+    raises FrontendReferenceError, BoundsError, SourceMapError {
+    &in ParsedFile file = project.frontend().file(node.file_id());
+    usize index = usize(0);
+    while (index < file.token_count()) {
+        SourceSpan token = file.token(index).source_location();
+        if (token.start_offset() >= mode.start_offset()
+            && token.end_offset() <= mode.end_offset()) {
+            if (project.frontend().source_map().text_equals(token, "in")) {
+                return TypeAccess.read;
+            }
+            if (project.frontend().source_map().text_equals(token, "out")) {
+                return TypeAccess.write;
+            }
+            if (project.frontend().source_map().text_equals(token, "inout")) {
+                return TypeAccess.read_write;
+            }
+        }
+        index = index + usize(1);
+    }
+    return TypeAccess.read_write;
+}
+
+bool is_type_syntax(SyntaxKind kind) {
+    return kind == SyntaxKind.named_type || kind == SyntaxKind.generic_type
+        || kind == SyntaxKind.array_type || kind == SyntaxKind.slice_type
+        || kind == SyntaxKind.borrow_type || kind == SyntaxKind.raw_pointer_type
+        || kind == SyntaxKind.nullable_pointer_type || kind == SyntaxKind.invalid_type;
+}
+
+TypeResult finish_type(&inout TypeTables table, NodeRef node, TypeResult result)
+    raises CapacityError, LayoutError, AllocationError, BoundsError {
+    table.record_category(node, result, TypeCategory.type_name, false);
+    return result;
+}
+
+TypeResult symbol_type(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, SymbolId symbol)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error {
+    SymbolKind kind;
+    NameId name;
+    SymbolOrigin origin;
+    {
+        &in SymbolRecord record = builder.project().symbol(symbol);
+        kind = record.symbol_kind();
+        name = record.symbol_name();
+        origin = record.declaration_origin();
+    }
+    if (kind == SymbolKind.builtin_type) {
+        return TypeResult.known(table.intern(TypeShape.primitive(name)));
+    }
+    if (kind == SymbolKind.type_parameter) {
+        return TypeResult.known(table.intern(TypeShape.parameter(symbol)));
+    }
+    if (kind == SymbolKind.self_type) {
+        SymbolLink owner = builder.project().symbol(symbol).symbol_owner();
+        match (&in owner) {
+            .present(type_symbol) {
+                SymbolKind owner_kind = builder.project().symbol(type_symbol).symbol_kind();
+                if (owner_kind == SymbolKind.structure || owner_kind == SymbolKind.sum_type) {
+                    if (generic_arity(builder.project(), type_symbol) == usize(0)) {
+                        return TypeResult.known(table.intern(TypeShape.nominal(
+                            type_symbol, table.argument_count(), usize(0))));
+                    }
+                }
+            }
+            .none { }
+        }
+        return TypeResult.known(table.intern(TypeShape.contextual_self(symbol)));
+    }
+    if (kind == SymbolKind.computed_type) {
+        match (&in origin) {
+            .source(declaration, _) {
+                SyntaxData payload = builder.project().frontend().node(declaration).payload();
+                match (&in payload) {
+                    .comptime_type_declaration(_, _, initializer) {
+                        match (&in initializer) {
+                            .present(handle) {
+                                NodeRef alias = builder.project().frontend().reference(
+                                    declaration.file_id(), handle);
+                                if (is_type_syntax(builder.project().frontend().node(alias).kind())) {
+                                    return resolve_type(builder, table, diagnostics, alias);
+                                }
+                            }
+                            .absent { }
+                        }
+                    }
+                    _ { }
+                }
+            }
+            .builtin { }
+        }
+        table.add_obligation(node, TypeCheckKind.declaration,
+            TypeDeferred.computed_type, node);
+        return TypeResult.known(table.intern(TypeShape.computed(symbol)));
+    }
+    if (kind == SymbolKind.structure || kind == SymbolKind.sum_type
+        || kind == SymbolKind.view_type || kind == SymbolKind.interface_type) {
+        return TypeResult.known(table.intern(TypeShape.nominal(
+            symbol, table.argument_count(), usize(0))));
+    }
+    return type_failure(builder, diagnostics,
+        builder.project().frontend().node(node).source_span(),
+        "type.not-a-type", "this name does not denote a type");
+}
+
+TypeResult resolve_named(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error {
+    ReferenceStatus status = builder.project().latest_status_for(node);
+    return match (&in status) {
+        .resolved(symbol) => symbol_type(builder, table, diagnostics, node, symbol),
+        .deferred(_) => TypeResult.deferred(TypeDeferred.comptime_value),
+        .invalid(cause) => TypeResult.invalid(cause),
+    };
+}
+
+usize decimal_extent(&in FrontendProject project, SourceSpan span)
+    raises SourceMapError, ParseIntError, CapacityError, LayoutError, AllocationError,
+        Utf8Error {
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) builder(allocator);
+    usize offset = span.start_offset();
+    while (offset < span.end_offset()) {
+        builder.append_byte(project.frontend().source_map().byte_at(span.source_id(), offset));
+        offset = offset + usize(1);
+    }
+    String(SystemAllocator) text = finish_string(SystemAllocator, builder);
+    return parse_usize(text.as_str());
+}
+
+TypeResult resolve_type(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    TypeResult result = match (&in data) {
+        .named_type(_) => resolve_named(builder, table, diagnostics, node),
+        .generic_type(_, arguments) => resolve_generic(
+            builder, table, diagnostics, node, arguments),
+        .array_type(element, extent) => resolve_array(
+            builder, table, diagnostics, node, element, extent),
+        .slice_type(element) => wrap_type(builder, table, diagnostics, node,
+            element, usize(1), TypeAccess.read),
+        .borrow_type(mode, element) => wrap_type(builder, table, diagnostics, node,
+            element, usize(2), access_for(builder.project(), node, mode)),
+        .raw_pointer_type(mode, element) => wrap_type(builder, table, diagnostics, node,
+            element, usize(3), access_for(builder.project(), node, mode)),
+        .nullable_pointer_type(mode, element) => wrap_type(builder, table, diagnostics, node,
+            element, usize(4), access_for(builder.project(), node, mode)),
+        .invalid_type => TypeResult.deferred(TypeDeferred.dependent_expression),
+        _ => type_failure(builder, diagnostics,
+            builder.project().frontend().node(node).source_span(),
+            "type.invalid-syntax", "expected a type expression"),
+    };
+    return finish_type(table, node, result);
+}
+
+TypeResult wrap_type(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, NodeLink element,
+    usize wrapper, TypeAccess access)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error {
+    match (&in element) {
+        .absent { return TypeResult.deferred(TypeDeferred.generic_body); }
+        .present(_) { }
+    }
+    TypeResult inner = resolve_type(builder, table, diagnostics,
+        linked_child(builder.project(), node, element));
+    match (&in inner) {
+        .known(value) {
+            if (wrapper == usize(1)) {
+                return TypeResult.known(table.intern(TypeShape.slice(value)));
+            }
+            if (wrapper == usize(2)) {
+                return TypeResult.known(table.intern(TypeShape.borrow(value, access)));
+            }
+            return TypeResult.known(table.intern(TypeShape.pointer(
+                value, access, wrapper == usize(4))));
+        }
+        .deferred(reason) { return TypeResult.deferred(reason); }
+        .invalid(cause) { return TypeResult.invalid(cause); }
+    }
+}
+
+TypeResult resolve_parameter_type(&inout ProjectBuilder builder,
+    &inout TypeTables table, &inout DiagnosticBag diagnostics, NodeRef node,
+    NodeLink declared_type)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error {
+    SymbolId parameter = builder.project().declaration_symbol(node);
+    NameId name = builder.project().symbol(parameter).symbol_name();
+    if (builder.project().name(name) == "self") {
+        SymbolLink function_owner = builder.project().symbol(parameter).symbol_owner();
+        match (&in function_owner) {
+            .present(function_symbol) {
+                SymbolLink type_owner = builder.project().symbol(function_symbol).symbol_owner();
+                match (&in type_owner) {
+                    .present(owner) {
+                        SymbolKind kind = builder.project().symbol(owner).symbol_kind();
+                        if ((kind == SymbolKind.structure || kind == SymbolKind.sum_type)
+                            && generic_arity(builder.project(), owner) == usize(0)) {
+                            TypeId type_id = table.intern(TypeShape.nominal(
+                                owner, table.argument_count(), usize(0)));
+                            match (&in declared_type) {
+                                .present(_) {
+                                    NodeRef type_node = linked_child(builder.project(), node, declared_type);
+                                    SyntaxData payload = builder.project().frontend().node(type_node).payload();
+                                    match (&in payload) {
+                                        .borrow_type(mode, _) {
+                                            TypeResult result = TypeResult.known(table.intern(
+                                                TypeShape.borrow(type_id,
+                                                    access_for(builder.project(), type_node, mode))));
+                                            finish_type(table, type_node, result);
+                                            return result;
+                                        }
+                                        _ { }
+                                    }
+                                }
+                                .absent { return TypeResult.known(type_id); }
+                            }
+                        }
+                    }
+                    .none { }
+                }
+            }
+            .none { }
+        }
+    }
+    match (&in declared_type) {
+        .present(_) {
+            return resolve_type(builder, table, diagnostics,
+                linked_child(builder.project(), node, declared_type));
+        }
+        .absent { return TypeResult.deferred(TypeDeferred.generic_body); }
+    }
+}
+
+ReferenceStatus callable_status(&inout ProjectBuilder builder,
+    &inout TypeTables table, &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    match (&in data) {
+        .parenthesized_expression(inner) {
+            return callable_status(builder, table, diagnostics,
+                linked_child(builder.project(), node, inner));
+        }
+        .member_expression(name, receiver_link) {
+            ReferenceStatus existing = builder.project().latest_status_for(node);
+            match (&in existing) {
+                .resolved(symbol) { return ReferenceStatus.resolved(symbol); }
+                .invalid(cause) { return ReferenceStatus.invalid(cause); }
+                .deferred(_) { }
+            }
+            TypeResult receiver = infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, receiver_link));
+            match (&in receiver) {
+                .known(id) {
+                    TypeShape shape = table.shape(id);
+                    match (&in shape) {
+                        .borrow(element, _) { shape = table.shape(element); }
+                        _ { }
+                    }
+                    match (&in shape) {
+                        .nominal(owner, _, _) {
+                            usize index = usize(0);
+                            while (index < builder.project().inherent_member_count()) {
+                                MemberRecord member = builder.project().inherent_member(index);
+                                if (member.member_owner().equals(owner)) {
+                                    SymbolId symbol = member.member_symbol();
+                                    if (builder.project().frontend().source_map().text_equals(name,
+                                        builder.project().name(builder.project().symbol(symbol).symbol_name()))) {
+                                        return ReferenceStatus.resolved(symbol);
+                                    }
+                                }
+                                index = index + usize(1);
+                            }
+                        }
+                        _ { }
+                    }
+                }
+                .invalid(cause) { return ReferenceStatus.invalid(cause); }
+                .deferred(_) { }
+            }
+            return existing;
+        }
+        _ { return builder.project().latest_status_for(node); }
+    }
+}
+
+TypeResult resolve_array(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, NodeLink element, NodeLink extent)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error {
+    TypeResult inner = resolve_type(builder, table, diagnostics,
+        linked_child(builder.project(), node, element));
+    match (&in inner) {
+        .known(value) {
+            NodeRef size = linked_child(builder.project(), node, extent);
+            SyntaxKind size_kind;
+            SourceSpan size_span;
+            {
+                &in SyntaxNode syntax = builder.project().frontend().node(size);
+                size_kind = syntax.kind();
+                size_span = syntax.source_span();
+            }
+            if (size_kind == SyntaxKind.integer_literal) {
+                try {
+                    return TypeResult.known(table.intern(TypeShape.array(
+                        value, decimal_extent(builder.project(), size_span))));
+                } catch ParseIntError {
+                    return type_failure(builder, diagnostics, size_span,
+                        "type.invalid-extent", "array extent is out of range");
+                }
+            }
+            table.record_category(size, TypeResult.deferred(TypeDeferred.comptime_value),
+                TypeCategory.type_name, false);
+            table.add_obligation(node, TypeCheckKind.declaration,
+                TypeDeferred.comptime_value, size);
+            return TypeResult.known(table.intern(TypeShape.symbolic_array(value, size)));
+        }
+        .deferred(reason) { return TypeResult.deferred(reason); }
+        .invalid(cause) { return TypeResult.invalid(cause); }
+    }
+}
+
+usize generic_arity(&in FrontendProject project, SymbolId symbol)
+    raises ProjectReferenceError, FrontendReferenceError {
+    &in SymbolRecord record = project.symbol(symbol);
+    SymbolOrigin origin = record.declaration_origin();
+    SymbolKind kind = record.symbol_kind();
+    NameId name = record.symbol_name();
+    match (&in origin) {
+        .source(declaration, _) {
+            SyntaxData data = project.frontend().node(declaration).payload();
+            return match (&in data) {
+                .struct_declaration(_, _, parameters, _) => parameters.len(),
+                .union_declaration(_, _, parameters, _) => parameters.len(),
+                .function_declaration(_, _, _, parameters, _, _) => parameters.len(),
+                _ => usize(0),
+            };
+        }
+        .builtin {
+            if (kind == SymbolKind.builtin_type
+                && project.name(name) == "MaybeUninit") { return usize(1); }
+        }
+    }
+    return usize(0);
+}
+
+TypeResult validate_storage_type(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, TypeResult result)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError {
+    match (&in result) {
+        .known(id) {
+            TypeShape shape = table.shape(id);
+            match (&in shape) {
+                .primitive(name) {
+                    if (builder.project().name(name) == "void") {
+                        return type_failure(builder, diagnostics,
+                            builder.project().frontend().node(node).source_span(),
+                            "type.invalid-storage", "void is not a storable value type");
+                    }
+                }
+                _ { }
+            }
+        }
+        _ { }
+    }
+    return result;
+}
+
+TypeResult resolve_generic(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, ChildRange arguments)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error {
+    ReferenceStatus status = builder.project().latest_status_for(node);
+    match (&in status) {
+        .resolved(symbol) {
+            SymbolKind base_kind = builder.project().symbol(symbol).symbol_kind();
+            if (base_kind == SymbolKind.type_parameter
+                || base_kind == SymbolKind.computed_type) {
+                return TypeResult.deferred(TypeDeferred.generic_body);
+            }
+            if (base_kind != SymbolKind.structure && base_kind != SymbolKind.sum_type
+                && base_kind != SymbolKind.view_type
+                && base_kind != SymbolKind.interface_type
+                && base_kind != SymbolKind.builtin_type) {
+                return type_failure(builder, diagnostics,
+                    builder.project().frontend().node(node).source_span(),
+                    "type.not-a-type", "generic base does not denote a type");
+            }
+            if (generic_arity(builder.project(), symbol) != arguments.len()) {
+                return type_failure(builder, diagnostics,
+                    builder.project().frontend().node(node).source_span(),
+                    "type.generic-arity", "incorrect number of generic arguments");
+            }
+            SystemAllocator argument_allocator;
+            Vector(TypeArgument, SystemAllocator) resolved(argument_allocator, usize(0));
+            usize index = usize(0);
+            while (index < arguments.len()) {
+                NodeRef argument;
+                {
+                    &in ParsedFile file = builder.project().frontend().file(node.file_id());
+                    argument = builder.project().frontend().reference(
+                        node.file_id(), file.child(arguments, index));
+                }
+                NodeRef value = argument;
+                SyntaxKind kind = builder.project().frontend().node(value).kind();
+                bool symbolic_value = false;
+                if (kind == SyntaxKind.name_expression) {
+                    ReferenceStatus argument_status =
+                        builder.project().latest_status_for(value);
+                    match (&in argument_status) {
+                        .resolved(argument_symbol) {
+                            SymbolKind argument_kind =
+                                builder.project().symbol(argument_symbol).symbol_kind();
+                            if (argument_kind == SymbolKind.parameter) {
+                                resolved.push(TypeArgument.symbolic(argument_symbol));
+                                symbolic_value = true;
+                            }
+                        }
+                        _ { }
+                    }
+                }
+                if (symbolic_value) { }
+                elif (is_type_syntax(kind) || kind == SyntaxKind.name_expression) {
+                    TypeResult item;
+                    if (kind == SyntaxKind.name_expression) {
+                        item = finish_type(table, value,
+                            resolve_named(builder, table, diagnostics, value));
+                    } else {
+                        item = resolve_type(builder, table, diagnostics, value);
+                    }
+                    match (&in item) {
+                        .known(id) { resolved.push(TypeArgument.type_value(id)); }
+                        .deferred(_) { resolved.push(TypeArgument.expression(value)); }
+                        .invalid(_) { resolved.push(TypeArgument.expression(value)); }
+                    }
+                } elif (kind == SyntaxKind.integer_literal) {
+                    try {
+                        usize number = decimal_extent(builder.project(),
+                            builder.project().frontend().node(value).source_span());
+                        resolved.push(TypeArgument.integer(number));
+                    } catch ParseIntError {
+                        resolved.push(TypeArgument.expression(value));
+                        table.record(value, TypeResult.deferred(TypeDeferred.comptime_value),
+                            false, false);
+                    }
+                } else {
+                    resolved.push(TypeArgument.expression(value));
+                    table.record(value, TypeResult.deferred(TypeDeferred.comptime_value),
+                        false, false);
+                }
+                index = index + usize(1);
+            }
+            usize start = table.argument_count();
+            index = usize(0);
+            while (index < resolved.len()) {
+                table.add_argument(resolved.get(index));
+                index = index + usize(1);
+            }
+            return TypeResult.known(table.intern(TypeShape.nominal(
+                symbol, start, resolved.len())));
+        }
+        .deferred(_) { return TypeResult.deferred(TypeDeferred.comptime_value); }
+        .invalid(cause) { return TypeResult.invalid(cause); }
+    }
+}
+
+bool is_expression_syntax(SyntaxKind kind) {
+    return kind == SyntaxKind.name_expression
+        || kind == SyntaxKind.integer_literal
+        || kind == SyntaxKind.floating_literal
+        || kind == SyntaxKind.string_literal
+        || kind == SyntaxKind.boolean_literal
+        || kind == SyntaxKind.null_literal
+        || kind == SyntaxKind.formatted_string
+        || kind == SyntaxKind.unary_expression
+        || kind == SyntaxKind.binary_expression
+        || kind == SyntaxKind.borrow_expression
+        || kind == SyntaxKind.move_expression
+        || kind == SyntaxKind.dereference_expression
+        || kind == SyntaxKind.call_expression
+        || kind == SyntaxKind.member_expression
+        || kind == SyntaxKind.index_expression
+        || kind == SyntaxKind.slice_expression
+        || kind == SyntaxKind.struct_literal
+        || kind == SyntaxKind.union_variant_expression
+        || kind == SyntaxKind.parenthesized_expression;
+}
+
+TypeResult primitive_result(&inout ProjectBuilder builder, &inout TypeTables table,
+    str spelling)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        NameReferenceError {
+    return TypeResult.known(table.intern(
+        TypeShape.primitive(builder.intern(spelling))));
+}
+
+TypeResult infer_expression(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    match (&in data) {
+        .integer_literal(_) { return primitive_result(builder, table, "i32"); }
+        .floating_literal(_) { return primitive_result(builder, table, "f64"); }
+        .string_literal(_) { return primitive_result(builder, table, "str"); }
+        .formatted_string(_) { return primitive_result(builder, table, "str"); }
+        .boolean_literal(_) { return primitive_result(builder, table, "bool"); }
+        .null_literal { return TypeResult.deferred(TypeDeferred.dependent_expression); }
+        .name_expression(_) {
+            ReferenceStatus status = builder.project().latest_status_for(node);
+            match (&in status) {
+                .resolved(symbol) {
+                    SymbolKind kind;
+                    SymbolOrigin origin;
+                    {
+                        &in SymbolRecord record = builder.project().symbol(symbol);
+                        kind = record.symbol_kind();
+                        origin = record.declaration_origin();
+                    }
+                    if (kind == SymbolKind.parameter || kind == SymbolKind.local
+                        || kind == SymbolKind.global || kind == SymbolKind.constant
+                        || kind == SymbolKind.field || kind == SymbolKind.catch_binding
+                        || kind == SymbolKind.match_binding) {
+                        match (&in origin) {
+                            .source(declaration, _) {
+                                try { return table.result_for(declaration); }
+                                catch ProjectReferenceError {
+                                    return TypeResult.deferred(TypeDeferred.generic_body);
+                                }
+                            }
+                            .builtin { }
+                        }
+                    }
+                    return TypeResult.deferred(TypeDeferred.generic_body);
+                }
+                .deferred(_) { return TypeResult.deferred(TypeDeferred.dependent_member); }
+                .invalid(cause) { return TypeResult.invalid(cause); }
+            }
+        }
+        .parenthesized_expression(expression) {
+            return infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, expression));
+        }
+        .move_expression(expression) {
+            return infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, expression));
+        }
+        .unary_expression(_, operation, operand) {
+            return infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, operand));
+        }
+        .binary_expression(_, operation, left, right) {
+            TypeResult left_type = infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, left));
+            TypeResult right_type = infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, right));
+            if (operation == SyntaxOperator.equal || operation == SyntaxOperator.not_equal
+                || operation == SyntaxOperator.less || operation == SyntaxOperator.less_equal
+                || operation == SyntaxOperator.greater || operation == SyntaxOperator.greater_equal
+                || operation == SyntaxOperator.logical_and
+                || operation == SyntaxOperator.logical_or) {
+                return primitive_result(builder, table, "bool");
+            }
+            match (&in left_type) {
+                .known(left_id) {
+                    match (&in right_type) {
+                        .known(right_id) {
+                            if (left_id.equals(right_id)) { return left_type; }
+                            return TypeResult.deferred(TypeDeferred.dependent_expression);
+                        }
+                        .deferred(reason) { return TypeResult.deferred(reason); }
+                        .invalid(cause) { return TypeResult.invalid(cause); }
+                    }
+                }
+                .deferred(reason) { return TypeResult.deferred(reason); }
+                .invalid(cause) { return TypeResult.invalid(cause); }
+            }
+        }
+        .call_expression(callee, _) {
+            NodeRef target = linked_child(builder.project(), node, callee);
+            ReferenceStatus status = callable_status(builder, table, diagnostics, target);
+            match (&in status) {
+                .resolved(symbol) {
+                    SymbolKind kind = builder.project().symbol(symbol).symbol_kind();
+                    if (kind == SymbolKind.builtin_type || kind == SymbolKind.structure
+                        || kind == SymbolKind.sum_type || kind == SymbolKind.view_type) {
+                        return resolve_named(builder, table, diagnostics, target);
+                    }
+                    try {
+                        SignatureId signature_id = table.signature_for(symbol);
+                        &in SignatureRecord signature = table.signature(signature_id);
+                        return signature.result_type();
+                    } catch ProjectReferenceError {
+                        return TypeResult.deferred(TypeDeferred.dependent_member);
+                    }
+                }
+                .deferred(reason) { return TypeResult.deferred(TypeDeferred.dependent_member); }
+                .invalid(cause) { return TypeResult.invalid(cause); }
+            }
+        }
+        .struct_literal(declared_type, _) {
+            NodeRef type_node = linked_child(builder.project(), node, declared_type);
+            if (is_type_syntax(builder.project().frontend().node(type_node).kind())) {
+                return resolve_type(builder, table, diagnostics, type_node);
+            }
+            return resolve_named(builder, table, diagnostics, type_node);
+        }
+        .index_expression(target, _) {
+            TypeResult target_type = infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, target));
+            match (&in target_type) {
+                .known(id) {
+                    TypeShape shape = table.shape(id);
+                    match (&in shape) {
+                        .array(element, _) { return TypeResult.known(element); }
+                        .slice(element) { return TypeResult.known(element); }
+                        .borrow(element, _) {
+                            TypeShape borrowed = table.shape(element);
+                            match (&in borrowed) {
+                                .array(item, _) { return TypeResult.known(item); }
+                                .slice(item) { return TypeResult.known(item); }
+                                _ { return TypeResult.deferred(TypeDeferred.dependent_member); }
+                            }
+                        }
+                        _ { return TypeResult.deferred(TypeDeferred.dependent_member); }
+                    }
+                }
+                .deferred(reason) { return TypeResult.deferred(reason); }
+                .invalid(cause) { return TypeResult.invalid(cause); }
+            }
+        }
+        .member_expression(member_span, receiver_link) {
+            NodeRef receiver = linked_child(builder.project(), node, receiver_link);
+            TypeResult receiver_type = infer_expression(builder, table, diagnostics, receiver);
+            match (&in receiver_type) {
+                .known(receiver_id) {
+                    TypeShape receiver_shape = table.shape(receiver_id);
+                    TypeId lookup_type = receiver_id;
+                    match (&in receiver_shape) {
+                        .borrow(element, _) { lookup_type = element; }
+                        _ { }
+                    }
+                    receiver_shape = table.shape(lookup_type);
+                    match (&in receiver_shape) {
+                        .nominal(owner, _, _) {
+                            usize member_index = usize(0);
+                            while (member_index < builder.project().inherent_member_count()) {
+                                MemberRecord member = builder.project().inherent_member(member_index);
+                                if (member.member_owner().equals(owner)) {
+                                    SymbolKind member_kind;
+                                    NameId member_name;
+                                    SymbolOrigin member_origin;
+                                    {
+                                        &in SymbolRecord symbol = builder.project().symbol(
+                                            member.member_symbol());
+                                        member_kind = symbol.symbol_kind();
+                                        member_name = symbol.symbol_name();
+                                        member_origin = symbol.declaration_origin();
+                                    }
+                                    if (builder.project().frontend().source_map().text_equals(
+                                        member_span, builder.project().name(member_name))) {
+                                        if (member_kind == SymbolKind.field) {
+                                            match (&in member_origin) {
+                                                .source(field_node, _) {
+                                                    return table.result_for(field_node);
+                                                }
+                                                .builtin {
+                                                    return TypeResult.deferred(
+                                                        TypeDeferred.dependent_member);
+                                                }
+                                            }
+                                        }
+                                        if (member_kind == SymbolKind.inherent_method) {
+                                            return TypeResult.deferred(
+                                                TypeDeferred.dependent_member);
+                                        }
+                                    }
+                                }
+                                member_index = member_index + usize(1);
+                            }
+                            return type_failure(builder, diagnostics, member_span,
+                                "type.missing-member",
+                                "known receiver type has no member with this name");
+                        }
+                        _ { return TypeResult.deferred(TypeDeferred.dependent_member); }
+                    }
+                }
+                .deferred(_) { return TypeResult.deferred(TypeDeferred.dependent_member); }
+                .invalid(cause) { return TypeResult.invalid(cause); }
+            }
+        }
+        .slice_expression(target, _, _) {
+            TypeResult target_type = infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, target));
+            match (&in target_type) {
+                .known(id) { return TypeResult.known(table.intern(TypeShape.slice(id))); }
+                .deferred(reason) { return TypeResult.deferred(reason); }
+                .invalid(cause) { return TypeResult.invalid(cause); }
+            }
+        }
+        .borrow_expression(mode, operand) {
+            TypeResult inner = infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, operand));
+            match (&in inner) {
+                .known(id) {
+                    return TypeResult.known(table.intern(TypeShape.borrow(
+                        id, access_for(builder.project(), node, mode))));
+                }
+                .deferred(reason) { return TypeResult.deferred(reason); }
+                .invalid(cause) { return TypeResult.invalid(cause); }
+            }
+        }
+        .dereference_expression(operand) {
+            TypeResult inner = infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, operand));
+            match (&in inner) {
+                .known(id) {
+                    TypeShape shape = table.shape(id);
+                    match (&in shape) {
+                        .pointer(element, _, _) { return TypeResult.known(element); }
+                        .borrow(element, _) { return TypeResult.known(element); }
+                        _ { return TypeResult.deferred(TypeDeferred.dependent_member); }
+                    }
+                }
+                .deferred(reason) { return TypeResult.deferred(reason); }
+                .invalid(cause) { return TypeResult.invalid(cause); }
+            }
+        }
+        .union_variant_expression(_, _) {
+            return TypeResult.deferred(TypeDeferred.dependent_match);
+        }
+        _ { return TypeResult.deferred(TypeDeferred.dependent_expression); }
+    }
+}
+
+void infer_expression_tree(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    bool include = true;
+    TypeCategory category = TypeCategory.value;
+    bool writable = false;
+    if (builder.project().frontend().node(node).kind() == SyntaxKind.member_expression) {
+        ReferenceStatus status = callable_status(builder, table, diagnostics, node);
+        match (&in status) {
+            .resolved(symbol) {
+                SymbolKind kind = builder.project().symbol(symbol).symbol_kind();
+                if (kind == SymbolKind.inherent_method) { category = TypeCategory.callable; }
+            }
+            _ { }
+        }
+    }
+    if (builder.project().frontend().node(node).kind() == SyntaxKind.name_expression) {
+        ReferenceStatus status = builder.project().latest_status_for(node);
+        match (&in status) {
+            .resolved(symbol) {
+                SymbolKind kind = builder.project().symbol(symbol).symbol_kind();
+                if (kind == SymbolKind.global || kind == SymbolKind.constant
+                    || kind == SymbolKind.parameter || kind == SymbolKind.local
+                    || kind == SymbolKind.field || kind == SymbolKind.catch_binding
+                    || kind == SymbolKind.match_binding) {
+                    category = TypeCategory.place;
+                    writable = kind != SymbolKind.constant;
+                } else {
+                    if (kind == SymbolKind.function || kind == SymbolKind.inherent_method
+                        || kind == SymbolKind.interface_requirement
+                        || kind == SymbolKind.implementation_method
+                        || kind == SymbolKind.builtin_function) {
+                        category = TypeCategory.callable;
+                    } else {
+                        if (kind == SymbolKind.builtin_type || kind == SymbolKind.structure
+                            || kind == SymbolKind.sum_type || kind == SymbolKind.view_type
+                            || kind == SymbolKind.interface_type
+                            || kind == SymbolKind.self_type) {
+                            category = TypeCategory.type_name;
+                        } else {
+                            include = false;
+                        }
+                    }
+                }
+            }
+            _ { }
+        }
+    }
+    if (include && is_expression_syntax(
+        builder.project().frontend().node(node).kind())) {
+        if (category == TypeCategory.value && is_place_expression(builder.project(), node)) {
+            category = TypeCategory.place;
+        }
+        if (category == TypeCategory.place) {
+            writable = writable_expression(builder, table, diagnostics, node);
+        }
+        TypeResult result;
+        if (category == TypeCategory.callable) {
+            result = TypeResult.deferred(TypeDeferred.generic_body);
+        } else {
+            if (category == TypeCategory.type_name) {
+                result = resolve_named(builder, table, diagnostics, node);
+            } else {
+                result = infer_expression(builder, table, diagnostics, node);
+            }
+        }
+        table.record_category(node, result, category, writable);
+    }
+    usize children;
+    {
+        &in SyntaxNode syntax = builder.project().frontend().node(node);
+        children = child_count(syntax);
+    }
+    usize index = usize(0);
+    while (index < children) {
+        infer_expression_tree(builder, table, diagnostics,
+            builder.project().frontend().child(node, index));
+        index = index + usize(1);
+    }
+}
+
+bool writable_expression(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    match (&in data) {
+        .name_expression(_) {
+            ReferenceStatus status = builder.project().latest_status_for(node);
+            match (&in status) {
+                .resolved(symbol) {
+                    SymbolKind kind = builder.project().symbol(symbol).symbol_kind();
+                    return kind == SymbolKind.local || kind == SymbolKind.global
+                        || kind == SymbolKind.parameter || kind == SymbolKind.field
+                        || kind == SymbolKind.catch_binding || kind == SymbolKind.match_binding;
+                }
+                _ { return false; }
+            }
+        }
+        .parenthesized_expression(inner) {
+            return writable_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, inner));
+        }
+        .member_expression(_, receiver) {
+            return writable_projection(builder, table, diagnostics,
+                linked_child(builder.project(), node, receiver));
+        }
+        .index_expression(receiver, _) {
+            return writable_projection(builder, table, diagnostics,
+                linked_child(builder.project(), node, receiver));
+        }
+        .dereference_expression(operand) {
+            TypeResult result = infer_expression(builder, table, diagnostics,
+                linked_child(builder.project(), node, operand));
+            match (&in result) {
+                .known(id) {
+                    TypeShape shape = table.shape(id);
+                    return match (&in shape) {
+                        .pointer(_, access, _) => access == TypeAccess.read_write,
+                        .borrow(_, access) => access != TypeAccess.read,
+                        _ => false,
+                    };
+                }
+                _ { return false; }
+            }
+        }
+        _ { return false; }
+    }
+}
+
+bool writable_projection(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef receiver)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    TypeResult result = infer_expression(builder, table, diagnostics, receiver);
+    match (&in result) {
+        .known(id) {
+            TypeShape shape = table.shape(id);
+            match (&in shape) {
+                .borrow(_, access) { return access != TypeAccess.read; }
+                _ { }
+            }
+        }
+        _ { }
+    }
+    return writable_expression(builder, table, diagnostics, receiver);
+}
+
+void collect_declaration(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    match (&in data) {
+        .function_declaration(_, modifiers, return_type, parameters, error_types, _) {
+            collect_signature(builder, table, diagnostics, node,
+                modifiers, return_type, parameters, error_types);
+        }
+        .comptime_statement(_) {
+            table.add_obligation(node, TypeCheckKind.expression,
+                TypeDeferred.comptime_value, node);
+        }
+        .parameter(_, _, declared_type, _) {
+            TypeResult result = resolve_parameter_type(builder, table, diagnostics,
+                node, declared_type);
+            table.record(node, result, true, true);
+        }
+        .field_declaration(_, _, declared_type, _) {
+            NodeRef child = linked_child(builder.project(), node, declared_type);
+            TypeResult result = resolve_type(builder, table, diagnostics, child);
+            table.record(node,
+                validate_storage_type(builder, table, diagnostics, node, result),
+                true, true);
+        }
+        .variable_declaration(_, _, declared_type, _, _) {
+            NodeRef child = linked_child(builder.project(), node, declared_type);
+            TypeResult result = resolve_type(builder, table, diagnostics, child);
+            table.record(node,
+                validate_storage_type(builder, table, diagnostics, node, result),
+                true, true);
+        }
+        .constant_declaration(_, _, declared_type, _) {
+            NodeRef child = linked_child(builder.project(), node, declared_type);
+            TypeResult result = resolve_type(builder, table, diagnostics, child);
+            table.record(node,
+                validate_storage_type(builder, table, diagnostics, node, result),
+                true, false);
+        }
+        _ { }
+    }
+    usize index = usize(0);
+    usize children;
+    {
+        &in SyntaxNode syntax = builder.project().frontend().node(node);
+        children = child_count(syntax);
+    }
+    while (index < children) {
+        NodeRef child = builder.project().frontend().child(node, index);
+        if (is_type_syntax(builder.project().frontend().node(child).kind()) == false) {
+            collect_declaration(builder, table, diagnostics, child);
+        }
+        index = index + usize(1);
+    }
+}
+
+void collect_signature(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, DeclarationModifiers modifiers,
+    NodeLink return_type, ChildRange parameters, ChildRange error_types)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SymbolId symbol = builder.project().declaration_symbol(node);
+    TypeResult result;
+    match (&in return_type) {
+        .absent {
+            result = TypeResult.known(table.intern(
+                TypeShape.primitive(builder.intern("void"))));
+        }
+        .present(_) {
+            result = resolve_type(builder, table, diagnostics,
+                linked_child(builder.project(), node, return_type));
+        }
+    }
+    usize parameter_start = table.parameter_count();
+    usize index = usize(0);
+    while (index < parameters.len()) {
+        NodeRef parameter;
+        {
+            &in ParsedFile file = builder.project().frontend().file(node.file_id());
+            parameter = builder.project().frontend().reference(
+                node.file_id(), file.child(parameters, index));
+        }
+        SyntaxData payload = builder.project().frontend().node(parameter).payload();
+        match (&in payload) {
+            .parameter(_, contracts, declared_type, _) {
+                TypeResult param_type = resolve_parameter_type(builder, table,
+                    diagnostics, parameter, declared_type);
+                table.add_parameter(SignatureParameter {
+                    symbol = builder.project().declaration_symbol(parameter),
+                    type_result = param_type,
+                    move_flag = contracts.consuming_flag(),
+                    comptime_flag = contracts.comptime_flag(),
+                });
+            }
+            _ { }
+        }
+        index = index + usize(1);
+    }
+    usize error_start = table.error_count();
+    index = usize(0);
+    while (index < error_types.len()) {
+        NodeRef error_type;
+        {
+            &in ParsedFile file = builder.project().frontend().file(node.file_id());
+            error_type = builder.project().frontend().reference(
+                node.file_id(), file.child(error_types, index));
+        }
+        table.add_error(resolve_type(builder, table, diagnostics, error_type));
+        index = index + usize(1);
+    }
+    table.add_signature(SignatureRecord {
+        symbol = symbol, parameter_start = parameter_start,
+        parameter_length = table.parameter_count() - parameter_start,
+        return_type = result, error_start = error_start,
+        error_length = table.error_count() - error_start,
+        inferred_errors = modifiers.raises_inferred_flag(), modifiers = modifiers,
+    });
+    if (modifiers.raises_inferred_flag()) {
+        table.add_obligation(node, TypeCheckKind.declaration,
+            TypeDeferred.inferred_errors, node);
+    }
+}
+
+bool numeric_literal_target(&inout ProjectBuilder builder,
+    &inout TypeTables table, NodeRef value, TypeId expected)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        NameReferenceError, ProjectReferenceError, FrontendReferenceError,
+        SourceMapError, Utf8Error {
+    SyntaxKind literal_kind = builder.project().frontend().node(value).kind();
+    if (literal_kind == SyntaxKind.floating_literal) {
+        TypeShape expected_shape = table.shape(expected);
+        return match (&in expected_shape) {
+            .primitive(name) => name.equals(builder.intern("f32"))
+                || name.equals(builder.intern("f64")),
+            _ => false,
+        };
+    }
+
+    bool negative = false;
+    NodeRef literal = value;
+    if (literal_kind == SyntaxKind.unary_expression) {
+        SyntaxData unary = builder.project().frontend().node(value).payload();
+        match (&in unary) {
+            .unary_expression(_, operation, operand) {
+                if (operation != SyntaxOperator.subtract) { return false; }
+                literal = linked_child(builder.project(), value, operand);
+                negative = true;
+            }
+            _ { return false; }
+        }
+        literal_kind = builder.project().frontend().node(literal).kind();
+    }
+    if (literal_kind != SyntaxKind.integer_literal) { return false; }
+
+    NameId type_name;
+    TypeShape expected_shape = table.shape(expected);
+    match (&in expected_shape) {
+        .primitive(name) { type_name = name; }
+        _ { return false; }
+    }
+    str spelling = builder.project().name(type_name);
+    u32 bits = u32(0);
+    bool signed = false;
+    if (spelling == "i8") { bits = u32(8); signed = true; }
+    elif (spelling == "u8" || spelling == "b8") { bits = u32(8); }
+    elif (spelling == "i16") { bits = u32(16); signed = true; }
+    elif (spelling == "u16" || spelling == "b16") { bits = u32(16); }
+    elif (spelling == "i32" || spelling == "be_i32" || spelling == "le_i32") {
+        bits = u32(32); signed = true;
+    } elif (spelling == "u32" || spelling == "b32") { bits = u32(32); }
+    elif (spelling == "i64" || spelling == "isize") { bits = u32(64); signed = true; }
+    elif (spelling == "u64" || spelling == "usize" || spelling == "b64") {
+        bits = u32(64);
+    } else { return false; }
+    if (negative && signed == false) { return false; }
+
+    u64 magnitude;
+    try {
+        magnitude = parse_integer_spelling(builder.project(),
+            builder.project().frontend().node(literal).source_span());
+    } catch ParseIntError { return false; }
+    u64 positive_limit = u64(0);
+    if (signed) {
+        positive_limit = (u64(1) << (bits - u32(1))) - u64(1);
+        if (negative) { return magnitude <= positive_limit + u64(1); }
+        return magnitude <= positive_limit;
+    }
+    if (bits == u32(64)) { return true; }
+    return magnitude <= (u64(1) << bits) - u64(1);
+}
+
+u64 parse_integer_spelling(&in FrontendProject project, SourceSpan span)
+    raises SourceMapError, ParseIntError, CapacityError, LayoutError,
+        AllocationError, Utf8Error {
+    SystemAllocator allocator;
+    StringBuilder(SystemAllocator) builder(allocator);
+    usize offset = span.start_offset();
+    while (offset < span.end_offset()) {
+        builder.append_byte(project.frontend().source_map().byte_at(span.source_id(), offset));
+        offset = offset + usize(1);
+    }
+    String(SystemAllocator) text = finish_string(SystemAllocator, builder);
+    return parse_u64(text.as_str());
+}
+
+bool literal_range_candidate(&inout ProjectBuilder builder,
+    &inout TypeTables table, NodeRef value, TypeId expected)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, NameReferenceError {
+    SyntaxKind kind = builder.project().frontend().node(value).kind();
+    if (kind == SyntaxKind.unary_expression) {
+        SyntaxData data = builder.project().frontend().node(value).payload();
+        match (&in data) {
+            .unary_expression(_, operation, operand) {
+                if (operation != SyntaxOperator.subtract) { return false; }
+                value = linked_child(builder.project(), value, operand);
+                kind = builder.project().frontend().node(value).kind();
+            }
+            _ { return false; }
+        }
+    }
+    if (kind != SyntaxKind.integer_literal) { return false; }
+    u32 family = primitive_family(builder, table, expected);
+    return family == u32(2) || family == u32(3) || family == u32(5);
+}
+
+bool contextual_value_compatible(&inout ProjectBuilder builder,
+    &inout TypeTables table, NodeRef value, TypeId expected, TypeId actual)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    if (literal_range_candidate(builder, table, value, expected)) {
+        return numeric_literal_target(builder, table, value, expected);
+    }
+    return type_compatible(builder, table, expected, actual);
+}
+
+bool nullable_pointer_requires_refinement(&inout TypeTables table,
+    TypeId expected, TypeId actual) raises ProjectReferenceError {
+    TypeShape expected_shape = table.shape(expected);
+    TypeShape actual_shape = table.shape(actual);
+    return match (&in expected_shape) {
+        .pointer(expected_element, _, expected_nullable) =>
+            match (&in actual_shape) {
+                .pointer(actual_element, _, actual_nullable) =>
+                    expected_nullable == false && actual_nullable
+                    && expected_element.equals(actual_element),
+                _ => false,
+            },
+        _ => false,
+    };
+}
+
+u32 primitive_family(&inout ProjectBuilder builder, &inout TypeTables table,
+    TypeId id)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, NameReferenceError {
+    TypeShape shape = table.shape(id);
+    match (&in shape) {
+        .primitive(name) {
+            if (name.equals(builder.intern("bool"))) { return u32(1); }
+            if (name.equals(builder.intern("i8")) || name.equals(builder.intern("i16"))
+                || name.equals(builder.intern("i32")) || name.equals(builder.intern("i64"))
+                || name.equals(builder.intern("isize"))
+                || name.equals(builder.intern("be_i32")) || name.equals(builder.intern("le_i32"))) {
+                return u32(2);
+            }
+            if (name.equals(builder.intern("u8")) || name.equals(builder.intern("u16"))
+                || name.equals(builder.intern("u32")) || name.equals(builder.intern("u64"))
+                || name.equals(builder.intern("usize"))) { return u32(5); }
+            if (name.equals(builder.intern("b8")) || name.equals(builder.intern("b16"))
+                || name.equals(builder.intern("b32")) || name.equals(builder.intern("b64"))) {
+                return u32(3);
+            }
+            if (name.equals(builder.intern("f32")) || name.equals(builder.intern("f64"))) {
+                return u32(4);
+            }
+        }
+        _ { }
+    }
+    return u32(0);
+}
+
+bool type_compatible(&inout ProjectBuilder builder, &inout TypeTables table,
+    TypeId expected, TypeId actual)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, NameReferenceError {
+    if (expected.equals(actual)) { return true; }
+    TypeShape expected_shape = table.shape(expected);
+    TypeShape actual_shape = table.shape(actual);
+    match (&in expected_shape) {
+        .borrow(expected_element, expected_access) {
+            match (&in actual_shape) {
+                .borrow(actual_element, actual_access) {
+                    if (expected_access == TypeAccess.read
+                        && (actual_access == TypeAccess.read
+                            || actual_access == TypeAccess.read_write)) {
+                        return expected_element.equals(actual_element);
+                    }
+                    return expected_access == actual_access
+                        && expected_element.equals(actual_element);
+                }
+                _ { return expected_element.equals(actual); }
+            }
+        }
+        _ { }
+    }
+    u32 target_family = primitive_family(builder, table, expected);
+    u32 source_family = primitive_family(builder, table, actual);
+    if (target_family == u32(1) || source_family == u32(1)) {
+        return target_family == u32(1) && source_family == u32(1);
+    }
+    if (target_family == u32(2) || target_family == u32(5)) {
+        return source_family == u32(2) || source_family == u32(5);
+    }
+    if (target_family == u32(3)) {
+        return source_family == u32(2) || source_family == u32(3)
+            || source_family == u32(5);
+    }
+    if (target_family == u32(4)) {
+        return source_family == u32(2) || source_family == u32(4)
+            || source_family == u32(5);
+    }
+    return false;
+}
+
+bool is_unsigned_type(&inout ProjectBuilder builder, &inout TypeTables table,
+    TypeId id)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, NameReferenceError {
+    return primitive_family(builder, table, id) == u32(5);
+}
+
+void record_check_error(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, TypeCheckKind kind,
+    str code, str message)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        FrontendReferenceError {
+    TypeResult failure = type_failure(builder, diagnostics,
+        builder.project().frontend().node(node).source_span(), code, message);
+    match (&in failure) {
+        .invalid(cause) { table.add_failure(node, kind, cause); }
+        _ { }
+    }
+}
+
+bool visit_stored_layout(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, &inout Vector(u8, SystemAllocator) marks,
+    TypeId id, NodeRef origin)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    TypeShape shape = table.shape(id);
+    usize type_index = id.type_index();
+    u8 state = marks.get(type_index);
+    if (state == u8(2)) { return false; }
+    if (state == u8(1)) {
+        record_check_error(builder, table, diagnostics, origin,
+            TypeCheckKind.layout, "type.infinite-size",
+            "stored value has an infinitely recursive layout");
+        return true;
+    }
+    marks.replace(type_index, u8(1));
+    bool invalid = false;
+    match (&in shape) {
+        .array(element, _) {
+            invalid = visit_stored_layout(builder, table, diagnostics, marks,
+                element, origin);
+        }
+        .symbolic_array(_, extent) {
+            table.add_obligation(origin, TypeCheckKind.layout,
+                TypeDeferred.comptime_value, extent);
+        }
+        .parameter(symbol) {
+            table.add_obligation(origin, TypeCheckKind.layout,
+                TypeDeferred.generic_body, origin);
+        }
+        .contextual_self(_) {
+            table.add_obligation(origin, TypeCheckKind.layout,
+                TypeDeferred.generic_body, origin);
+        }
+        .computed(_) {
+            table.add_obligation(origin, TypeCheckKind.layout,
+                TypeDeferred.computed_type, origin);
+        }
+        .nominal(owner, _, argument_length) {
+            if (argument_length > usize(0)) {
+                table.add_obligation(origin, TypeCheckKind.layout,
+                    TypeDeferred.generic_body, origin);
+            }
+            SymbolKind owner_kind;
+            {
+                &in SymbolRecord owner_record = builder.project().symbol(owner);
+                owner_kind = owner_record.symbol_kind();
+            }
+            usize member_index = usize(0);
+            while (member_index < builder.project().inherent_member_count()) {
+                MemberRecord member = builder.project().inherent_member(member_index);
+                if (member.member_owner().equals(owner)
+                    && (owner_kind == SymbolKind.structure
+                        || owner_kind == SymbolKind.sum_type)) {
+                    SymbolKind member_kind;
+                    SymbolOrigin field_origin;
+                    {
+                        &in SymbolRecord symbol_record = builder.project().symbol(
+                            member.member_symbol());
+                        member_kind = symbol_record.symbol_kind();
+                        field_origin = symbol_record.declaration_origin();
+                    }
+                    match (&in field_origin) {
+                        .source(field_node, _) {
+                            if (owner_kind == SymbolKind.structure
+                                && member_kind == SymbolKind.field) {
+                                TypeResult field_type = table.result_for(field_node);
+                                match (&in field_type) {
+                                    .known(field_id) {
+                                        if (visit_stored_layout(builder, table,
+                                            diagnostics, marks, field_id, field_node)) {
+                                            invalid = true;
+                                        }
+                                    }
+                                    .deferred(reason) {
+                                        table.add_obligation(field_node,
+                                            TypeCheckKind.layout, reason, field_node);
+                                    }
+                                    .invalid(_) { }
+                                }
+                            }
+                            if (owner_kind == SymbolKind.sum_type
+                                && member_kind == SymbolKind.variant) {
+                                usize payload_count = child_count(
+                                    builder.project().frontend().node(field_node));
+                                usize payload_index = usize(0);
+                                while (payload_index < payload_count) {
+                                    NodeRef payload = builder.project().frontend().child(
+                                        field_node, payload_index);
+                                    TypeResult payload_type = table.result_for(payload);
+                                    match (&in payload_type) {
+                                        .known(payload_id) {
+                                            if (visit_stored_layout(builder, table,
+                                                diagnostics, marks, payload_id, payload)) {
+                                                invalid = true;
+                                            }
+                                        }
+                                        .deferred(reason) {
+                                            table.add_obligation(payload,
+                                                TypeCheckKind.layout, reason, payload);
+                                        }
+                                        .invalid(_) { }
+                                    }
+                                    payload_index = payload_index + usize(1);
+                                }
+                            }
+                        }
+                        .builtin { }
+                    }
+                }
+                member_index = member_index + usize(1);
+            }
+        }
+        .slice(_) { }
+        .borrow(_, _) { }
+        .pointer(_, _, _) { }
+        .primitive(_) { }
+    }
+    marks.replace(type_index, u8(2));
+    return invalid;
+}
+
+void validate_stored_layouts(&inout ProjectBuilder builder,
+    &inout TypeTables table, &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SystemAllocator allocator;
+    Vector(u8, SystemAllocator) marks(allocator, usize(0));
+    usize index = usize(0);
+    while (index < table.type_count()) {
+        marks.push(u8(0));
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < builder.project().declaration_count()) {
+        NodeRef declaration_node;
+        {
+            &in DeclarationSymbol declaration = builder.project().declaration(index);
+            declaration_node = declaration.syntax_node();
+        }
+        SyntaxKind declaration_kind = builder.project().frontend().node(
+            declaration_node).kind();
+        if (declaration_kind == SyntaxKind.variable_declaration
+            || declaration_kind == SyntaxKind.field_declaration
+            || declaration_kind == SyntaxKind.parameter
+            || declaration_kind == SyntaxKind.constant_declaration) {
+            TypeResult result;
+            bool has_type = true;
+            try { result = table.result_for(declaration_node); }
+            catch ProjectReferenceError { has_type = false; }
+            if (has_type) {
+                match (&in result) {
+                    .known(id) {
+                        visit_stored_layout(builder, table, diagnostics, marks,
+                            id, declaration_node);
+                    }
+                    _ { }
+                }
+            }
+        }
+        index = index + usize(1);
+    }
+}
+
+void validate_call_types(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    match (&in data) {
+        .call_expression(callee, arguments) {
+            NodeRef callee_node = linked_child(builder.project(), node, callee);
+            ReferenceStatus status = callable_status(builder, table, diagnostics, callee_node);
+            match (&in status) {
+                .resolved(symbol) {
+                    SignatureId signature_id;
+                    try { signature_id = table.signature_for(symbol); }
+                    catch ProjectReferenceError { return; }
+                    SignatureRecord signature = table.signature(signature_id);
+                    usize parameter_count = signature.parameter_count();
+                    usize parameter_offset = usize(0);
+                    SyntaxData callee_data = builder.project().frontend().node(callee_node).payload();
+                    match (&in callee_data) {
+                        .member_expression(_, receiver) {
+                            if (builder.project().symbol(symbol).symbol_kind()
+                                == SymbolKind.inherent_method && parameter_count > usize(0)) {
+                                SignatureParameter first = table.parameter(signature_id, usize(0));
+                                if (builder.project().name(builder.project().symbol(
+                                    first.parameter_symbol()).symbol_name()) == "self") {
+                                    parameter_offset = usize(1);
+                                    parameter_count = parameter_count - usize(1);
+                                    check_call_argument(builder, table, diagnostics,
+                                        linked_child(builder.project(), callee_node, receiver),
+                                        first.declared_type());
+                                }
+                            }
+                        }
+                        _ { }
+                    }
+                    if (arguments.len() != parameter_count) {
+                        record_check_error(builder, table, diagnostics, node,
+                            TypeCheckKind.call, "type.call-arity",
+                            "call argument count does not match the function signature");
+                    }
+                    usize limit = arguments.len();
+                    if (limit > parameter_count) {
+                        limit = parameter_count;
+                    }
+                    usize index = usize(0);
+                    while (index < limit) {
+                        NodeRef argument;
+                        {
+                            &in ParsedFile file = builder.project().frontend().file(node.file_id());
+                            argument = builder.project().frontend().reference(
+                                node.file_id(), file.child(arguments, index));
+                        }
+                        SignatureParameter parameter = table.parameter(signature_id,
+                            index + parameter_offset);
+                        check_call_argument(builder, table, diagnostics, argument,
+                            parameter.declared_type());
+                        index = index + usize(1);
+                    }
+                }
+                _ { }
+            }
+        }
+        _ { }
+    }
+    usize children;
+    {
+        &in SyntaxNode syntax = builder.project().frontend().node(node);
+        children = child_count(syntax);
+    }
+    usize child_index = usize(0);
+    while (child_index < children) {
+        validate_call_types(builder, table, diagnostics,
+            builder.project().frontend().child(node, child_index));
+        child_index = child_index + usize(1);
+    }
+}
+
+void check_call_argument(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef argument, TypeResult expected)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    TypeResult actual = table.result_for(argument);
+    match (&in expected) {
+        .known(expected_id) {
+            match (&in actual) {
+                .known(actual_id) {
+                    TypeShape shape = table.shape(expected_id);
+                    match (&in shape) {
+                        .borrow(element, access) {
+                            SyntaxData data = builder.project().frontend().node(argument).payload();
+                            match (&in data) {
+                                .borrow_expression(_, _) {
+                                    record_check_error(builder, table, diagnostics, argument,
+                                        TypeCheckKind.call, "type.explicit-borrow-argument",
+                                        "call borrows are determined by the parameter contract");
+                                    return;
+                                }
+                                _ { }
+                            }
+                            if (access != TypeAccess.read
+                                && writable_projection(builder, table, diagnostics, argument) == false) {
+                                record_check_error(builder, table, diagnostics, argument,
+                                    TypeCheckKind.call, "type.mutable-borrow-required",
+                                    "this parameter requires a writable argument");
+                                return;
+                            }
+                        }
+                        _ { }
+                    }
+                    if (contextual_value_compatible(builder, table,
+                        argument, expected_id, actual_id) == false) {
+                        str code = "type.incompatible-argument";
+                        str message = "argument type is incompatible with the parameter";
+                        if (literal_range_candidate(builder, table, argument, expected_id)) {
+                            code = "type.literal-out-of-range";
+                            message = "numeric literal is outside the parameter type range";
+                        }
+                        record_check_error(builder, table, diagnostics,
+                            argument, TypeCheckKind.call, code, message);
+                    }
+                }
+                .deferred(reason) {
+                    table.add_obligation(argument, TypeCheckKind.call, reason, argument);
+                }
+                .invalid(_) { }
+            }
+        }
+        .deferred(reason) { table.add_obligation(argument, TypeCheckKind.call, reason, argument); }
+        .invalid(_) { }
+    }
+}
+
+void validate_initializer_value(&inout ProjectBuilder builder,
+    &inout TypeTables table, &inout DiagnosticBag diagnostics, NodeRef node,
+    NodeLink initializer)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    match (&in initializer) {
+        .present(_) {
+            NodeRef value = linked_child(builder.project(), node, initializer);
+            TypeResult expected = table.result_for(node);
+            TypeResult actual = table.result_for(value);
+            match (&in expected) {
+                .known(expected_id) {
+                    match (&in actual) {
+                        .known(actual_id) {
+                            if (expected_id.equals(actual_id) == false
+                                && numeric_literal_target(builder, table,
+                                    value, expected_id) == false) {
+                                str code = "type.incompatible-initializer";
+                                str message = "initializer type does not match the declared type";
+                                if (literal_range_candidate(builder, table,
+                                    value, expected_id)) {
+                                    code = "type.literal-out-of-range";
+                                    message = "numeric literal is outside the destination type range";
+                                }
+                                TypeResult invalid = type_failure(builder, diagnostics,
+                                    builder.project().frontend().node(value).source_span(),
+                                    code, message);
+                                match (&in invalid) {
+                                    .invalid(cause) {
+                                        table.add_failure(value,
+                                            TypeCheckKind.initializer, cause);
+                                    }
+                                    _ { }
+                                }
+                            }
+                        }
+                        .deferred(reason) {
+                            table.add_obligation(node, TypeCheckKind.initializer,
+                                reason, value);
+                        }
+                        .invalid(_) { }
+                    }
+                }
+                .deferred(reason) {
+                    table.add_obligation(node, TypeCheckKind.initializer, reason, node);
+                }
+                .invalid(_) { }
+            }
+        }
+        .absent { }
+    }
+}
+
+void validate_initializer_types(&inout ProjectBuilder builder,
+    &inout TypeTables table, &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    match (&in data) {
+        .variable_declaration(_, _, _, initializer, _) {
+            validate_initializer_value(builder, table, diagnostics, node, initializer);
+        }
+        .field_declaration(_, _, _, initializer) {
+            validate_initializer_value(builder, table, diagnostics, node, initializer);
+        }
+        .constant_declaration(_, _, _, initializer) {
+            validate_initializer_value(builder, table, diagnostics, node, initializer);
+        }
+        _ { }
+    }
+    usize index = usize(0);
+    usize children;
+    {
+        &in SyntaxNode syntax = builder.project().frontend().node(node);
+        children = child_count(syntax);
+    }
+    while (index < children) {
+        validate_initializer_types(builder, table, diagnostics,
+            builder.project().frontend().child(node, index));
+        index = index + usize(1);
+    }
+}
+
+bool is_boolean_type(&inout ProjectBuilder builder, &inout TypeTables table,
+    TypeId id)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        NameReferenceError {
+    return id.equals(table.intern(TypeShape.primitive(builder.intern("bool"))));
+}
+
+bool is_primitive_type(&inout ProjectBuilder builder, &inout TypeTables table,
+    TypeId id, str spelling)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, NameReferenceError {
+    TypeShape shape = table.shape(id);
+    match (&in shape) {
+        .primitive(name) { return name.equals(builder.intern(spelling)); }
+        _ { return false; }
+    }
+}
+
+bool is_comparison_operator(SyntaxOperator operation) {
+    return operation == SyntaxOperator.equal
+        || operation == SyntaxOperator.not_equal
+        || operation == SyntaxOperator.less
+        || operation == SyntaxOperator.less_equal
+        || operation == SyntaxOperator.greater
+        || operation == SyntaxOperator.greater_equal;
+}
+
+void validate_binary_operator(&inout ProjectBuilder builder,
+    &inout TypeTables table, &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    match (&in data) {
+        .binary_expression(_, operation, left, right) {
+            NodeRef left_node = linked_child(builder.project(), node, left);
+            NodeRef right_node = linked_child(builder.project(), node, right);
+            TypeResult left_result;
+            TypeResult right_result;
+            bool known = true;
+            try {
+                left_result = table.result_for(left_node);
+                right_result = table.result_for(right_node);
+            } catch ProjectReferenceError { known = false; }
+            if (known == false) { return; }
+            match (&in left_result) {
+                .known(left_id) {
+                    match (&in right_result) {
+                        .known(right_id) {
+                            u32 left_family = primitive_family(builder, table, left_id);
+                            u32 right_family = primitive_family(builder, table, right_id);
+                            bool valid = true;
+                            if (operation == SyntaxOperator.logical_and
+                                || operation == SyntaxOperator.logical_or) {
+                                valid = is_boolean_type(builder, table, left_id)
+                                    && is_boolean_type(builder, table, right_id);
+                            } elif (operation == SyntaxOperator.bit_and
+                                || operation == SyntaxOperator.bit_or
+                                || operation == SyntaxOperator.bit_xor) {
+                                valid = left_id.equals(right_id)
+                                    && (left_family == u32(2) || left_family == u32(3)
+                                        || left_family == u32(5));
+                            } elif (operation == SyntaxOperator.shift_left
+                                || operation == SyntaxOperator.shift_right) {
+                                valid = (left_family == u32(2) || left_family == u32(3)
+                                    || left_family == u32(5))
+                                    && right_family == u32(5);
+                            } elif (operation == SyntaxOperator.add
+                                || operation == SyntaxOperator.subtract
+                                || operation == SyntaxOperator.multiply
+                                || operation == SyntaxOperator.divide
+                                || operation == SyntaxOperator.remainder) {
+                                valid = left_id.equals(right_id)
+                                    && (left_family == u32(2) || left_family == u32(4)
+                                        || left_family == u32(5));
+                            } elif (is_comparison_operator(operation)) {
+                                valid = left_id.equals(right_id)
+                                    && (left_family == u32(1) || left_family == u32(2)
+                                        || left_family == u32(3) || left_family == u32(4)
+                                        || left_family == u32(5)
+                                        || is_primitive_type(builder, table, left_id, "str"));
+                                if (operation != SyntaxOperator.equal
+                                    && operation != SyntaxOperator.not_equal) {
+                                    valid = valid && left_family != u32(1)
+                                        && left_family != u32(3)
+                                        && is_primitive_type(builder, table, left_id, "str") == false;
+                                }
+                            }
+                            if (valid == false) {
+                                record_check_error(builder, table, diagnostics, node,
+                                    TypeCheckKind.operator, "type.invalid-operator",
+                                    "operator is not defined for these operand types");
+                            } elif (is_comparison_operator(operation)
+                                && left_family == u32(0)) {
+                                table.add_obligation(node, TypeCheckKind.operator,
+                                    TypeDeferred.dependent_expression, node);
+                            }
+                        }
+                        .deferred(_) { }
+                        .invalid(_) { }
+                    }
+                }
+                .deferred(_) { }
+                .invalid(_) { }
+            }
+        }
+        _ { }
+    }
+}
+
+void validate_integer_index(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef owner, NodeLink index)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    NodeRef value = linked_child(builder.project(), owner, index);
+    TypeResult result;
+    bool found = true;
+    try { result = table.result_for(value); }
+    catch ProjectReferenceError { found = false; }
+    if (found) {
+        match (&in result) {
+            .known(id) {
+                u32 family = primitive_family(builder, table, id);
+                if (family != u32(2) && family != u32(5)) {
+                    record_check_error(builder, table, diagnostics, value,
+                        TypeCheckKind.operator, "type.non-integer-index",
+                        "array and slice indexes must have an integer type");
+                }
+            }
+            .deferred(reason) { table.add_pending(value, reason); }
+            .invalid(_) { }
+        }
+    }
+}
+
+bool is_place_expression(&in FrontendProject project, NodeRef node)
+    raises FrontendReferenceError, ProjectReferenceError {
+    SyntaxData data = project.frontend().node(node).payload();
+    return match (&in data) {
+        .name_expression(_) => true,
+        .member_expression(_, _) => true,
+        .index_expression(_, _) => true,
+        .dereference_expression(_) => true,
+        .parenthesized_expression(expression) => is_place_expression(
+            project, linked_child(project, node, expression)),
+        _ => false,
+    };
+}
+
+bool definitely_terminates(&in FrontendProject project, NodeRef node)
+    raises FrontendReferenceError, ProjectReferenceError, SourceMapError,
+        BoundsError {
+    SyntaxData data = project.frontend().node(node).payload();
+    match (&in data) {
+        .return_statement(_) { return true; }
+        .raise_statement(_) { return true; }
+        .rethrow_statement { return true; }
+        .block_statement(statements) {
+            usize index = usize(0);
+            while (index < statements.len()) {
+                NodeRef statement;
+                {
+                    &in ParsedFile file = project.frontend().file(node.file_id());
+                    statement = project.frontend().reference(node.file_id(),
+                        file.child(statements, index));
+                }
+                if (definitely_terminates(project, statement)) { return true; }
+                index = index + usize(1);
+            }
+            return false;
+        }
+        .if_statement(branches) {
+            bool has_else = false;
+            usize index = usize(0);
+            while (index < branches.len()) {
+                NodeRef branch;
+                {
+                    &in ParsedFile file = project.frontend().file(node.file_id());
+                    branch = project.frontend().reference(node.file_id(),
+                        file.child(branches, index));
+                }
+                SyntaxData branch_data = project.frontend().node(branch).payload();
+                match (&in branch_data) {
+                    .else_branch(body) {
+                        has_else = true;
+                        if (definitely_terminates(project,
+                            linked_child(project, branch, body)) == false) { return false; }
+                    }
+                    .if_branch(_, body) {
+                        if (definitely_terminates(project,
+                            linked_child(project, branch, body)) == false) { return false; }
+                    }
+                    _ { return false; }
+                }
+                index = index + usize(1);
+            }
+            return has_else;
+        }
+        .while_statement(condition, _) {
+            NodeRef condition_node = linked_child(project, node, condition);
+            SyntaxData condition_data = project.frontend().node(condition_node).payload();
+            match (&in condition_data) {
+                .boolean_literal(spelling) {
+                    return project.frontend().source_map().text_equals(
+                        spelling, "true");
+                }
+                _ { return false; }
+            }
+        }
+        .for_statement(_, condition, _, _) {
+            match (&in condition) {
+                .absent { return true; }
+                .present(_) {
+                    NodeRef condition_node = linked_child(project, node, condition);
+                    SyntaxData condition_data = project.frontend().node(condition_node).payload();
+                    match (&in condition_data) {
+                        .boolean_literal(spelling) {
+                            return project.frontend().source_map().text_equals(
+                                spelling, "true");
+                        }
+                        _ { return false; }
+                    }
+                }
+            }
+        }
+        _ { return false; }
+    }
+}
+
+bool has_unresolved_flow(&in FrontendProject project, NodeRef node)
+    raises FrontendReferenceError {
+    SyntaxKind kind = project.frontend().node(node).kind();
+    if (kind == SyntaxKind.match_statement || kind == SyntaxKind.match_expression
+        || kind == SyntaxKind.try_statement) { return true; }
+    usize index = usize(0);
+    usize count = child_count(project.frontend().node(node));
+    while (index < count) {
+        if (has_unresolved_flow(project, project.frontend().child(node, index))) {
+            return true;
+        }
+        index = index + usize(1);
+    }
+    return false;
+}
+
+void check_return_statement(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, TypeResult expected,
+    bool in_function)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    match (&in data) {
+        .return_statement(value) {
+            if (in_function == false) {
+                record_check_error(builder, table, diagnostics, node,
+                    TypeCheckKind.return_value, "type.return-outside-function",
+                    "return statement has no enclosing function signature");
+                return;
+            }
+            bool has_value = match (&in value) {
+                .present(_) => true,
+                .absent => false,
+            };
+            match (&in expected) {
+                .known(expected_id) {
+                    bool expected_void = expected_id.equals(table.intern(
+                        TypeShape.primitive(builder.intern("void"))));
+                    if (has_value == false && expected_void == false) {
+                        record_check_error(builder, table, diagnostics, node,
+                            TypeCheckKind.return_value, "type.missing-return-value",
+                            "non-void function must return a value");
+                    } elif (has_value && expected_void) {
+                        record_check_error(builder, table, diagnostics, node,
+                            TypeCheckKind.return_value, "type.void-return-value",
+                            "void function cannot return a value");
+                    } elif (has_value) {
+                        NodeRef expression = linked_child(builder.project(), node, value);
+                        TypeResult actual;
+                        bool resolved = true;
+                        try { actual = table.result_for(expression); }
+                        catch ProjectReferenceError { resolved = false; }
+                        if (resolved) {
+                            match (&in actual) {
+                                .known(actual_id) {
+                                    if (nullable_pointer_requires_refinement(table,
+                                        expected_id, actual_id)) {
+                                        table.add_obligation(expression,
+                                            TypeCheckKind.return_value,
+                                            TypeDeferred.dependent_expression,
+                                            expression);
+                                    } elif (contextual_value_compatible(builder, table,
+                                        expression, expected_id, actual_id) == false) {
+                                        str code = "type.incompatible-return";
+                                        str message = "return value is incompatible with the function result type";
+                                        if (literal_range_candidate(builder, table,
+                                            expression, expected_id)) {
+                                            code = "type.literal-out-of-range";
+                                            message = "numeric literal is outside the return type range";
+                                        }
+                                        record_check_error(builder, table, diagnostics,
+                                            expression, TypeCheckKind.return_value,
+                                            code, message);
+                                    }
+                                }
+                                _ { }
+                            }
+                        }
+                    }
+                }
+                .deferred(reason) {
+                    table.add_obligation(node, TypeCheckKind.return_value, reason, node);
+                }
+                .invalid(_) { }
+            }
+        }
+        _ { }
+    }
+}
+
+void validate_statement_types(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, TypeResult expected_return,
+    bool in_function)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    match (&in data) {
+        .function_declaration(_, _, _, _, _, body) {
+            match (&in body) {
+                .present(_) {
+                    SignatureId id;
+                    bool found = true;
+                    try { id = table.signature_for(
+                        builder.project().declaration_symbol(node)); }
+                    catch ProjectReferenceError { found = false; }
+                    if (found) {
+                        SignatureRecord signature = table.signature(id);
+                        TypeResult result_type = signature.result_type();
+                        NodeRef body_node = linked_child(builder.project(), node, body);
+                        validate_statement_types(builder, table, diagnostics,
+                            body_node, result_type, true);
+                        bool nonvoid = false;
+                        match (&in result_type) {
+                            .known(result_id) {
+                                nonvoid = result_id.equals(table.intern(
+                                    TypeShape.primitive(builder.intern("void")))) == false;
+                            }
+                            _ { }
+                        }
+                        if (nonvoid && definitely_terminates(
+                            builder.project(), body_node) == false) {
+                            if (has_unresolved_flow(builder.project(), body_node)) {
+                                table.add_obligation(node, TypeCheckKind.flow,
+                                    TypeDeferred.dependent_match, node);
+                            } else {
+                                record_check_error(builder, table, diagnostics, node,
+                                    TypeCheckKind.return_value, "type.missing-return-path",
+                                    "non-void function may finish without returning a value");
+                            }
+                        }
+                    }
+                }
+                .absent { }
+            }
+            return;
+        }
+        .return_statement(_) {
+            check_return_statement(builder, table, diagnostics, node,
+                expected_return, in_function);
+        }
+        .assignment_statement(target, value) {
+            NodeRef target_node = linked_child(builder.project(), node, target);
+            NodeRef value_node = linked_child(builder.project(), node, value);
+            if (writable_expression(builder, table, diagnostics, target_node) == false) {
+                record_check_error(builder, table, diagnostics, target_node,
+                    TypeCheckKind.assignment, "type.invalid-assignment-target",
+                    "assignment target is not a writable place");
+            } else {
+                TypeResult target_type;
+                TypeResult value_type;
+                bool resolved = true;
+                try {
+                    target_type = table.result_for(target_node);
+                    value_type = table.result_for(value_node);
+                } catch ProjectReferenceError { resolved = false; }
+                if (resolved) {
+                    match (&in target_type) {
+                        .known(expected_id) {
+                            match (&in value_type) {
+                                .known(actual_id) {
+                                    if (contextual_value_compatible(builder, table,
+                                        value_node, expected_id, actual_id) == false) {
+                                        str code = "type.incompatible-assignment";
+                                        str message = "assigned value is incompatible with the target type";
+                                        if (literal_range_candidate(builder, table,
+                                            value_node, expected_id)) {
+                                            code = "type.literal-out-of-range";
+                                            message = "numeric literal is outside the assignment target range";
+                                        }
+                                        record_check_error(builder, table, diagnostics,
+                                            value_node, TypeCheckKind.assignment,
+                                            code, message);
+                                    }
+                                }
+                                _ { }
+                            }
+                        }
+                        _ { }
+                    }
+                }
+            }
+        }
+        .if_branch(condition, _) {
+            validate_boolean_condition(builder, table, diagnostics, node, condition,
+                "if condition");
+        }
+        .while_statement(condition, _) {
+            validate_boolean_condition(builder, table, diagnostics, node, condition,
+                "while condition");
+        }
+        .for_statement(_, condition, _, _) {
+            match (&in condition) {
+                .present(_) {
+                    validate_boolean_condition(builder, table, diagnostics, node,
+                        condition, "for condition");
+                }
+                .absent { }
+            }
+        }
+        .binary_expression(_, _, _, _) {
+            validate_binary_operator(builder, table, diagnostics, node);
+        }
+        .unary_expression(_, operation, operand) {
+            if (operation == SyntaxOperator.bit_not) {
+                NodeRef value = linked_child(builder.project(), node, operand);
+                TypeResult result;
+                bool found = true;
+                try { result = table.result_for(value); }
+                catch ProjectReferenceError { found = false; }
+                if (found) {
+                    match (&in result) {
+                        .known(id) {
+                            u32 family = primitive_family(builder, table, id);
+                            if (family != u32(2) && family != u32(3)
+                                && family != u32(5)) {
+                                record_check_error(builder, table, diagnostics, node,
+                                    TypeCheckKind.operator, "type.invalid-unary-operator",
+                                    "bitwise complement requires an integer or raw-byte operand");
+                            }
+                        }
+                        _ { }
+                    }
+                }
+            }
+        }
+        .index_expression(_, index) {
+            validate_integer_index(builder, table, diagnostics, node, index);
+        }
+        .slice_expression(_, start, end) {
+            match (&in start) {
+                .present(_) { validate_integer_index(builder, table, diagnostics, node, start); }
+                .absent { }
+            }
+            match (&in end) {
+                .present(_) { validate_integer_index(builder, table, diagnostics, node, end); }
+                .absent { }
+            }
+        }
+        _ { }
+    }
+    usize children;
+    {
+        &in SyntaxNode syntax = builder.project().frontend().node(node);
+        children = child_count(syntax);
+    }
+    usize index = usize(0);
+    while (index < children) {
+        validate_statement_types(builder, table, diagnostics,
+            builder.project().frontend().child(node, index),
+            expected_return, in_function);
+        index = index + usize(1);
+    }
+}
+
+void validate_boolean_condition(&inout ProjectBuilder builder,
+    &inout TypeTables table, &inout DiagnosticBag diagnostics, NodeRef owner,
+    NodeLink condition, str context)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    NodeRef value = linked_child(builder.project(), owner, condition);
+    TypeResult result;
+    bool resolved = true;
+    try { result = table.result_for(value); }
+    catch ProjectReferenceError { resolved = false; }
+    if (resolved) {
+        match (&in result) {
+            .known(id) {
+                if (is_boolean_type(builder, table, id) == false) {
+                    record_check_error(builder, table, diagnostics, value,
+                        TypeCheckKind.condition, "type.non-boolean-condition",
+                        context);
+                }
+            }
+            .deferred(reason) {
+                table.add_obligation(value, TypeCheckKind.condition, reason, value);
+            }
+            .invalid(_) { }
+        }
+    }
+}
+
+pub TypedProject analyze_typed_project(str entry, &in ProjectOptions options,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
+        ProjectReferenceError, NameReferenceError, Utf8Error {
+    ProjectBuilder builder = project_builder();
+    load_module_graph_into(builder, entry, options, diagnostics);
+    AnalysisState state = index_project(builder, diagnostics);
+    resolve_project(builder, state, diagnostics);
+    validate_analysis(builder.project());
+    TypeTables table = type_tables(builder.project().identity_value());
+    usize module_index = usize(0);
+    while (module_index < builder.project().module_count()) {
+        ModuleId module_id = builder.project().module_at(module_index);
+        ParsedFileId file = builder.project().module_record(module_id).parsed_file();
+        usize root_index = usize(0);
+        while (root_index < builder.project().frontend().file(file).root_count()) {
+            collect_declaration(builder, table, diagnostics,
+                builder.project().frontend().root(file, root_index));
+            root_index = root_index + usize(1);
+        }
+        module_index = module_index + usize(1);
+    }
+    validate_stored_layouts(builder, table, diagnostics);
+    module_index = usize(0);
+    while (module_index < builder.project().module_count()) {
+        ModuleId module_id = builder.project().module_at(module_index);
+        ParsedFileId file = builder.project().module_record(module_id).parsed_file();
+        usize root_index = usize(0);
+        while (root_index < builder.project().frontend().file(file).root_count()) {
+            infer_expression_tree(builder, table, diagnostics,
+                builder.project().frontend().root(file, root_index));
+            root_index = root_index + usize(1);
+        }
+        module_index = module_index + usize(1);
+    }
+    module_index = usize(0);
+    while (module_index < builder.project().module_count()) {
+        ModuleId module_id = builder.project().module_at(module_index);
+        ParsedFileId file = builder.project().module_record(module_id).parsed_file();
+        usize root_index = usize(0);
+        while (root_index < builder.project().frontend().file(file).root_count()) {
+            validate_call_types(builder, table, diagnostics,
+                builder.project().frontend().root(file, root_index));
+            validate_statement_types(builder, table, diagnostics,
+                builder.project().frontend().root(file, root_index),
+                TypeResult.deferred(TypeDeferred.generic_body), false);
+            validate_initializer_types(builder, table, diagnostics,
+                builder.project().frontend().root(file, root_index));
+            root_index = root_index + usize(1);
+        }
+        module_index = module_index + usize(1);
+    }
+    FrontendProject project = finish_project(builder);
+    return finish_typed_project(project, table);
+}

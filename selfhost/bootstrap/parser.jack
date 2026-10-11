@@ -413,6 +413,8 @@ ArenaHandle(SyntaxNode) parse_prefix(
         kind = SyntaxKind.dereference_expression; prefix = true;
     } elif (token_is(parser, context, "~")) {
         prefix = true;
+    } elif (token_is(parser, context, "-")) {
+        prefix = true;
     }
     if (prefix) {
         SourceSpan operator = first;

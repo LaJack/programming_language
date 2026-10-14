@@ -14,6 +14,48 @@ from jack.semantic_pass import SemanticError, validate_runtime_ast
 
 
 class SumTypeTests(unittest.TestCase):
+    def test_methods_follow_reborrowed_union_payloads(self):
+        program = self.hir('''
+            struct Point {
+                i32 value;
+                void set(&inout self, i32 value) { self.value = value; }
+                i32 get(&in self) { return self.value; }
+            }
+            union Item { some(Point point); }
+            Item item = Item.some(Point { value = 1 });
+            match (&inout item) {
+                .some(point) {
+                    &inout Point alias = &inout point;
+                    alias.set(42);
+                    print(alias.get());
+                    alias.value = 43;
+                    print(alias.value);
+                }
+            }
+            print(match (&in item) { .some(point) => point.get(), });
+        ''')
+        output = io.StringIO()
+        with redirect_stdout(output):
+            Interpreter().eval_hir_program(program)
+        self.assertEqual('alias.get() = 42\nalias.value = 43\n<expr> = 43\n', output.getvalue())
+
+    def test_uninitialized_union_storage_is_not_default_constructed(self):
+        program = self.hir('''
+            union Payload { item(i32 value); }
+            Payload make() {
+                Payload result;
+                result = Payload.item(42);
+                return result;
+            }
+            print(match (make()) { .item(value) => value, });
+        ''')
+        output = io.StringIO()
+        with redirect_stdout(output):
+            Interpreter().eval_hir_program(program)
+        self.assertEqual('<expr> = 42\n', output.getvalue())
+        self.assertIn('switch', emit_hir_llvm(program))
+        self.assertIn('switch', emit_hir_c(program))
+
     def test_nested_statement_matches_can_return_from_function(self):
         source = '''
             union Inner { absent; present(i32 value); }

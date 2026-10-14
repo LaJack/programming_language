@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from jack.compiler_driver import CompilationOptions, CompilerDriver
+from tests.bootstrap_artifacts import artifacts
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,15 +15,7 @@ class BootstrapTypingTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temporary = tempfile.TemporaryDirectory()
         cls.directory = Path(cls.temporary.name)
-        cls.executable = cls.directory / "jack-bootstrap"
-        CompilerDriver(print_handler=None).compile_executable(
-            ROOT / "selfhost/bootstrap/main.jack",
-            CompilationOptions(
-                module_roots=(ROOT / "selfhost", ROOT / "jack"),
-                backend="llvm",
-                output=cls.executable,
-            ),
-        )
+        cls.executable = artifacts.executable().output_path
 
     @classmethod
     def tearDownClass(cls):
@@ -266,6 +259,62 @@ class BootstrapTypingTests(unittest.TestCase):
         self.assertIn("\tplace\t", first.stdout)
         self.assertNotIn("pending\t", first.stdout)
 
+    def test_intrinsic_expression_checks_are_once_per_node(self):
+        result = self.run_source(
+            "module app; i32 sum(i32 a, i32 b) { return (a + b) * (a + b); }",
+            "--dump", "types", "--diagnostic-format", "stable",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        fields = result.stdout.splitlines()[0].split("\t")
+        self.assertEqual(["checking", "expressions", "9", "requests"], fields[:4])
+        self.assertGreaterEqual(int(fields[4]), 9)
+
+    def test_contextual_conversions_preserve_intrinsic_literal_types(self):
+        result = self.run_source(
+            "module app; u8 narrow() { u8 value = 42; return 7; }",
+            "--dump", "types", "--diagnostic-format", "stable",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        conversions = [line.split("\t") for line in result.stdout.splitlines()
+                       if line.startswith("conversion\t")]
+        self.assertEqual({"initializer", "return"}, {item[-1] for item in conversions})
+        self.assertTrue(all(item[-3] != item[-2] for item in conversions))
+
+    def test_qualifier_comments_and_whitespace_do_not_change_access(self):
+        result = self.run_source(
+            "module app; struct Point { i32 x; } "
+            "void change(& /* out */ inout Point point) { point.x = 2; } "
+            "void read(& /* inout */ in Point point) { point.x = 3; }",
+            "--check-types", "--diagnostic-format", "stable",
+        )
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertEqual(1, result.stderr.count("type.invalid-assignment-target"))
+
+    def test_syntax_qualifiers_have_exact_tokens_and_typed_modes(self):
+        from tests.bootstrap_syntax_normalization import read_dump
+
+        source = ("module app; struct Point { void read(& /* trivia */ in self) {} } "
+                  "void use(&out i32 a, *in i32 b, ?*inout i32 c) {}")
+        result = self.run_source(source, "--dump", "syntax")
+        self.assertEqual(0, result.returncode, result.stderr)
+        nodes, _ = read_dump(result.stdout)
+        qualifiers = [node for node in nodes.values() if "access" in node.values]
+        self.assertEqual(4, len(qualifiers))
+        for node in qualifiers:
+            start, end = node.fields["mode"]
+            self.assertEqual(node.values["access"], source[start:end])
+
+    def test_concrete_member_targets_retain_original_declaration_spans(self):
+        source = ("module app; struct Point { i32 x; "
+                  "i32 read(&in self) { return self.x; } } "
+                  "i32 caller(&in Point point) { return point.read(); }")
+        result = self.run_source(source, "--dump", "types")
+        self.assertEqual(0, result.returncode, result.stderr)
+        targets = [line.split("\t") for line in result.stdout.splitlines()
+                   if line.startswith("target\t") and not line.endswith("\tbuiltin")]
+        declaration_names = {source[int(row[-2]):int(row[-1])] for row in targets}
+        self.assertTrue({"read", "x"}.issubset(declaration_names), result.stdout)
+
     def test_typed_mode_is_exclusive(self):
         result = self.run_source(
             "module app;", "--check-types", "--dump", "types",
@@ -291,6 +340,27 @@ class BootstrapTypingTests(unittest.TestCase):
         self.assertEqual(1, len(pending), result.stdout)
         self.assertIn("\texpression\t", pending[0])
         self.assertNotIn("NOT_EXECUTED", result.stdout + result.stderr)
+
+    def test_match_return_has_an_explicit_pending_result(self):
+        result = self.run_source('''
+            module app;
+            union Choice { first; second; }
+            i32 choose(&in Choice value) {
+                return match (value) { .first => 1, .second => 2, };
+            }
+        ''', "--dump", "types", "--diagnostic-format", "stable")
+        self.assertEqual(3, result.returncode, result.stderr)
+        self.assertIn("dependent_match", result.stdout)
+        self.assertNotIn("error", result.stderr)
+
+    def test_generic_struct_literal_reuses_its_type_expression_result(self):
+        result = self.run_source('''
+            module app;
+            struct Box(comptime type T: Copyable) { T item; }
+            void build() { Box(i32) value = Box(i32) { item = 1 }; }
+        ''', "--dump", "types", "--diagnostic-format", "stable")
+        self.assertIn(result.returncode, (0, 3), result.stderr)
+        self.assertNotIn("project.invalid-reference", result.stderr)
 
     def test_std_memory_generic_value_arguments(self):
         result = subprocess.run(

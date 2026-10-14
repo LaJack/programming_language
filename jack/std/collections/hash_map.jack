@@ -1,0 +1,351 @@
+module std.collections.hash_map;
+
+import std.memory;
+import std.option;
+
+pub interface HashKey {
+    u64 hash(&in self);
+    bool equals(&in self, &in Self other);
+}
+
+pub struct KeyNotFoundError { }
+pub struct HashMapCursorError { }
+
+usize next_hash_map_identity = usize(1);
+
+pub struct HashMapCursor {
+    usize identity;
+    usize generation;
+    usize next;
+    usize current;
+    bool positioned;
+}
+
+// Public so a bounded allocator can name the bucket layout; fields stay private.
+pub struct HashMapBucket(comptime type K, comptime type V) {
+    u8 state;
+    u64 hash;
+    MaybeUninit(K) key;
+    MaybeUninit(V) value;
+}
+
+pub struct HashMap(
+    comptime type K: HashKey,
+    comptime type V,
+    comptime type A: Allocator
+) {
+    A allocator;
+    Allocation allocation;
+    usize buckets;
+    usize length;
+    usize used;
+    usize identity;
+    usize generation;
+
+    init(&inout self, move A allocator, usize initial_capacity)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        if (next_hash_map_identity == usize(18446744073709551615)) {
+            raise LayoutError { };
+        }
+        usize count = bucket_count(initial_capacity);
+        Layout layout = layout_array(HashMapBucket(K, V), count);
+        self.allocator = move allocator;
+        Allocation allocation = self.allocator.allocate(layout);
+        self.allocation = move allocation;
+        self.buckets = self.allocation.layout().size() / sizeof(HashMapBucket(K, V));
+        self.length = usize(0);
+        self.used = usize(0);
+        self.identity = next_hash_map_identity;
+        next_hash_map_identity = next_hash_map_identity + usize(1);
+        self.generation = usize(0);
+        unsafe {
+            *inout b8 address = self.allocator.address_mut(self.allocation);
+            *inout MaybeUninit(HashMapBucket(K, V)) slots = address.cast(MaybeUninit(HashMapBucket(K, V)));
+            usize index = usize(0);
+            while (index < self.buckets) {
+                HashMapBucket(K, V) empty;
+                empty.state = u8(0);
+                empty.hash = u64(0);
+                &inout MaybeUninit(HashMapBucket(K, V)) slot = &inout *slots.offset(index);
+                slot.write(empty);
+                index = index + usize(1);
+            }
+        }
+    }
+
+    usize len(&in self) { return self.length; }
+    bool is_empty(&in self) { return self.length == usize(0); }
+
+    bool contains(&in self, &in K key) {
+        return self.find(key, self.hash_key(key)) < self.buckets;
+    }
+
+    &in V get(&in self, &in K key) raises KeyNotFoundError {
+        usize index = self.find(key, self.hash_key(key));
+        if (index == self.buckets) { raise KeyNotFoundError { }; }
+        unsafe { return (*self.bucket(index)).value.borrow(); }
+    }
+
+    &inout V get_mut(&inout self, &in K key) raises KeyNotFoundError {
+        usize index = self.find(key, self.hash_key(key));
+        if (index == self.buckets) { raise KeyNotFoundError { }; }
+        unsafe { return (*self.bucket_mut(index)).value.borrow_mut(); }
+    }
+
+    Option(V) insert(&inout self, move K key, move V value)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        self.check_generation();
+        u64 hash = self.hash_key(key);
+        usize existing = self.find(key, hash);
+        if (existing < self.buckets) {
+            unsafe {
+                &inout HashMapBucket(K, V) slot = &inout *self.bucket_mut(existing);
+                V previous = slot.value.take();
+                slot.value.write(value);
+                self.generation = self.generation + usize(1);
+                return Option(V).some(previous);
+            }
+        } else {
+            usize position = self.vacant(hash);
+            bool fresh = true;
+            if (position < self.buckets) {
+                unsafe { fresh = (*self.bucket(position)).state == u8(0); }
+            }
+            if (self.buckets == usize(0)
+                || (fresh && self.used >= bucket_limit(self.buckets))) {
+                usize requested = self.length + usize(1);
+                usize count = bucket_count(requested);
+                if (count < self.buckets) { count = self.buckets; }
+                unsafe { self.rehash(count); }
+                position = self.vacant(hash);
+            }
+            unsafe {
+                &inout HashMapBucket(K, V) slot = &inout *self.bucket_mut(position);
+                if (slot.state == u8(0)) { self.used = self.used + usize(1); }
+                slot.key.write(key);
+                slot.value.write(value);
+                slot.hash = hash;
+                slot.state = u8(1);
+            }
+            self.length = self.length + usize(1);
+            self.generation = self.generation + usize(1);
+            return Option(V).none;
+        }
+    }
+
+    Option(V) remove(&inout self, &in K key) raises LayoutError {
+        usize index = self.find(key, self.hash_key(key));
+        if (index == self.buckets) { return Option(V).none; }
+        self.check_generation();
+        unsafe {
+            &inout HashMapBucket(K, V) slot = &inout *self.bucket_mut(index);
+            K removed_key = slot.key.take();
+            V value = slot.value.take();
+            slot.state = u8(2);
+            self.length = self.length - usize(1);
+            self.generation = self.generation + usize(1);
+            return Option(V).some(value);
+        }
+    }
+
+    void reserve(&inout self, usize minimum_capacity)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        if (minimum_capacity <= bucket_limit(self.buckets)) { return; }
+        self.check_generation();
+        unsafe { self.rehash(bucket_count(minimum_capacity)); }
+        self.generation = self.generation + usize(1);
+    }
+
+    void clear(&inout self) raises LayoutError {
+        self.check_generation();
+        unsafe { self.destroy_entries(); }
+        self.generation = self.generation + usize(1);
+    }
+
+    HashMapCursor cursor(&in self) {
+        return HashMapCursor {
+            identity = self.identity, generation = self.generation,
+            next = usize(0), current = usize(0), positioned = false
+        };
+    }
+
+    bool advance(&in self, &inout HashMapCursor cursor) raises HashMapCursorError {
+        self.check_cursor(cursor, false);
+        cursor.positioned = false;
+        while (cursor.next < self.buckets) {
+            usize index = cursor.next;
+            cursor.next = cursor.next + usize(1);
+            unsafe {
+                if ((*self.bucket(index)).state == u8(1)) {
+                    cursor.current = index;
+                    cursor.positioned = true;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    &in K key(&in self, &in HashMapCursor cursor) raises HashMapCursorError {
+        self.check_cursor(cursor, true);
+        unsafe { return (*self.bucket(cursor.current)).key.borrow(); }
+    }
+
+    &in V value(&in self, &in HashMapCursor cursor) raises HashMapCursorError {
+        self.check_cursor(cursor, true);
+        unsafe { return (*self.bucket(cursor.current)).value.borrow(); }
+    }
+
+    &inout V value_mut(&inout self, &in HashMapCursor cursor) raises HashMapCursorError {
+        self.check_cursor(cursor, true);
+        unsafe { return (*self.bucket_mut(cursor.current)).value.borrow_mut(); }
+    }
+
+    void check_cursor(&in self, &in HashMapCursor cursor, bool positioned)
+        raises HashMapCursorError
+    {
+        if (cursor.identity != self.identity || cursor.generation != self.generation
+            || (positioned && (cursor.positioned == false || cursor.current >= self.buckets))) {
+            raise HashMapCursorError { };
+        }
+    }
+
+    void check_generation(&in self) raises LayoutError {
+        if (self.generation == usize(18446744073709551615)) { raise LayoutError { }; }
+    }
+
+    unsafe *in HashMapBucket(K, V) bucket(&in self, usize index) {
+        *in b8 address = self.allocator.address(self.allocation);
+        *in MaybeUninit(HashMapBucket(K, V)) storage = address.cast(MaybeUninit(HashMapBucket(K, V)));
+        return storage.cast(HashMapBucket(K, V)).offset(index);
+    }
+
+    unsafe *inout HashMapBucket(K, V) bucket_mut(&inout self, usize index) {
+        *inout b8 address = self.allocator.address_mut(self.allocation);
+        *inout MaybeUninit(HashMapBucket(K, V)) storage = address.cast(MaybeUninit(HashMapBucket(K, V)));
+        return storage.cast(HashMapBucket(K, V)).offset(index);
+    }
+
+    usize find(&in self, &in K key, u64 hash) {
+        if (self.buckets == usize(0)) { return self.buckets; }
+        usize position = usize(hash % u64(self.buckets));
+        usize visited = usize(0);
+        unsafe {
+            while (visited < self.buckets) {
+                &in HashMapBucket(K, V) slot = &in *self.bucket(position);
+                if (slot.state == u8(0)) { return self.buckets; }
+                if (slot.state == u8(1) && slot.hash == hash) {
+                    if (self.keys_equal(slot.key.borrow(), key)) { return position + usize(0); }
+                }
+                position = (position + usize(1)) % self.buckets;
+                visited = visited + usize(1);
+            }
+        }
+        return self.buckets;
+    }
+
+    u64 hash_key(&in self, &in K key) { return key.hash(); }
+    bool keys_equal(&in self, &in K left, &in K right) { return left.equals(right); }
+
+    usize vacant(&in self, u64 hash) {
+        if (self.buckets == usize(0)) { return self.buckets; }
+        usize position = usize(hash % u64(self.buckets));
+        usize visited = usize(0);
+        unsafe {
+            while (visited < self.buckets) {
+                if ((*self.bucket(position)).state != u8(1)) { return position + usize(0); }
+                position = (position + usize(1)) % self.buckets;
+                visited = visited + usize(1);
+            }
+        }
+        return self.buckets;
+    }
+
+    unsafe void rehash(&inout self, usize count)
+        raises CapacityError, LayoutError, AllocationError
+    {
+        Layout requested = layout_array(HashMapBucket(K, V), count);
+        Allocation replacement = self.allocator.allocate(requested);
+        usize granted = replacement.layout().size() / sizeof(HashMapBucket(K, V));
+        unsafe {
+            *inout b8 address = self.allocator.address_mut(replacement);
+            *inout MaybeUninit(HashMapBucket(K, V)) storage = address.cast(MaybeUninit(HashMapBucket(K, V)));
+            *inout HashMapBucket(K, V) slots = storage.cast(HashMapBucket(K, V));
+            usize index = usize(0);
+            while (index < granted) {
+                HashMapBucket(K, V) empty;
+                empty.state = u8(0);
+                empty.hash = u64(0);
+                &inout MaybeUninit(HashMapBucket(K, V)) slot = &inout *storage.offset(index);
+                slot.write(empty);
+                index = index + usize(1);
+            }
+            index = usize(0);
+            while (index < self.buckets) {
+                &inout HashMapBucket(K, V) old = &inout *self.bucket_mut(index);
+                if (old.state == u8(1)) {
+                    usize position = usize(old.hash % u64(granted));
+                    while ((*slots.offset(position)).state == u8(1)) {
+                        position = (position + usize(1)) % granted;
+                    }
+                    &inout HashMapBucket(K, V) target = &inout *slots.offset(position);
+                    K key = old.key.take();
+                    V value = old.value.take();
+                    target.key.write(key);
+                    target.value.write(value);
+                    target.hash = old.hash;
+                    target.state = u8(1);
+                    old.state = u8(0);
+                }
+                index = index + usize(1);
+            }
+            Allocation previous = move self.allocation;
+            self.allocator.deallocate(previous);
+        }
+        self.allocation = move replacement;
+        self.buckets = granted;
+        self.used = self.length;
+    }
+
+    unsafe void destroy_entries(&inout self) {
+        usize index = self.buckets;
+        unsafe {
+            while (index > usize(0)) {
+                index = index - usize(1);
+                &inout HashMapBucket(K, V) slot = &inout *self.bucket_mut(index);
+                if (slot.state == u8(1)) {
+                    K key = slot.key.take();
+                    V value = slot.value.take();
+                }
+                slot.state = u8(0);
+            }
+        }
+        self.length = usize(0);
+        self.used = usize(0);
+    }
+
+    deinit(move self) {
+        unsafe {
+            self.destroy_entries();
+            Allocation allocation = move self.allocation;
+            self.allocator.deallocate(allocation);
+        }
+    }
+}
+
+usize bucket_count(usize elements) raises LayoutError {
+    if (elements == usize(0)) { return usize(0); }
+    usize count = usize(8);
+    while (bucket_limit(count) < elements) {
+        if (count > usize(18446744073709551615) / usize(2)) { raise LayoutError { }; }
+        count = count * usize(2);
+    }
+    return count;
+}
+
+usize bucket_limit(usize count) {
+    return count / usize(4) * usize(3) + count % usize(4) * usize(3) / usize(4);
+}

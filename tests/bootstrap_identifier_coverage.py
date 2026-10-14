@@ -11,7 +11,7 @@ from jack.parser import Lexer, Parser
 
 
 # Every SyntaxData variant is listed, including variants without source text.
-# Values classify SourceSpan fields, not child nodes.
+# Values classify source spans (including typed qualifier spans), not child nodes.
 FIELDS = {
     "invalid_declaration": {},
     "invalid_statement": {},
@@ -99,13 +99,18 @@ def assert_complete_classification(syntax_path: Path):
     kind_block = source.split("pub union SyntaxKind {", 1)[1].split("}", 1)[0]
     kinds = set(re.findall(r"^\s*(\w+);", kind_block, re.MULTILINE))
     data_block = source.split("pub union SyntaxData {", 1)[1].split("}", 1)[0]
+    qualifier = source.split("pub struct SyntaxQualifier {", 1)[1].split(
+        "SourceSpan source_span", 1)[0]
+    assert re.findall(r"\b(\w+)\s+(\w+);", qualifier) == [
+        ("SourceSpan", "location"), ("SyntaxAccess", "access"),
+    ], "Update identifier classification when qualifier storage changes."
     variants = {}
     for line in data_block.splitlines():
         match = re.fullmatch(r"\s*(\w+)(?:\((.*)\))?;", line)
         if match:
             signature = match.group(2) or ""
             variants[match.group(1)] = set(
-                re.findall(r"\bSourceSpan\s+(\w+)", signature))
+                re.findall(r"\b(?:SourceSpan|SyntaxQualifier)\s+(\w+)", signature))
             if "DeclarationModifiers modifiers" in signature:
                 variants[match.group(1)].add("abi")
     assert kinds == variants.keys(), (kinds - variants.keys(),

@@ -1,0 +1,17 @@
+module typing_fixture;
+
+struct Point {
+    i32 x;
+    i32 y;
+    i32 sum(&in self) { return self.x + self.y; }
+}
+
+i32 add(i32 left, i32 right) { return left + right; }
+
+u8 choose(bool enabled) {
+    u8 initial = 42;
+    if (enabled) { return 255; }
+    return 0;
+}
+
+i32 evaluate(&in Point point) { return add(point.sum(), 1); }

@@ -24,12 +24,16 @@ pub struct ParsedFileId {
 pub struct NodeRef {
     ParsedFileId file;
     ArenaHandle(SyntaxNode) node;
+    usize ordinal;
 
     bool equals(&in self, NodeRef other) {
         return self.file.equals(other.file) && self.node.equals(other.node);
     }
 
     ParsedFileId file_id(&in self) { return self.file; }
+    usize project_identity(&in self) { return self.file.context; }
+    usize file_ordinal(&in self) { return self.file.index; }
+    usize node_ordinal(&in self) { return self.ordinal; }
 }
 
 pub struct FrontendContext {
@@ -57,8 +61,10 @@ pub struct FrontendContext {
 
     NodeRef reference(&in self, ParsedFileId id, ArenaHandle(SyntaxNode) node)
         raises FrontendReferenceError {
-        NodeRef result = NodeRef { file = id, node = node };
-        self.node(result);
+        usize ordinal;
+        try { ordinal = self.file(id).node(node).ordinal_value(); }
+        catch ArenaHandleError { raise FrontendReferenceError { }; }
+        NodeRef result = NodeRef { file = id, node = node, ordinal = ordinal };
         return result;
     }
 
@@ -75,16 +81,25 @@ pub struct FrontendContext {
         return id.index;
     }
 
+    ParsedFileId file_at(&in self, usize index) raises FrontendReferenceError {
+        if (index >= self.files.len()) { raise FrontendReferenceError { }; }
+        return ParsedFileId { context = self.identity_value(), index = index };
+    }
+
     NodeRef root(&in self, ParsedFileId id, usize index)
         raises FrontendReferenceError {
         &in ParsedFile file = self.file(id);
-        try { return NodeRef { file = id, node = file.root(index) }; }
+        try { return self.reference(id, file.root(index)); }
         catch BoundsError { raise FrontendReferenceError { }; }
     }
 
     &in SyntaxNode node(&in self, NodeRef reference) raises FrontendReferenceError {
         &in ParsedFile file = self.file(reference.file);
-        try { return file.node(reference.node); }
+        try {
+            &in SyntaxNode node = file.node(reference.node);
+            if (node.ordinal_value() != reference.ordinal) { raise FrontendReferenceError { }; }
+            return node;
+        }
         catch ArenaHandleError { raise FrontendReferenceError { }; }
     }
 
@@ -93,10 +108,7 @@ pub struct FrontendContext {
         &in ParsedFile file = self.file(reference.file);
         &in SyntaxNode node = self.node(reference);
         try {
-            return NodeRef {
-                file = reference.file,
-                node = syntax_child(file, node, index),
-            };
+            return self.reference(reference.file, syntax_child(file, node, index));
         } catch BoundsError { raise FrontendReferenceError { }; }
     }
 }

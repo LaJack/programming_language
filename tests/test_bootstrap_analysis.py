@@ -14,6 +14,7 @@ from jack.interpreter import Interpreter
 from jack.module_loader import load_source_graph
 from jack.runtime_externs import default_runtime_externs
 from tests.bootstrap_interpreter_runner import run_hir_isolated
+from tests.bootstrap_artifacts import artifacts, ROOTS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,18 +25,13 @@ class BootstrapAnalysisTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temporary = tempfile.TemporaryDirectory()
         cls.directory = Path(cls.temporary.name)
-        cls.executable = cls.directory / "jack-bootstrap"
         cls.driver = CompilerDriver(print_handler=None)
-        cls.options = CompilationOptions(module_roots=(ROOT / "selfhost",))
-        cls.driver.compile_executable(
-            ROOT / "selfhost/bootstrap/main.jack",
-            CompilationOptions(
-                module_roots=(ROOT / "selfhost",),
-                backend="llvm",
-                output=cls.executable,
-            ),
-        )
-        cls.program = cls.driver.compile_hir(ROOT / "selfhost/bootstrap/main.jack", cls.options)
+        cls.options = CompilationOptions(module_roots=ROOTS)
+        cls.executable = artifacts.executable(options=cls.options).output_path
+
+    @property
+    def program(self):
+        return artifacts.hir(options=self.options)
 
     @classmethod
     def tearDownClass(cls):
@@ -131,7 +127,11 @@ pub i32 add(i32 left, i32 right) { return left + right; }
         expected_references = Counter(expected.references)
         actual_references = Counter(reference for reference in actual
                                     if reference.role != "declaration")
-        self.assertEqual(expected_references, actual_references)
+        missing = expected_references - actual_references
+        unexpected = actual_references - expected_references
+        self.assertFalse(missing or unexpected,
+                         f"Missing: {list(missing.items())[:20]}\n"
+                         f"Unexpected: {list(unexpected.items())[:20]}")
         self.assertFalse(any(reference.status == "invalid"
                              for reference in actual_references))
         self.assertEqual(
@@ -536,9 +536,10 @@ void generic(comptime type T) { i32 unknown = T.field; }
             arguments = ["jack-bootstrap", "--check-names", str(entry)]
             stdout = io.StringIO()
             stderr = io.StringIO()
+            program = self.program
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 status = Interpreter(externs=default_runtime_externs()).eval_hir_program(
-                    self.program, arguments,
+                    program, arguments,
                 )
             native = subprocess.run(
                 [str(self.executable), *arguments[1:]],

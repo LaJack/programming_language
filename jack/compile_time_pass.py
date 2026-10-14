@@ -1721,16 +1721,11 @@ class CompileTimePass:
                 parameter is not None
                 and parameter.comptime
                 and parameter.type.name == 'type'
-                and type(argument) is VariableExpression
+                and isinstance(argument, (VariableExpression, FunctionCall, TypeExpression, IndexExpression))
             ):
-                value = scope.get(argument.name)
-                if value is not None and value.type == 'type':
-                    prelude, expression = [], copy.deepcopy(value)
-                else:
-                    prelude, expression = [], LiteralExpression(
-                        self._apply_type_reference(TypeReference(argument.name), scope),
-                        'type',
-                    )
+                prelude, expression = [], LiteralExpression(
+                    self._eval_comptime_type_argument(argument, scope), 'type',
+                )
             else:
                 prelude, expression = self._apply_expression_for_argument(argument, scope)
             argument_preludes.extend(prelude)
@@ -2112,6 +2107,7 @@ class CompileTimePass:
                         field_scope,
                         owner_type=TypeReference(variant_name),
                         owner_source_name=declaration.name,
+                        type_constraints=constraints,
                     )
                     for method in declaration.methods
                 ]
@@ -4290,6 +4286,7 @@ class CompileTimePass:
         scope: CompileTimeScope,
         owner_type: TypeReference | None = None,
         owner_source_name: str | None = None,
+        type_constraints: dict[str, set[str]] | None = None,
     ) -> FunctionDeclaration:
         if declaration.comptime:
             raise CompileTimeFeatureNotImplemented('Comptime methods are not implemented yet.')
@@ -4308,7 +4305,19 @@ class CompileTimePass:
         body_scope.runtime_names.update(parameter.name for parameter in declaration.parameters)
         body_scope.runtime_names.add('self')
         return_type = self._apply_type_reference(declaration.return_type, body_scope)
-        body = self._apply_statements(declaration.body, body_scope)
+        previous_dispatch = self.active_interface_dispatch
+        self.active_interface_dispatch = {
+            **previous_dispatch,
+            **{
+                parameter.name: set(type_constraints[parameter.type.name])
+                for parameter in declaration.parameters
+                if type_constraints and parameter.type.name in type_constraints
+            },
+        }
+        try:
+            body = self._apply_statements(declaration.body, body_scope)
+        finally:
+            self.active_interface_dispatch = previous_dispatch
         self._validate_returns(declaration.name, return_type, body)
         return FunctionDeclaration(
             declaration.name,

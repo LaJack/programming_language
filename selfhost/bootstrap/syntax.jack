@@ -258,9 +258,9 @@ pub union SyntaxData {
     generic_type(SourceSpan name, ChildRange arguments);
     array_type(NodeLink element, NodeLink extent);
     slice_type(NodeLink element);
-    borrow_type(SourceSpan mode, NodeLink target);
-    raw_pointer_type(SourceSpan mode, NodeLink target);
-    nullable_pointer_type(SourceSpan mode, NodeLink target);
+    borrow_type(SyntaxQualifier mode, NodeLink target);
+    raw_pointer_type(SyntaxQualifier mode, NodeLink target);
+    nullable_pointer_type(SyntaxQualifier mode, NodeLink target);
     type_argument(NodeLink value);
     name_expression(SourceSpan name);
     integer_literal(SourceSpan spelling);
@@ -272,7 +272,7 @@ pub union SyntaxData {
     null_literal;
     unary_expression(SourceSpan operator, SyntaxOperator operation, NodeLink operand);
     binary_expression(SourceSpan operator, SyntaxOperator operation, NodeLink left, NodeLink right);
-    borrow_expression(SourceSpan mode, NodeLink operand);
+    borrow_expression(SyntaxQualifier mode, NodeLink operand);
     move_expression(NodeLink operand);
     dereference_expression(NodeLink operand);
     call_expression(NodeLink callee, ChildRange arguments);
@@ -287,7 +287,25 @@ pub union SyntaxData {
 }
 
 // Draft records exist only while the parser constructs a typed node.
+pub union SyntaxAccess { read; write; read_write; invalid; }
+
+pub str syntax_access_name(SyntaxAccess access) {
+    return match (&in access) {
+        .read => "in", .write => "out", .read_write => "inout", .invalid => "invalid",
+    };
+}
+
+pub struct SyntaxQualifier {
+    SourceSpan location;
+    SyntaxAccess access;
+    SourceSpan source_span(&in self) { return self.location; }
+    SyntaxAccess access_mode(&in self) { return self.access; }
+    usize start_offset(&in self) { return self.location.start_offset(); }
+    usize end_offset(&in self) { return self.location.end_offset(); }
+}
+
 pub union NodeDraft {
+    qualified(SourceSpan mode, SyntaxAccess access, ChildRange children);
     operator(SourceSpan text, SyntaxOperator operation, ChildRange children);
     metadata(SourceSpan text, SourceSpan extra, u32 value, ChildRange children);
     none;
@@ -2254,8 +2272,10 @@ pub SyntaxNode materialize_node(
         span.line_number(), span.column_number());
     u32 flags = u32(0);
     SyntaxOperator operation = SyntaxOperator.invalid;
+    SyntaxAccess access = SyntaxAccess.invalid;
     ChildRange children = ChildRange { start = usize(0), length = usize(0) };
     match (&in draft) {
+        .qualified(mode, value, range) { text = mode; access = value; children = range; }
         .operator(value, op, range) { text = value; operation = op; children = range; }
         .metadata(value, additional, modifiers, range) {
             text = value; extra = additional; flags = modifiers; children = range;
@@ -2358,9 +2378,9 @@ pub SyntaxNode materialize_node(
         .generic_type => SyntaxData.generic_type(text, children),
         .array_type => SyntaxData.array_type(draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
         .slice_type => SyntaxData.slice_type(draft_child(builder, children, usize(0))),
-        .borrow_type => SyntaxData.borrow_type(text, draft_child(builder, children, usize(0))),
-        .raw_pointer_type => SyntaxData.raw_pointer_type(text, draft_child(builder, children, usize(0))),
-        .nullable_pointer_type => SyntaxData.nullable_pointer_type(text, draft_child(builder, children, usize(0))),
+        .borrow_type => SyntaxData.borrow_type(SyntaxQualifier { location = text, access = access }, draft_child(builder, children, usize(0))),
+        .raw_pointer_type => SyntaxData.raw_pointer_type(SyntaxQualifier { location = text, access = access }, draft_child(builder, children, usize(0))),
+        .nullable_pointer_type => SyntaxData.nullable_pointer_type(SyntaxQualifier { location = text, access = access }, draft_child(builder, children, usize(0))),
         .type_argument => SyntaxData.type_argument(draft_child(builder, children, usize(0))),
         .name_expression => SyntaxData.name_expression(text),
         .integer_literal => SyntaxData.integer_literal(text),
@@ -2372,7 +2392,7 @@ pub SyntaxNode materialize_node(
         .null_literal => SyntaxData.null_literal,
         .unary_expression => SyntaxData.unary_expression(text, operation, draft_child(builder, children, usize(0))),
         .binary_expression => SyntaxData.binary_expression(text, operation, draft_child(builder, children, usize(0)), draft_child(builder, children, usize(1))),
-        .borrow_expression => SyntaxData.borrow_expression(text, draft_child(builder, children, usize(0))),
+        .borrow_expression => SyntaxData.borrow_expression(SyntaxQualifier { location = text, access = access }, draft_child(builder, children, usize(0))),
         .move_expression => SyntaxData.move_expression(draft_child(builder, children, usize(0))),
         .dereference_expression => SyntaxData.dereference_expression(draft_child(builder, children, usize(0))),
         .call_expression => SyntaxData.call_expression(draft_child(builder, children, usize(0)), subrange(children, tail, children.len())),
@@ -2585,6 +2605,18 @@ void validate_range(&in ParsedFile file, &in SyntaxNode parent,
     }
 }
 
+void validate_qualifier(&in SourceMap sources, &in SyntaxNode parent,
+    SyntaxQualifier qualifier, bool allow_out)
+    raises SyntaxValidationError, SourceMapError {
+    SourceSpan span = qualifier.source_span();
+    validate_text(sources, parent, span);
+    SyntaxAccess access = qualifier.access_mode();
+    if (access == SyntaxAccess.invalid || (allow_out == false && access == SyntaxAccess.write)
+        || sources.text_equals(span, syntax_access_name(access)) == false) {
+        raise SyntaxValidationError { };
+    }
+}
+
 void validate_text(&in SourceMap sources, &in SyntaxNode parent, SourceSpan text)
     raises SourceMapError, SyntaxValidationError {
     SourceId source = text.source_id();
@@ -2791,15 +2823,15 @@ void validate_payload(&in SourceMap sources, &in ParsedFile file, &in SyntaxNode
             validate_link(file, node, element, "type", false);
         }
         .borrow_type(mode, target) {
-            validate_text(sources, node, mode);
+            validate_qualifier(sources, node, mode, true);
             validate_link(file, node, target, "type", true);
         }
         .raw_pointer_type(mode, target) {
-            validate_text(sources, node, mode);
+            validate_qualifier(sources, node, mode, false);
             validate_link(file, node, target, "type", false);
         }
         .nullable_pointer_type(mode, target) {
-            validate_text(sources, node, mode);
+            validate_qualifier(sources, node, mode, false);
             validate_link(file, node, target, "type", false);
         }
         .type_argument(value) {
@@ -2839,7 +2871,7 @@ void validate_payload(&in SourceMap sources, &in ParsedFile file, &in SyntaxNode
             validate_link(file, node, right, "expression", false);
         }
         .borrow_expression(mode, operand) {
-            validate_text(sources, node, mode);
+            validate_qualifier(sources, node, mode, true);
             validate_link(file, node, operand, "expression", false);
         }
         .move_expression(operand) {

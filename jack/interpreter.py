@@ -261,11 +261,16 @@ class JackBorrow:
     def get_field(self, name: str) -> object:
         if not borrow_mode_can_read(self._field_mode(name)):
             raise EvaluationError('Cannot read through a write-only borrow.')
+        if isinstance(self.value, (JackBorrow, JackArrayElementBorrow)):
+            return self.value.get_field(name)
         return getattr(self.value, name)
 
     def set_field(self, name: str, value: object) -> None:
         if not borrow_mode_can_write(self._field_mode(name)):
             raise EvaluationError('Cannot assign through a read-only borrow.')
+        if isinstance(self.value, (JackBorrow, JackArrayElementBorrow)):
+            self.value.set_field(name, value)
+            return
         setattr(self.value, name, value)
 
     def _field_mode(self, name: str) -> str:
@@ -451,7 +456,7 @@ class JackRawPointer:
     def as_maybe_uninit(self, element_key: str, element_size: int) -> 'JackRawPointer':
         self._require_live()
         if self.allocation is None:
-            return self
+            return JackRawPointer(self.target, self.mutable, unwrap_storage=False)
         if element_size <= 0:
             raise EvaluationError('MaybeUninit pointer element size must be positive.')
         byte_offset = (
@@ -1455,6 +1460,10 @@ class Interpreter:
                 raise EvaluationError('Cannot borrow through a non-pointer value.')
             if mutable and not pointer.mutable:
                 raise EvaluationError('Cannot create a writable borrow through *in pointer.')
+            if pointer.unwrap_storage and isinstance(pointer.target.value, MemoryMaybeUninit):
+                slot = pointer.target.value
+                slot.get()
+                return JackMaybeUninitBorrow(slot, expression.mode)
             return pointer.target
         if isinstance(expression.expr, HIRSliceExpression):
             return self._slice_from_hir_expression(
@@ -1608,10 +1617,8 @@ class Interpreter:
 
 
     def _method_receiver_value(self, value: object) -> object:
-        if isinstance(value, JackBorrow):
-            return value.value
-        if isinstance(value, JackArrayElementBorrow):
-            return value.value
+        while isinstance(value, (JackBorrow, JackArrayElementBorrow)):
+            value = value.value
         return value
 
 

@@ -40,6 +40,7 @@ pub struct SymbolId {
     usize project;
     usize index;
     usize project_identity(&in self) { return self.project; }
+    usize symbol_ordinal(&in self) { return self.index; }
     bool equals(&in self, SymbolId other) {
         return self.project == other.project && self.index == other.index;
     }

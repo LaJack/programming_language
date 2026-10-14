@@ -231,6 +231,30 @@ u32 binary_precedence(
     return u32(0);
 }
 
+SyntaxAccess current_access(&in ParserState parser, &in SourceMap context)
+    raises BoundsError, SourceMapError {
+    if (token_is(parser, context, "in")) { return SyntaxAccess.read; }
+    if (token_is(parser, context, "out")) { return SyntaxAccess.write; }
+    if (token_is(parser, context, "inout")) { return SyntaxAccess.read_write; }
+    return SyntaxAccess.invalid;
+}
+
+ArenaHandle(SyntaxNode) insert_qualified_node(&inout ParserState parser,
+    SyntaxKind kind, SourceSpan span, SourceSpan mode, SyntaxAccess access,
+    usize children)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, ArenaHandleError {
+    ChildRange range = finish_list(parser, children);
+    if (access == SyntaxAccess.invalid
+        || (access == SyntaxAccess.write && kind != SyntaxKind.borrow_type
+            && kind != SyntaxKind.borrow_expression)) {
+        if (kind == SyntaxKind.borrow_expression) {
+            return insert_node(parser, SyntaxKind.invalid_expression, span, NodeDraft.none);
+        }
+        return insert_node(parser, SyntaxKind.invalid_type, span, NodeDraft.none);
+    }
+    return insert_node(parser, kind, span, NodeDraft.qualified(mode, access, range));
+}
+
 ArenaHandle(SyntaxNode) invalid_expression(
     &inout ParserState parser, &in SourceMap context, &inout DiagnosticBag diagnostics
 ) raises CapacityError, LayoutError, AllocationError, BoundsError, ArenaHandleError, SourceMapError {
@@ -419,7 +443,10 @@ ArenaHandle(SyntaxNode) parse_prefix(
     if (prefix) {
         SourceSpan operator = first;
         parser.current = parser.current + usize(1);
-        if (kind == SyntaxKind.borrow_expression && current_is_identifier(parser)) {
+        SourceSpan mode_span = current_span(parser);
+        SyntaxAccess access = SyntaxAccess.invalid;
+        if (kind == SyntaxKind.borrow_expression) {
+            access = current_access(parser, context);
             if (token_is(parser, context, "in") || token_is(parser, context, "out")
                 || token_is(parser, context, "inout")) {
                 parser.current = parser.current + usize(1);
@@ -431,6 +458,10 @@ ArenaHandle(SyntaxNode) parse_prefix(
         ArenaHandle(SyntaxNode) operand = parse_expression(parser, context, diagnostics, u32(10));
         usize children = child_list(parser);
         push_child(parser, children, operand);
+        if (kind == SyntaxKind.borrow_expression) {
+            return insert_qualified_node(parser, kind,
+                cover_spans(first, previous_span(parser)), mode_span, access, children);
+        }
         if (kind == SyntaxKind.unary_expression) {
             return insert_operator_children_node(parser, kind,
                 cover_spans(first, node_span(parser, operand)), operator,
@@ -935,9 +966,12 @@ ArenaHandle(SyntaxNode) parse_type_syntax_inner(
     SourceSpan first = current_span(parser);
     SyntaxKind wrapper = SyntaxKind.named_type;
     SourceSpan prefix = first;
+    SourceSpan mode_span = first;
+    SyntaxAccess access = SyntaxAccess.invalid;
     bool wrapped = false;
     if (advance_if(parser, context, "&")) {
         wrapper = SyntaxKind.borrow_type; wrapped = true;
+        mode_span = current_span(parser); access = current_access(parser, context);
         if (token_is(parser, context, "in") || token_is(parser, context, "out")
             || token_is(parser, context, "inout")) {
             parser.current = parser.current + usize(1);
@@ -947,6 +981,7 @@ ArenaHandle(SyntaxNode) parse_type_syntax_inner(
     } elif (advance_if(parser, context, "?")) {
         wrapper = SyntaxKind.nullable_pointer_type; wrapped = true;
         expect(parser, context, diagnostics, "*", "expected * after ? in pointer type");
+        mode_span = current_span(parser); access = current_access(parser, context);
         if (token_is(parser, context, "in") || token_is(parser, context, "inout")) {
             parser.current = parser.current + usize(1);
         } else {
@@ -954,6 +989,7 @@ ArenaHandle(SyntaxNode) parse_type_syntax_inner(
         }
     } elif (advance_if(parser, context, "*")) {
         wrapper = SyntaxKind.raw_pointer_type; wrapped = true;
+        mode_span = current_span(parser); access = current_access(parser, context);
         if (token_is(parser, context, "in") || token_is(parser, context, "inout")) {
             parser.current = parser.current + usize(1);
         } else {
@@ -1030,9 +1066,9 @@ ArenaHandle(SyntaxNode) parse_type_syntax_inner(
     if (wrapped) {
         usize child = child_list(parser);
         push_child(parser, child, result);
-        result = insert_text_children_node(
-            parser, wrapper, cover_spans(first, previous_span(parser)), prefix,
-            u32(0), child
+        result = insert_qualified_node(
+            parser, wrapper, cover_spans(first, previous_span(parser)), mode_span,
+            access, child
         );
     }
     return result;
@@ -1052,6 +1088,8 @@ ArenaHandle(SyntaxNode) parse_parameter_syntax(
     if (token_is(parser, context, "&")) {
         SourceSpan borrow = current_span(parser);
         parser.current = parser.current + usize(1);
+        SourceSpan mode_span = current_span(parser);
+        SyntaxAccess access = current_access(parser, context);
         if (token_is(parser, context, "in") || token_is(parser, context, "out")
             || token_is(parser, context, "inout")) {
             parser.current = parser.current + usize(1);
@@ -1062,7 +1100,8 @@ ArenaHandle(SyntaxNode) parse_parameter_syntax(
             usize self_children = child_list(parser);
             push_child(parser, self_children, insert_node(
                 parser, SyntaxKind.borrow_type,
-                cover_spans(borrow, self_name), NodeDraft.text(cover_spans(borrow, self_name))
+                cover_spans(borrow, self_name), NodeDraft.qualified(mode_span, access,
+                    ChildRange { start = usize(0), length = usize(0) })
             ));
             return insert_text_children_node(
                 parser, SyntaxKind.parameter,

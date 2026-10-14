@@ -347,6 +347,8 @@ class StageZeroBindings:
                            "<implementation>")
             implementation_scope = Scope(scope)
             implementation_scope.generic_owner = owner
+            implementation_scope.bind(Target(source.path, start, end,
+                                             "self_type", "Self", owner.identity))
             self._visit(source, node.parameters, implementation_scope,
                         aliases, "generic_parameter")
             if node.type_name:

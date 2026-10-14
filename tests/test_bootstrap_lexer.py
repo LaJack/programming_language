@@ -11,6 +11,7 @@ from tests.bootstrap_syntax_normalization import (
     bootstrap_nodes, first_difference, python_node, read_dump, root_source_ranges,
 )
 from tests.bootstrap_interpreter_runner import run_hir_isolated
+from tests.bootstrap_artifacts import artifacts, ROOTS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,42 +43,18 @@ class BootstrapLexerTests(unittest.TestCase):
     def setUpClass(cls):
         cls.build = tempfile.TemporaryDirectory()
         cls.root = Path(cls.build.name)
-        driver = CompilerDriver(print_handler=None)
-        started = time.perf_counter()
-        cls.program = driver.compile_hir(
-            ENTRY, CompilationOptions(module_roots=(SELFHOST_ROOT,))
-        )
-        print(f"bootstrap HIR build: {time.perf_counter() - started:.2f}s",
-              file=sys.stderr, flush=True)
         cls.executables = {}
         cls.compilation_results = {}
-        for backend in ('c', 'llvm'):
-            started = time.perf_counter()
-            output = cls.root / f'bootstrap-{backend}'
-            cls.compilation_results[backend] = driver.compile_executable(
-                ENTRY,
-                CompilationOptions(
-                    backend=backend,
-                    output=output,
-                    module_roots=(SELFHOST_ROOT,),
-                ),
-            )
-            cls.executables[backend] = output
-            print(f"bootstrap {backend} -O0 build: {time.perf_counter() - started:.2f}s",
-                  file=sys.stderr, flush=True)
-        for backend in ('llvm', 'c'):
-            started = time.perf_counter()
-            optimized = cls.root / f'bootstrap-{backend}-o2'
-            driver.compile_executable(
-                ENTRY,
-                CompilationOptions(
-                    backend=backend, output=optimized, optimization=2,
-                    module_roots=(SELFHOST_ROOT,),
-                ),
-            )
-            cls.executables[f'{backend}-o2'] = optimized
-            print(f"bootstrap {backend} -O2 build: {time.perf_counter() - started:.2f}s",
-                  file=sys.stderr, flush=True)
+
+    def executable(self, backend):
+        if backend not in self.executables:
+            result = artifacts.executable(ENTRY, CompilationOptions(
+                backend=backend.removesuffix('-o2'), module_roots=ROOTS,
+                optimization=2 if backend.endswith('-o2') else 0,
+            ))
+            self.compilation_results[backend] = result
+            self.executables[backend] = result.output_path
+        return self.executables[backend]
 
     @classmethod
     def tearDownClass(cls):
@@ -85,16 +62,17 @@ class BootstrapLexerTests(unittest.TestCase):
 
     def run_interpreter(self, path: Path | None, *arguments: str):
         return run_hir_isolated(
-            self.program,
+            artifacts.hir(),
             ['jack-bootstrap', *arguments,
              *([] if path is None else [str(path)])],
             timeout=180, label=path.name if path is not None else "no-entry",
         )
 
     def run_native(self, backend: str, *arguments: str):
+        executable = self.executable(backend)
         started = time.perf_counter()
         result = subprocess.run(
-            [str(self.executables[backend]), *arguments],
+            [str(executable), *arguments],
             capture_output=True,
             text=True,
             timeout=20,
@@ -271,7 +249,9 @@ i32 later = 2;
 
     def test_token_specification_is_a_recorded_comptime_dependency(self):
         expected = (SELFHOST_ROOT / 'bootstrap' / 'jack.tokens').resolve()
-        for backend, result in self.compilation_results.items():
+        for backend in ('c', 'llvm'):
+            self.executable(backend)
+            result = self.compilation_results[backend]
             with self.subTest(backend=backend):
                 self.assertIn(expected, result.comptime_dependencies)
 

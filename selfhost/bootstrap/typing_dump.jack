@@ -87,6 +87,9 @@ pub String(SystemAllocator) dump_types(&in TypedProject typed)
     SystemAllocator allocator;
     StringBuilder(SystemAllocator) output(allocator);
     usize index = usize(0);
+    output.append("checking\texpressions\t"); output.append_usize(typed.expression_check_count());
+    output.append("\trequests\t"); output.append_usize(typed.expression_request_count());
+    output.append("\n");
     while (index < typed.type_count()) {
         TypeId id = typed.type_at(index);
         TypeShape shape = typed.type_record(id).type_shape();
@@ -161,6 +164,37 @@ pub String(SystemAllocator) dump_types(&in TypedProject typed)
         number(output, span.start_offset());
         number(output, span.end_offset());
         field(output, check_kind_name(failure.check_kind()));
+        output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < typed.conversion_count()) {
+        &in TypeConversion conversion = typed.conversion(index);
+        SourceSpan span = typed.project().frontend().node(conversion.syntax_node()).source_span();
+        output.append("conversion");
+        field(output, typed.project().frontend().source_map().path(span.source_id()));
+        number(output, span.start_offset()); number(output, span.end_offset());
+        number(output, conversion.source_type().type_index());
+        number(output, conversion.destination_type().type_index());
+        field(output, check_kind_name(conversion.check_kind())); output.append("\n");
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < typed.target_count()) {
+        &in TypeTarget target = typed.target(index);
+        SourceSpan span = typed.project().frontend().node(target.syntax_node()).source_span();
+        output.append("target");
+        field(output, typed.project().frontend().source_map().path(span.source_id()));
+        number(output, span.start_offset()); number(output, span.end_offset());
+        number(output, typed.project().symbol_index(target.declaration()));
+        SymbolOrigin origin = typed.project().symbol(target.declaration()).declaration_origin();
+        match (&in origin) {
+            .source(_, name) {
+                field(output, typed.project().frontend().source_map().path(name.source_id()));
+                number(output, name.start_offset()); number(output, name.end_offset());
+            }
+            .builtin { field(output, "builtin"); }
+        }
         output.append("\n");
         index = index + usize(1);
     }

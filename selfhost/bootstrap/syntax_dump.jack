@@ -662,16 +662,22 @@ void append_node_record(
         .slice_type(element) {
         }
         .borrow_type(mode, target) {
+            output.append("value\t"); output.append_usize(id);
+            output.append("\taccess\t"); output.append(syntax_access_name(mode.access_mode())); output.append("\n");
             output.append("field\t"); output.append_usize(id);
             output.append("\tmode\t"); output.append_usize(mode.start_offset());
             output.append("\t"); output.append_usize(mode.end_offset()); output.append("\n");
         }
         .raw_pointer_type(mode, target) {
+            output.append("value\t"); output.append_usize(id);
+            output.append("\taccess\t"); output.append(syntax_access_name(mode.access_mode())); output.append("\n");
             output.append("field\t"); output.append_usize(id);
             output.append("\tmode\t"); output.append_usize(mode.start_offset());
             output.append("\t"); output.append_usize(mode.end_offset()); output.append("\n");
         }
         .nullable_pointer_type(mode, target) {
+            output.append("value\t"); output.append_usize(id);
+            output.append("\taccess\t"); output.append(syntax_access_name(mode.access_mode())); output.append("\n");
             output.append("field\t"); output.append_usize(id);
             output.append("\tmode\t"); output.append_usize(mode.start_offset());
             output.append("\t"); output.append_usize(mode.end_offset()); output.append("\n");
@@ -723,6 +729,8 @@ void append_node_record(
             output.append("\t"); output.append_usize(operator.end_offset()); output.append("\n");
         }
         .borrow_expression(mode, operand) {
+            output.append("value\t"); output.append_usize(id);
+            output.append("\taccess\t"); output.append(syntax_access_name(mode.access_mode())); output.append("\n");
             output.append("field\t"); output.append_usize(id);
             output.append("\tmode\t"); output.append_usize(mode.start_offset());
             output.append("\t"); output.append_usize(mode.end_offset()); output.append("\n");

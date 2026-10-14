@@ -5,6 +5,7 @@ import bootstrap.frontend;
 import bootstrap.names;
 import bootstrap.syntax;
 import std.collections.vector;
+import std.collections.hash_map;
 import std.memory;
 
 pub struct TypeId {
@@ -169,6 +170,51 @@ pub struct TypeCheckFailure {
     IssueId issue_cause(&in self) { return self.cause; }
 }
 
+pub struct TypeConversion {
+    NodeRef node;
+    TypeId source;
+    TypeId destination;
+    TypeCheckKind kind;
+    NodeRef syntax_node(&in self) { return self.node; }
+    TypeId source_type(&in self) { return self.source; }
+    TypeId destination_type(&in self) { return self.destination; }
+    TypeCheckKind check_kind(&in self) { return self.kind; }
+}
+
+pub struct TypeTarget {
+    NodeRef node;
+    SymbolId symbol;
+    NodeRef syntax_node(&in self) { return self.node; }
+    SymbolId declaration(&in self) { return self.symbol; }
+}
+
+pub struct PendingKey {
+    NodeRef node;
+    TypeCheckKind kind;
+    TypeDeferred reason;
+    NodeRef dependency;
+}
+
+PendingKey implements HashKey {
+    u64 hash(&in self) {
+        return u64(self.node.file_ordinal()) ^ (u64(self.node.node_ordinal()) << u32(16))
+            ^ (u64(self.dependency.file_ordinal()) << u32(32))
+            ^ (u64(self.dependency.node_ordinal()) << u32(1));
+    }
+    bool equals(&in self, &in Self other) {
+        return self.node.equals(other.node) && self.kind == other.kind
+            && same_type_deferred(self.reason, other.reason)
+            && self.dependency.equals(other.dependency);
+    }
+}
+
+pub struct TypeFileIndex {
+    Vector(usize, SystemAllocator) results;
+    Vector(usize, SystemAllocator) targets;
+}
+
+pub union TypePhase { unprepared; declarations; bodies; checked; validated; }
+
 pub struct TypeTables {
     usize identity;
     Vector(TypeRecord, SystemAllocator) types;
@@ -179,10 +225,125 @@ pub struct TypeTables {
     Vector(TypedOccurrence, SystemAllocator) occurrences;
     Vector(PendingType, SystemAllocator) pending;
     Vector(TypeCheckFailure, SystemAllocator) failures;
+    Vector(TypeConversion, SystemAllocator) conversions;
+    Vector(TypeTarget, SystemAllocator) targets;
+    HashMap(PendingKey, usize, SystemAllocator) pending_index;
+    Vector(TypeFileIndex, SystemAllocator) files;
+    Vector(usize, SystemAllocator) signature_index;
+    usize expression_checks;
+    usize expression_requests;
+    TypePhase phase;
+
+    void enter_bodies(&inout self, usize identity) raises ProjectReferenceError {
+        if (self.identity != identity || self.phase != TypePhase.declarations) {
+            raise ProjectReferenceError { };
+        }
+        self.phase = TypePhase.bodies;
+    }
+    void finish_bodies(&inout self, usize identity) raises ProjectReferenceError {
+        if (self.identity != identity || self.phase != TypePhase.bodies) {
+            raise ProjectReferenceError { };
+        }
+        self.phase = TypePhase.checked;
+    }
+
+    void prepare(&inout self, &in FrontendProject project)
+        raises CapacityError, LayoutError, AllocationError, BoundsError,
+            ProjectReferenceError, FrontendReferenceError {
+        if (self.identity != project.identity_value() || self.phase != TypePhase.unprepared) {
+            raise ProjectReferenceError { };
+        }
+        usize index = usize(0);
+        while (index < project.frontend().file_count()) {
+            ParsedFileId file = project.frontend().file_at(index);
+            usize count = project.frontend().file(file).node_count();
+            SystemAllocator allocator;
+            Vector(usize, SystemAllocator) results(allocator, count);
+            SystemAllocator target_allocator;
+            Vector(usize, SystemAllocator) targets(target_allocator, count);
+            usize node = usize(0);
+            while (node < count) {
+                results.push(usize(0)); targets.push(usize(0)); node = node + usize(1);
+            }
+            self.files.push(TypeFileIndex { results = move results, targets = move targets });
+            index = index + usize(1);
+        }
+        index = usize(0);
+        while (index < project.symbol_count()) {
+            self.signature_index.push(usize(0)); index = index + usize(1);
+        }
+        self.phase = TypePhase.declarations;
+    }
+
+    usize result_index(&in self, NodeRef node) raises BoundsError {
+        if (node.project_identity() != self.identity) { raise BoundsError { }; }
+        return self.files.get(node.file_ordinal()).results.get(node.node_ordinal());
+    }
+
+    bool has_result(&in self, NodeRef node) raises BoundsError {
+        return self.result_index(node) != usize(0);
+    }
+
+    TypeCategory category_for(&in self, NodeRef node) raises ProjectReferenceError {
+        try {
+            usize index = self.result_index(node);
+            if (index != usize(0)) {
+                return self.occurrences.get(index - usize(1)).expression_category();
+            }
+        } catch BoundsError { raise ProjectReferenceError { }; }
+        raise ProjectReferenceError { };
+    }
+
+    bool has_signature(&in self, SymbolId symbol) raises ProjectReferenceError {
+        if (symbol.project_identity() != self.identity) { raise ProjectReferenceError { }; }
+        try { return self.signature_index.get(symbol.symbol_ordinal()) != usize(0); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+
+    SymbolLink target_for(&in self, NodeRef node) raises BoundsError {
+        self.result_index(node);
+        usize index = self.files.get(node.file_ordinal()).targets.get(node.node_ordinal());
+        if (index == usize(0)) { return SymbolLink.none; }
+        return SymbolLink.present(self.targets.get(index - usize(1)).declaration());
+    }
+
+    void record_target(&inout self, NodeRef node, SymbolId symbol)
+        raises CapacityError, LayoutError, AllocationError, BoundsError {
+        self.result_index(node);
+        if (symbol.project_identity() != self.identity || symbol.symbol_ordinal() >= self.signature_index.len()) {
+            raise BoundsError { };
+        }
+        SymbolLink existing = self.target_for(node);
+        match (&in existing) {
+            .present(previous) {
+                if (previous.equals(symbol) == false) { raise BoundsError { }; }
+                return;
+            }
+            .none { }
+        }
+        self.targets.push(TypeTarget { node = node, symbol = symbol });
+        &inout TypeFileIndex file = self.files.get_mut(node.file_ordinal());
+        file.targets.replace(node.node_ordinal(), self.targets.len());
+    }
     usize argument_count(&in self) { return self.arguments.len(); }
     usize type_count(&in self) { return self.types.len(); }
     usize parameter_count(&in self) { return self.parameters.len(); }
     usize error_count(&in self) { return self.errors.len(); }
+    usize signature_count(&in self) { return self.signatures.len(); }
+    usize occurrence_count(&in self) { return self.occurrences.len(); }
+    usize pending_count(&in self) { return self.pending.len(); }
+    usize conversion_count(&in self) { return self.conversions.len(); }
+    usize expression_check_count(&in self) { return self.expression_checks; }
+    usize expression_request_count(&in self) { return self.expression_requests; }
+    void requested_expression(&inout self) { self.expression_requests = self.expression_requests + usize(1); }
+    void checked_expression(&inout self) { self.expression_checks = self.expression_checks + usize(1); }
+    void add_conversion(&inout self, NodeRef node, TypeId source, TypeId destination,
+        TypeCheckKind kind) raises CapacityError, LayoutError, AllocationError {
+        if (source.equals(destination)) { return; }
+        self.conversions.push(TypeConversion {
+            node = node, source = source, destination = destination, kind = kind
+        });
+    }
     void add_pending(&inout self, NodeRef node, TypeDeferred reason)
         raises CapacityError, LayoutError, AllocationError, BoundsError {
         self.add_obligation(node, TypeCheckKind.expression, reason, node);
@@ -190,17 +351,11 @@ pub struct TypeTables {
     void add_obligation(&inout self, NodeRef node, TypeCheckKind kind,
         TypeDeferred reason, NodeRef dependency)
         raises CapacityError, LayoutError, AllocationError, BoundsError {
-        usize index = usize(0);
-        while (index < self.pending.len()) {
-            PendingType existing;
-            try { existing = self.pending.get(index); }
-            catch BoundsError { raise BoundsError { }; }
-            if (existing.syntax_node().equals(node)
-                && existing.check_kind() == kind
-                && existing.depends_on().equals(dependency)
-                && same_type_deferred(existing.deferred_reason(), reason)) { return; }
-            index = index + usize(1);
-        }
+        self.result_index(node);
+        self.result_index(dependency);
+        PendingKey key = PendingKey { node = node, kind = kind, reason = reason, dependency = dependency };
+        if (self.pending_index.contains(key)) { return; }
+        self.pending_index.insert(key, self.pending.len());
         self.pending.push(PendingType {
             node = node, kind = kind, reason = reason, dependency = dependency,
         });
@@ -232,6 +387,9 @@ pub struct TypeTables {
     void record_category(&inout self, NodeRef node, TypeResult result,
         TypeCategory category, bool writable)
         raises CapacityError, LayoutError, AllocationError, BoundsError {
+        if (self.phase != TypePhase.declarations && self.phase != TypePhase.bodies) {
+            raise BoundsError { };
+        }
         bool place = category == TypeCategory.place;
         match (&in result) {
             .deferred(reason) {
@@ -241,21 +399,20 @@ pub struct TypeTables {
             }
             _ { }
         }
-        usize index = usize(0);
-        while (index < self.occurrences.len()) {
-            if (self.occurrences.get(index).node.equals(node)) {
-                self.occurrences.replace(index, TypedOccurrence {
-                    node = node, result = result, category = category,
-                    place = place, writable = writable,
-                });
-                return;
-            }
-            index = index + usize(1);
+        usize index = self.result_index(node);
+        if (index != usize(0)) {
+            self.occurrences.replace(index - usize(1), TypedOccurrence {
+                node = node, result = result, category = category,
+                place = place, writable = writable,
+            });
+            return;
         }
         self.occurrences.push(TypedOccurrence {
             node = node, result = result, category = category,
             place = place, writable = writable,
         });
+        &inout TypeFileIndex file = self.files.get_mut(node.file_ordinal());
+        file.results.replace(node.node_ordinal(), self.occurrences.len());
     }
     void add_failure(&inout self, NodeRef node, TypeCheckKind kind, IssueId cause)
         raises CapacityError, LayoutError, AllocationError, BoundsError {
@@ -300,9 +457,13 @@ pub struct TypeTables {
         catch BoundsError { raise ProjectReferenceError { }; }
     }
     SignatureId add_signature(&inout self, SignatureRecord record)
-        raises CapacityError, LayoutError, AllocationError {
+        raises CapacityError, LayoutError, AllocationError, BoundsError {
         usize index = self.signatures.len();
+        usize symbol = record.declaration().symbol_ordinal();
+        if (record.declaration().project_identity() != self.identity
+            || self.signature_index.get(symbol) != usize(0)) { raise BoundsError { }; }
         self.signatures.push(record);
+        self.signature_index.replace(symbol, index + usize(1));
         return SignatureId { project = self.identity, index = index };
     }
     usize add_parameter(&inout self, SignatureParameter parameter)
@@ -323,26 +484,18 @@ pub struct TypeTables {
     }
     SignatureId signature_for(&in self, SymbolId symbol) raises ProjectReferenceError {
         if (symbol.project_identity() != self.identity) { raise ProjectReferenceError { }; }
-        usize index = usize(0);
-        while (index < self.signatures.len()) {
-            try {
-                if (self.signatures.get(index).symbol.equals(symbol)) {
-                    return SignatureId { project = self.identity, index = index };
-                }
-            } catch BoundsError { raise ProjectReferenceError { }; }
-            index = index + usize(1);
-        }
+        try {
+            usize index = self.signature_index.get(symbol.symbol_ordinal());
+            if (index != usize(0)) {
+                return SignatureId { project = self.identity, index = index - usize(1) };
+            }
+        } catch BoundsError { raise ProjectReferenceError { }; }
         raise ProjectReferenceError { };
     }
     TypeResult result_for(&in self, NodeRef node) raises ProjectReferenceError {
         try {
-            usize index = usize(0);
-            while (index < self.occurrences.len()) {
-                if (self.occurrences.get(index).node.equals(node)) {
-                    return self.occurrences.get(index).result;
-                }
-                index = index + usize(1);
-            }
+            usize index = self.result_index(node);
+            if (index != usize(0)) { return self.occurrences.get(index - usize(1)).result; }
         } catch BoundsError { raise ProjectReferenceError { }; }
         raise ProjectReferenceError { };
     }
@@ -442,11 +595,24 @@ pub TypeTables type_tables(usize identity)
     Vector(PendingType, SystemAllocator) pending(pending_allocator, usize(0));
     SystemAllocator failure_allocator;
     Vector(TypeCheckFailure, SystemAllocator) failures(failure_allocator, usize(0));
+    SystemAllocator conversion_allocator;
+    Vector(TypeConversion, SystemAllocator) conversions(conversion_allocator, usize(0));
+    SystemAllocator target_allocator;
+    Vector(TypeTarget, SystemAllocator) targets(target_allocator, usize(0));
+    SystemAllocator pending_index_allocator;
+    HashMap(PendingKey, usize, SystemAllocator) pending_index(pending_index_allocator, usize(0));
+    SystemAllocator files_allocator;
+    Vector(TypeFileIndex, SystemAllocator) files(files_allocator, usize(0));
+    SystemAllocator signature_index_allocator;
+    Vector(usize, SystemAllocator) signature_index(signature_index_allocator, usize(0));
     return TypeTables {
         identity = identity, types = move types, arguments = move arguments,
         signatures = move signatures, parameters = move parameters,
         errors = move errors, occurrences = move occurrences, pending = move pending,
-        failures = move failures,
+        failures = move failures, conversions = move conversions, targets = move targets,
+        pending_index = move pending_index,
+        files = move files, signature_index = move signature_index,
+        expression_checks = usize(0), expression_requests = usize(0), phase = TypePhase.unprepared,
     };
 }
 
@@ -464,6 +630,10 @@ pub struct TypedProject {
     usize signature_count(&in self) { return self.types.signatures.len(); }
     usize occurrence_count(&in self) { return self.types.occurrences.len(); }
     usize failure_count(&in self) { return self.types.failures.len(); }
+    usize conversion_count(&in self) { return self.types.conversions.len(); }
+    usize target_count(&in self) { return self.types.targets.len(); }
+    usize expression_check_count(&in self) { return self.types.expression_checks; }
+    usize expression_request_count(&in self) { return self.types.expression_requests; }
     usize pending_count(&in self) {
         return self.types.pending.len();
     }
@@ -540,6 +710,14 @@ pub struct TypedProject {
         try { return self.types.pending.get(index); }
         catch BoundsError { raise ProjectReferenceError { }; }
     }
+    &in TypeConversion conversion(&in self, usize index) raises ProjectReferenceError {
+        try { return self.types.conversions.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
+    &in TypeTarget target(&in self, usize index) raises ProjectReferenceError {
+        try { return self.types.targets.get(index); }
+        catch BoundsError { raise ProjectReferenceError { }; }
+    }
 }
 
 void validate_type_result(&in FrontendProject project, &in TypeTables tables,
@@ -555,14 +733,22 @@ void validate_type_result(&in FrontendProject project, &in TypeTables tables,
     }
 }
 
-void validate_typed_tables(&in FrontendProject project, &in TypeTables tables)
+pub void validate_typed_tables(&in FrontendProject project, &in TypeTables tables)
     raises ProjectReferenceError, FrontendReferenceError, BoundsError {
-    if (project.identity_value() != tables.identity) { raise ProjectReferenceError { }; }
+    if (project.identity_value() != tables.identity || tables.phase != TypePhase.checked) {
+        raise ProjectReferenceError { };
+    }
+    if (tables.files.len() != project.frontend().file_count()
+        || tables.signature_index.len() != project.symbol_count()
+        || tables.pending_index.len() != tables.pending.len()) { raise ProjectReferenceError { }; }
     usize index = usize(0);
     while (index < tables.occurrences.len()) {
         TypedOccurrence occurrence = tables.occurrences.get(index);
         project.frontend().node(occurrence.syntax_node());
         validate_type_result(project, tables, occurrence.type_result());
+        if (tables.result_index(occurrence.syntax_node()) != index + usize(1)) {
+            raise ProjectReferenceError { };
+        }
         index = index + usize(1);
     }
     index = usize(0);
@@ -570,12 +756,22 @@ void validate_typed_tables(&in FrontendProject project, &in TypeTables tables)
         PendingType pending = tables.pending.get(index);
         project.frontend().node(pending.syntax_node());
         project.frontend().node(pending.depends_on());
+        PendingKey key = PendingKey {
+            node = pending.syntax_node(), kind = pending.check_kind(),
+            reason = pending.deferred_reason(), dependency = pending.depends_on()
+        };
+        try {
+            if (tables.pending_index.get(key) != index) { raise ProjectReferenceError { }; }
+        } catch KeyNotFoundError { raise ProjectReferenceError { }; }
         index = index + usize(1);
     }
     index = usize(0);
     while (index < tables.signatures.len()) {
         SignatureRecord signature = tables.signatures.get(index);
         project.symbol(signature.declaration());
+        if (tables.signature_index.get(signature.declaration().symbol_ordinal()) != index + usize(1)) {
+            raise ProjectReferenceError { };
+        }
         if (signature.parameter_start > tables.parameters.len()
             || signature.parameter_length > tables.parameters.len() - signature.parameter_start
             || signature.error_start > tables.errors.len()
@@ -604,11 +800,34 @@ void validate_typed_tables(&in FrontendProject project, &in TypeTables tables)
         project.issue(failure.issue_cause());
         index = index + usize(1);
     }
+    index = usize(0);
+    while (index < tables.conversions.len()) {
+        &in TypeConversion conversion = tables.conversions.get(index);
+        project.frontend().node(conversion.syntax_node());
+        tables.shape(conversion.source_type());
+        tables.shape(conversion.destination_type());
+        index = index + usize(1);
+    }
+    index = usize(0);
+    while (index < tables.targets.len()) {
+        &in TypeTarget target = tables.targets.get(index);
+        project.frontend().node(target.syntax_node());
+        project.symbol(target.declaration());
+        SymbolLink stored = tables.target_for(target.syntax_node());
+        match (&in stored) {
+            .present(symbol) {
+                if (symbol.equals(target.declaration()) == false) { raise ProjectReferenceError { }; }
+            }
+            .none { raise ProjectReferenceError { }; }
+        }
+        index = index + usize(1);
+    }
 }
 
 pub TypedProject finish_typed_project(move FrontendProject project, move TypeTables tables)
     raises ProjectReferenceError, FrontendReferenceError, BoundsError {
     if (project.identity_value() != tables.identity) { raise ProjectReferenceError { }; }
     validate_typed_tables(project, tables);
+    tables.phase = TypePhase.validated;
     return TypedProject { source = move project, types = move tables };
 }

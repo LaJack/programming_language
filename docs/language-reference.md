@@ -760,6 +760,12 @@ raises `LayoutError` on overflow. `get` borrows the vector through `&in self`,
 while `get_mut` requires `&inout self`. `pop`, `clear`, and destruction remove
 elements in reverse index order.
 
+`HashMap(K: HashKey, V, A: Allocator)` owns its keys and values and supports
+lookup, insertion/replacement, removal, reservation, clearing, and checked
+cursor iteration. It uses open addressing with tombstones; entry borrows obey
+ordinary lexical lifetimes. See [the hash-map contract](hash-map.md) for
+ownership, allocator failures, cursor invalidation, and complexity guarantees.
+
 `Arena(T, A: Allocator)` is a monotonic typed arena built on `Vector`. Insertion
 returns an opaque, copyable `ArenaHandle(T)` containing a stable insertion
 index. Growth may relocate values, but handles remain valid because they are

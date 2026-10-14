@@ -26,7 +26,9 @@ try:
         FunctionDeclaration,
         If,
         ImportDeclaration,
+        ImplementationDeclaration,
         IndexExpression,
+        InterfaceDeclaration,
         LiteralExpression,
         Match,
         ModuleDeclaration,
@@ -130,7 +132,9 @@ except ImportError:
         FunctionDeclaration,
         If,
         ImportDeclaration,
+        ImplementationDeclaration,
         IndexExpression,
+        InterfaceDeclaration,
         LiteralExpression,
         Match,
         ModuleDeclaration,
@@ -550,6 +554,8 @@ class HIRLoweringPass(SemanticPass):
         return type(statement) in {
             ModuleDeclaration,
             ImportDeclaration,
+            InterfaceDeclaration,
+            ImplementationDeclaration,
             TypeDeclaration,
             EnumDeclaration,
             ViewDeclaration,
@@ -820,10 +826,21 @@ class HIRLoweringPass(SemanticPass):
         if type(statement) is Assignment:
             return self._assignment(statement, scope)
         if type(statement) is FunctionCall:
-            return HIRExpressionStatement(
-                expr=self._expression(statement, scope),
-                span=statement.span,
-            )
+            value = self._expression(statement, scope)
+            declaration = self.types.get(self._type_name(value.type_ref))
+            if (not self._is_reference_type(value.type_ref)
+                    and type(declaration) in {TypeDeclaration, EnumDeclaration}
+                    and getattr(declaration, 'language_item', None) is None):
+                self.expression_temporary_counter += 1
+                symbol = HIRVariableSymbol(
+                    name=f'$jack$expression$discarded${self.expression_temporary_counter}',
+                    type_ref=self._copy_type(value.type_ref), synthetic=True,
+                    span=statement.span,
+                )
+                return HIRBlock(body=[HIRVariableDeclaration(
+                    symbol=symbol, initializer=value, span=statement.span,
+                )], span=statement.span)
+            return HIRExpressionStatement(expr=value, span=statement.span)
         if type(statement) is Return:
             expr = None if statement.expr is None else self._expression(statement.expr, scope)
             if (
@@ -883,10 +900,14 @@ class HIRLoweringPass(SemanticPass):
                 body=self._block(statement.body, SemanticScope(scope)), span=statement.span
             )
         if type(statement) is UnsafeBlock:
-            return HIRUnsafeBlock(
-                body=self._block(statement.body, SemanticScope(scope)),
-                span=statement.span,
-            )
+            self.unsafe_depth += 1
+            try:
+                return HIRUnsafeBlock(
+                    body=self._block(statement.body, SemanticScope(scope)),
+                    span=statement.span,
+                )
+            finally:
+                self.unsafe_depth -= 1
         raise HIRLoweringError(
             f'Statement "{type(statement).__name__}" cannot be lowered to HIR.',
             getattr(statement, 'span', None),
@@ -940,6 +961,10 @@ class HIRLoweringPass(SemanticPass):
             symbol=symbol,
             initializer=initializer,
             constructor_call=constructor_call,
+            initialized=not (
+                initializer is None and constructor_call is None
+                and type(self.types.get(self._type_name(symbol.type_ref))) is EnumDeclaration
+            ),
             span=declaration.span,
         )
 
@@ -1333,6 +1358,15 @@ class HIRLoweringPass(SemanticPass):
                 source=expression,
             )
         if type(expression) is FunctionCall:
+            enum_construct = self._enum_constructor(expression, scope)
+            if enum_construct is not None:
+                return self._record_expression(expression, enum_construct)
+            if (isinstance(expression.callee, MemberExpression)
+                    and expression.callee.member in {'write', 'take', 'borrow', 'borrow_mut'}):
+                receiver_type = self._expression_type(expression.callee.target, scope, check_reads=False)
+                declaration = self.types.get(self._type_name(self._element_type(receiver_type)))
+                if receiver_type.pointer_mode is None and declaration is not None and getattr(declaration, 'language_item', None) == 'MaybeUninit':
+                    return self._maybe_uninit_expression(expression, scope, declaration)
             if not expression.function_name:
                 if isinstance(expression.callee, MemberExpression):
                     receiver_type = self._expression_type(
@@ -1367,9 +1401,6 @@ class HIRLoweringPass(SemanticPass):
                                 ),
                             )
                 return self._call_expression(expression, scope)
-            enum_construct = self._enum_constructor(expression, scope)
-            if enum_construct is not None:
-                return self._record_expression(expression, enum_construct)
             if expression.function_name == 'raw':
                 argument = expression.parameters[0]
                 assert type(argument) is BorrowExpression
@@ -1440,50 +1471,6 @@ class HIRLoweringPass(SemanticPass):
                         span=expression.span,
                     ),
                 )
-            if '.' in expression.function_name:
-                receiver_name, method_name = expression.function_name.rsplit('.', 1)
-                receiver = self._name_expression(
-                    receiver_name, scope, expression.span
-                )
-                declaration = self.types.get(
-                    self._type_name(self._element_type(receiver.type_ref))
-                )
-                if declaration is not None and getattr(declaration, 'language_item', None) == 'MaybeUninit':
-                    assert declaration.language_item_type is not None
-                    element = self._copy_type(declaration.language_item_type)
-                    if method_name == 'write':
-                        value = self._expression(expression.parameters[0], scope)
-                        if isinstance(value, HIRVariableExpression):
-                            value = HIRMoveExpression(
-                                expr=value,
-                                type_ref=self._copy_type(value.type_ref),
-                                read_type=self._copy_type(value.read_type),
-                                span=expression.parameters[0].span,
-                            )
-                        return HIRMaybeUninitWriteExpression(
-                            slot=receiver,
-                            value=value,
-                            type_ref=TypeReference('void'),
-                            read_type=TypeReference('void'),
-                            span=expression.span,
-                        )
-                    if method_name == 'take':
-                        return HIRMaybeUninitTakeExpression(
-                            slot=receiver,
-                            type_ref=element,
-                            read_type=self._copy_type(element),
-                            span=expression.span,
-                        )
-                    mode = 'in' if method_name == 'borrow' else 'inout'
-                    borrowed = self._copy_type(element)
-                    borrowed.borrow = mode
-                    return HIRMaybeUninitBorrowExpression(
-                        slot=receiver,
-                        mode=mode,
-                        type_ref=borrowed,
-                        read_type=self._copy_type(borrowed),
-                        span=expression.span,
-                    )
             return self._call_expression(expression, scope)
         if type(expression) is FormattedStringExpression:
             return self._record_expression(
@@ -1800,6 +1787,36 @@ class HIRLoweringPass(SemanticPass):
         if source is not None:
             return self._record_expression(source, expr)
         return expr
+
+    def _maybe_uninit_expression(self, expression, scope, declaration):
+        receiver = self._expression(expression.callee.target, scope)
+        method_name = expression.callee.member
+        assert declaration.language_item_type is not None
+        element = self._copy_type(declaration.language_item_type)
+        if method_name == 'write':
+            value = self._expression(expression.parameters[0], scope)
+            if isinstance(value, HIRVariableExpression):
+                value = HIRMoveExpression(
+                    expr=value, type_ref=self._copy_type(value.type_ref),
+                    read_type=self._copy_type(value.read_type),
+                    span=expression.parameters[0].span,
+                )
+            return HIRMaybeUninitWriteExpression(
+                slot=receiver, value=value, type_ref=TypeReference('void'),
+                read_type=TypeReference('void'), span=expression.span,
+            )
+        if method_name == 'take':
+            return HIRMaybeUninitTakeExpression(
+                slot=receiver, type_ref=element, read_type=self._copy_type(element),
+                span=expression.span,
+            )
+        mode = 'in' if method_name == 'borrow' else 'inout'
+        borrowed = self._copy_type(element)
+        borrowed.borrow = mode
+        return HIRMaybeUninitBorrowExpression(
+            slot=receiver, mode=mode, type_ref=borrowed,
+            read_type=self._copy_type(borrowed), span=expression.span,
+        )
 
     def _call_expression(
         self, call: FunctionCall, scope: SemanticScope, *, record_source: bool = True
@@ -2222,7 +2239,12 @@ class HIRLoweringPass(SemanticPass):
             list(declaration.imports),
             list(declaration.qualified_imports),
         ):
-            yield
+            previous_unsafe_depth = self.unsafe_depth
+            self.unsafe_depth = int(declaration.unsafe)
+            try:
+                yield
+            finally:
+                self.unsafe_depth = previous_unsafe_depth
 
     @contextmanager
     def _method_context(
@@ -2233,7 +2255,12 @@ class HIRLoweringPass(SemanticPass):
             list(type_decl.imports),
             list(method.qualified_imports or type_decl.qualified_imports),
         ):
-            yield
+            previous_unsafe_depth = self.unsafe_depth
+            self.unsafe_depth = int(method.unsafe)
+            try:
+                yield
+            finally:
+                self.unsafe_depth = previous_unsafe_depth
 
     @contextmanager
     def _module_context(

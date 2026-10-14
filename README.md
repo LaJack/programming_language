@@ -247,11 +247,14 @@ context. Structural differential tests compare these trees with the Python
 parser. The self-hosted project pass loads imports, indexes declarations,
 builds lexical scopes, and resolves source names without executing comptime
 code. Independent tests compare its bindings with stage 0 and account for
-identifiers throughout the complete bootstrap graph. Type checking,
-specialization, and ownership validation remain in stage 0.
-See the
-[self-hosting documentation](selfhost/README.md) for APIs, syntax dumps, and
-measurements. The Python compiler remains stage 0.
+identifiers throughout the complete bootstrap graph. A separate type pass
+records canonical types, signatures, and concrete expression checks; generic,
+computed, and other unfinished checks remain explicit pending obligations.
+Specialization and ownership validation remain in stage 0.
+See the [self-hosting documentation](selfhost/README.md) for APIs and dumps, and
+the [checker guide](docs/selfhost-type-checking.md) for verified coverage,
+invariants, and fast versus acceptance test commands. The Python compiler
+remains stage 0.
 
 ## Development
 

@@ -251,7 +251,7 @@ def bootstrap_nodes(source, output):
         if kind == 'generic_type':
             return apply(name(text('name')), many('arguments'))
         if kind in {'borrow_type', 'raw_pointer_type', 'nullable_pointer_type'}:
-            mode = text('mode').replace('?', '').replace('*', '').replace('&', '').split()[0]
+            mode = node.values['access']
             target = one('target', name('self'))
             if kind == 'borrow_type':
                 return n('borrow_type', mode=mode, target=target)
@@ -318,7 +318,7 @@ def bootstrap_nodes(source, output):
         if kind == 'unary_expression':
             return n('unary', operator=text('operator'), operand=one('operand'))
         if kind == 'borrow_expression':
-            return n('borrow', mode=text('mode').replace('&', '').strip(), operand=one('operand'))
+            return n('borrow', mode=node.values['access'], operand=one('operand'))
         if kind in {'move_expression', 'dereference_expression'}:
             return n(kind.removesuffix('_expression'), operand=one('operand'))
         if kind == 'call_expression':

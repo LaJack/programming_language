@@ -2036,6 +2036,11 @@ class SemanticPass:
             receiver_type = self._expression_type(
                 call.callee.target, scope, check_reads=False
             )
+            declaration = self.types.get(self._type_name(self._element_type(receiver_type)))
+            if receiver_type.pointer_mode is None and declaration is not None and getattr(declaration, 'language_item', None) == 'MaybeUninit':
+                return self._validate_maybe_uninit_call(
+                    call, '', receiver_type, call.callee.member, declaration, scope
+                )
             if receiver_type.pointer_mode is not None:
                 if call.callee.member == 'offset':
                     if self.unsafe_depth == 0:
@@ -2406,9 +2411,9 @@ class SemanticPass:
                     BorrowAccess(BorrowPath('self'), return_type.borrow or 'in')
                 )
             return
-        if type(expression) is FunctionCall and '.' in expression.function_name:
-            receiver_name, method_name = expression.function_name.rsplit('.', 1)
-            receiver_type = self._resolve_name_type(receiver_name, scope)
+        if type(expression) is FunctionCall and isinstance(expression.callee, MemberExpression):
+            method_name = expression.callee.member
+            receiver_type = self._expression_type(expression.callee.target, scope, check_reads=False)
             receiver_decl = self._type_declaration_for(receiver_type)
             if (
                 getattr(receiver_decl, 'language_item', None) == 'MaybeUninit'
@@ -2560,6 +2565,14 @@ class SemanticPass:
     def _borrow_accesses_for_call_result(
         self, call: FunctionCall, expected_type: TypeReference, scope: SemanticScope
     ) -> tuple[BorrowAccess, ...]:
+        if isinstance(call.callee, MemberExpression):
+            receiver_type = self._expression_type(call.callee.target, scope, check_reads=False)
+            receiver_decl = self._type_declaration_for(receiver_type)
+            if (getattr(receiver_decl, 'language_item', None) == 'MaybeUninit'
+                    and call.callee.member in {'borrow', 'borrow_mut'}):
+                return self._place_accesses(
+                    call.callee.target, expected_type.borrow or 'in', scope
+                )
         target = self._borrow_return_call_target(call, scope)
         if target is None:
             return ()

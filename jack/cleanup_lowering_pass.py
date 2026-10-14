@@ -1596,7 +1596,8 @@ class HIRStaticCleanupLoweringPass:
                 return
             if is_dataclass(value):
                 for item in fields(value):
-                    if item.name != 'span':
+                    # Nested blocks lower their own moves on the paths that execute them.
+                    if item.name not in {'span', 'body', 'else_body'}:
                         visit(getattr(value, item.name))
 
         visit(statement)

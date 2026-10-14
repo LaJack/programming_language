@@ -1,4 +1,5 @@
 import io
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -6,12 +7,43 @@ from pathlib import Path
 
 from jack.c_emit_pass import CEmitError, CEmitPass, emit_c, emit_hir_c
 from jack.cleanup_lowering_pass import lower_hir_static_cleanups
+from jack.compiler_driver import CompilationOptions, CompilerDriver
 from jack.hir_lowering_pass import compile_to_hir
 from jack.parser import parse
 from jack.semantic_pass import SemanticError
 
 
 class CEmitPassTests(unittest.TestCase):
+    def test_optimized_error_propagation_preserves_moved_owner_drop_flags(self):
+        source = '''
+            i32 drops = 0;
+            struct Failure { }
+            struct Resource {
+                deinit(move self) { drops = drops + 1; }
+            }
+            void fail(move Resource value) raises Failure {
+                raise Failure { };
+            }
+            void run() {
+                Resource value;
+                try { fail(value); } catch Failure { }
+            }
+            run();
+            print(drops);
+        '''
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / 'main.jack'
+            entry.write_text(source)
+            output = Path(directory) / 'main'
+            driver = CompilerDriver(print_handler=None)
+            program = driver.backend_hir(entry)
+            self.assertIn('volatile bool jack_drop_', emit_hir_c(program))
+            driver.compile_executable(entry, CompilationOptions(
+                backend='c', optimization=2, output=output))
+            result = subprocess.run([output], capture_output=True, text=True, timeout=20)
+            self.assertEqual((0, 'drops = 1\n', ''),
+                             (result.returncode, result.stdout, result.stderr))
+
     def test_debug_emission_adds_source_line_directives_only_when_requested(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source_path = Path(tmpdir) / 'program.jack'

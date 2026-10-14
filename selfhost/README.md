@@ -213,7 +213,8 @@ rejected; pointer, borrow, and slice edges stop layout traversal. Layouts that
 depend on generic substitution remain pending. Nullable pointer returns that
 may depend on a branch refinement are also pending until flow-sensitive
 refinement is implemented. Field access works for known struct receivers;
-method calls and other receiver-dependent members still need fuller resolution.
+concrete inherent method calls are checked, while generic and other
+receiver-dependent members still need fuller resolution.
 Constructor resolution, interface coherence, comprehensive match checking,
 unsafe access, complete error propagation, and other expression forms remain
 unfinished.
@@ -221,6 +222,17 @@ Ownership dataflow, lifetime/alias validation, comptime execution,
 specialization, and HIR lowering are later passes. Status 1 means diagnosed
 errors, and 2 means invalid invocation. `--diagnostic-format stable` is
 available for machine-readable diagnostics.
+
+The checker now uses typed syntax qualifiers, direct file/node result indexes,
+symbol-indexed signatures, and a single contextual body traversal. Intrinsic
+expression results are reused; contextual conversions remain separate. Pending
+checks are deduplicated with the standard-library hash map while ordered vectors
+keep dumps deterministic. See [the rule matrix and development workflow](../docs/selfhost-type-checking.md)
+for verified coverage, pass invariants, and fast versus complete test commands.
+The complete bootstrap graph passes name analysis, but is not yet expected to
+pass `--check-types`: unfinished generic substitution and concrete type rules
+can still report type errors on valid stage-0 code. Consolidation does not claim
+completion of those rules.
 
 ## Verification And Measurements
 
@@ -241,20 +253,21 @@ semantic correctness or equivalence for every possible malformed input.
 
 `tests/test_bootstrap_analysis.py` compares source-level bindings against an
 independent stage-0 AST projection that reparses original files without running
-comptime. Its complete bootstrap-graph check matches 29,919 references by
+comptime. Its complete bootstrap-graph check matches 39,069 references by
 canonical declaration location, role, and UTF-8 byte span. An exhaustive syntax
-classification accounts for identifier tokens across all 22 loaded modules,
+classification accounts for identifier tokens across all 27 loaded modules,
 including formatted expressions; recovered invalid regions are classified
 individually. Focused cases test each deferral reason, poisoned dependencies,
 visibility, and comptime non-execution. Interpreter, C, and LLVM agree on
 focused valid and malformed project dumps at `-O0` and native `-O2`.
 
-In a local five-run LLVM `-O2` measurement, the graph contained 22 modules,
-64,340 syntax nodes, 5,585 symbols, and 35,359 occurrences, with no authoritative
-name errors. Median CPU times were 0.218 s loading, 0.037 s indexing, 0.062 s
-resolving, and 0.013 s validating; the separate compiler build took 78 s.
-Deferred occurrences included 4,399 receiver-dependent members, 16
-computed-type members, and 1,459 pattern variants. The corpus contains no
+In a local three-run LLVM `-O2` measurement, the graph contained 27 modules,
+83,010 syntax nodes, 7,262 symbols, and 46,148 occurrences, with no authoritative
+name errors. Median CPU times were 0.304 s loading, 0.056 s indexing, 0.088 s
+resolving, and 0.022 s validating; the separate compiler build took 91.5 s
+alongside acceptance work.
+Deferred occurrences included 6,133 receiver-dependent members, 16
+computed-type members, and 1,835 pattern variants. The corpus contains no
 generic-type or comptime-selection deferrals; focused fixtures verify both.
 These measurements are informational, not frozen counts or proof of type
 correctness. Neither `--check-names` nor `--check-types` executes comptime code.

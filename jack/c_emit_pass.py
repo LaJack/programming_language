@@ -1752,7 +1752,7 @@ class CEmitPass:
             target = self._mangle(symbol.name)
             source = self._emit_hir_expression(statement.initializer, env)
             lines = [
-                f'{self._emit_declaration(symbol.type_ref, target, env)} = {{0}};',
+                f'{self._emit_declaration(symbol.type_ref, target, env)} = {self._zero_value(symbol.type_ref)};',
                 f'__builtin_memmove({target}, {source}, sizeof({target}));',
             ]
             if statement.constructor_call is not None:
@@ -1764,8 +1764,11 @@ class CEmitPass:
             else self._zero_value(symbol.type_ref)
         )
         env[symbol.name] = symbol.type_ref
+        # Ownership flags changed after setjmp must survive error propagation.
+        qualifier = ('volatile ' if symbol.synthetic
+                     and symbol.name.startswith('jack_drop_') else '')
         lines = [
-            f'{self._emit_declaration(symbol.type_ref, self._mangle(symbol.name), env)} = {initializer};'
+            f'{qualifier}{self._emit_declaration(symbol.type_ref, self._mangle(symbol.name), env)} = {initializer};'
         ]
         if statement.constructor_call is not None:
             if self._hir_call_raises(statement.constructor_call):
@@ -2986,7 +2989,32 @@ class CEmitPass:
             return self._emit_type(declaration.language_item_type)
         return self._mangle(name)
 
+    def _needs_empty_initializer(self, type_ref: TypeReference, seen=None) -> bool:
+        if type_ref.borrow is not None or type_ref.pointer_mode is not None:
+            return False
+        if self._is_array_type(type_ref):
+            return (self._emit_array_size(type_ref.array_size) == '0'
+                    or self._needs_empty_initializer(self._element_type(type_ref), seen))
+        name = self._type_name(type_ref)
+        seen = set() if seen is None else seen
+        if name in seen:
+            return False
+        declaration = self.type_declarations.get(name)
+        if declaration is None:
+            return False
+        seen = seen | {name}
+        if getattr(declaration, 'language_item', None) == 'MaybeUninit':
+            return self._needs_empty_initializer(declaration.language_item_type, seen)
+        members = getattr(declaration, 'fields', ())
+        if not members:
+            return False
+        first = members[0]
+        member_type = first.type_ref if hasattr(first, 'type_ref') else first.type
+        return self._needs_empty_initializer(member_type, seen)
+
     def _zero_value(self, type_ref: TypeReference) -> str:
+        if self._needs_empty_initializer(type_ref):
+            return '{}'
         if self._is_array_type(type_ref):
             return '{0}'
         if self._is_slice_type(type_ref) or self._is_borrow_type(type_ref):
@@ -3024,7 +3052,8 @@ class CEmitPass:
             return '(jack_str){"", 0}'
         if self._is_void_type(type_ref):
             raise CEmitError('Cannot return a value for type "void".')
-        return f'({self._emit_type(type_ref)}){{0}}'
+        initializer = '{}' if self._needs_empty_initializer(type_ref) else '{0}'
+        return f'({self._emit_type(type_ref)}){initializer}'
 
     def _type_name(self, type_ref: TypeReference) -> str:
         if type_ref.arguments:

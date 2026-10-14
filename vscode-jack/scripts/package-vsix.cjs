@@ -8,7 +8,7 @@ const nodeOptions = `${existingNodeOptions} --require=${preload}`.trim();
 const executable = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const result = spawnSync(
   executable,
-  ['--yes', '@vscode/vsce', 'package', '--allow-missing-repository'],
+  ['--yes', '@vscode/vsce@2.32.0', 'package', '--no-dependencies', '--allow-missing-repository'],
   {
     cwd: path.join(__dirname, '..'),
     env: {

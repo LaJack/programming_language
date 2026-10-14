@@ -1,0 +1,83 @@
+import bootstrap.analysis;
+import bootstrap.modules;
+import bootstrap.project;
+import bootstrap.frontend;
+import bootstrap.syntax;
+import bootstrap.source;
+import bootstrap.diagnostics;
+import bootstrap.names;
+import bootstrap.types;
+import bootstrap.typing;
+import std.collections.arena;
+import std.collections.vector;
+import std.string;
+import std.memory;
+
+extern "c" i64 clock();
+
+void measure(str entry) raises {
+    ProjectOptions options = project_options();
+    options.add_module_root("selfhost"); options.add_module_root("jack");
+    DiagnosticBag diagnostics(usize(100));
+    ProjectBuilder builder = project_builder();
+    i64 start = clock();
+    load_module_graph_into(builder, entry, options, diagnostics);
+    i64 loaded = clock();
+    AnalysisState state = index_project(builder, diagnostics);
+    i64 indexed = clock();
+    resolve_project(builder, state, diagnostics);
+    validate_analysis(builder.project());
+    i64 resolved = clock();
+    TypeTables table = collect_project_types(builder, diagnostics);
+    i64 declared = clock();
+    check_project_bodies(builder, table, diagnostics);
+    i64 checked = clock();
+    validate_typed_tables(builder.project(), table);
+    i64 validated = clock();
+    usize source_bytes = usize(0);
+    usize nodes = usize(0);
+    usize module_index = usize(0);
+    while (module_index < builder.project().module_count()) {
+        ModuleId id = builder.project().module_at(module_index);
+        ParsedFileId file = builder.project().module_record(id).parsed_file();
+        &in ParsedFile parsed = builder.project().frontend().file(file);
+        source_bytes = source_bytes + builder.project().frontend().source_map().source_len(parsed.source_id());
+        nodes = nodes + parsed.node_count();
+        module_index = module_index + usize(1);
+    }
+    print(f"load_ticks\t{loaded - start}");
+    print(f"index_ticks\t{indexed - loaded}");
+    print(f"resolve_ticks\t{resolved - indexed}");
+    print(f"declare_ticks\t{declared - resolved}");
+    print(f"body_ticks\t{checked - declared}");
+    print(f"validate_ticks\t{validated - checked}");
+    print(f"source_bytes\t{source_bytes}");
+    print(f"modules\t{builder.project().module_count()}");
+    print(f"nodes\t{nodes}");
+    print(f"types\t{table.type_count()}");
+    print(f"signatures\t{table.signature_count()}");
+    print(f"results\t{table.occurrence_count()}");
+    print(f"obligations\t{table.pending_count()}");
+    print(f"conversions\t{table.conversion_count()}");
+    print(f"expression_checks\t{table.expression_check_count()}");
+    print(f"expression_requests\t{table.expression_request_count()}");
+    usize errors = usize(0);
+    if (builder.project().has_errors()) { errors = usize(1); }
+    print(f"errors\t{errors}");
+}
+
+i32 main(&in str[] arguments) {
+    if (usize(len(arguments)) != usize(2)) { return 2; }
+    try { measure(arguments[1]); return 0; }
+    catch CapacityError { return 1; }
+    catch LayoutError { return 1; }
+    catch AllocationError { return 1; }
+    catch BoundsError { return 1; }
+    catch SourceMapError { return 1; }
+    catch ArenaHandleError { return 1; }
+    catch SyntaxValidationError { return 1; }
+    catch FrontendReferenceError { return 1; }
+    catch ProjectReferenceError { return 1; }
+    catch NameReferenceError { return 1; }
+    catch Utf8Error { return 1; }
+}

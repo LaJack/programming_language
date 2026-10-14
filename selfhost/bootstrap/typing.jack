@@ -37,27 +37,17 @@ NodeRef linked_child(&in FrontendProject project, NodeRef owner, NodeLink link)
     }
 }
 
-TypeAccess access_for(&in FrontendProject project, NodeRef node, SourceSpan mode)
-    raises FrontendReferenceError, BoundsError, SourceMapError {
-    &in ParsedFile file = project.frontend().file(node.file_id());
-    usize index = usize(0);
-    while (index < file.token_count()) {
-        SourceSpan token = file.token(index).source_location();
-        if (token.start_offset() >= mode.start_offset()
-            && token.end_offset() <= mode.end_offset()) {
-            if (project.frontend().source_map().text_equals(token, "in")) {
-                return TypeAccess.read;
-            }
-            if (project.frontend().source_map().text_equals(token, "out")) {
-                return TypeAccess.write;
-            }
-            if (project.frontend().source_map().text_equals(token, "inout")) {
-                return TypeAccess.read_write;
-            }
-        }
-        index = index + usize(1);
-    }
-    return TypeAccess.read_write;
+TypeAccess access_for(SyntaxQualifier qualifier) raises ProjectReferenceError {
+    SyntaxAccess access = qualifier.access_mode();
+    return match (&in access) {
+        .read => TypeAccess.read, .write => TypeAccess.write,
+        .read_write => TypeAccess.read_write,
+        .invalid => invalid_access(),
+    };
+}
+
+TypeAccess invalid_access() raises ProjectReferenceError {
+    raise ProjectReferenceError { };
 }
 
 bool is_type_syntax(SyntaxKind kind) {
@@ -184,11 +174,11 @@ TypeResult resolve_type(&inout ProjectBuilder builder, &inout TypeTables table,
         .slice_type(element) => wrap_type(builder, table, diagnostics, node,
             element, usize(1), TypeAccess.read),
         .borrow_type(mode, element) => wrap_type(builder, table, diagnostics, node,
-            element, usize(2), access_for(builder.project(), node, mode)),
+            element, usize(2), access_for(mode)),
         .raw_pointer_type(mode, element) => wrap_type(builder, table, diagnostics, node,
-            element, usize(3), access_for(builder.project(), node, mode)),
+            element, usize(3), access_for(mode)),
         .nullable_pointer_type(mode, element) => wrap_type(builder, table, diagnostics, node,
-            element, usize(4), access_for(builder.project(), node, mode)),
+            element, usize(4), access_for(mode)),
         .invalid_type => TypeResult.deferred(TypeDeferred.dependent_expression),
         _ => type_failure(builder, diagnostics,
             builder.project().frontend().node(node).source_span(),
@@ -232,7 +222,8 @@ TypeResult resolve_parameter_type(&inout ProjectBuilder builder,
     SymbolId parameter = builder.project().declaration_symbol(node);
     NameId name = builder.project().symbol(parameter).symbol_name();
     if (builder.project().name(name) == "self") {
-        SymbolLink function_owner = builder.project().symbol(parameter).symbol_owner();
+        ScopeId parameter_scope = builder.project().symbol(parameter).lexical_scope();
+        SymbolLink function_owner = builder.project().scope(parameter_scope).symbol_owner();
         match (&in function_owner) {
             .present(function_symbol) {
                 SymbolLink type_owner = builder.project().symbol(function_symbol).symbol_owner();
@@ -251,7 +242,7 @@ TypeResult resolve_parameter_type(&inout ProjectBuilder builder,
                                         .borrow_type(mode, _) {
                                             TypeResult result = TypeResult.known(table.intern(
                                                 TypeShape.borrow(type_id,
-                                                    access_for(builder.project(), type_node, mode))));
+                                                    access_for(mode))));
                                             finish_type(table, type_node, result);
                                             return result;
                                         }
@@ -282,6 +273,11 @@ ReferenceStatus callable_status(&inout ProjectBuilder builder,
     raises CapacityError, LayoutError, AllocationError, BoundsError,
         ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
         NameReferenceError {
+    SymbolLink cached = table.target_for(node);
+    match (&in cached) {
+        .present(symbol) { return ReferenceStatus.resolved(symbol); }
+        .none { }
+    }
     SyntaxData data = builder.project().frontend().node(node).payload();
     match (&in data) {
         .parenthesized_expression(inner) {
@@ -291,7 +287,10 @@ ReferenceStatus callable_status(&inout ProjectBuilder builder,
         .member_expression(name, receiver_link) {
             ReferenceStatus existing = builder.project().latest_status_for(node);
             match (&in existing) {
-                .resolved(symbol) { return ReferenceStatus.resolved(symbol); }
+                .resolved(symbol) {
+                    table.record_target(node, symbol);
+                    return ReferenceStatus.resolved(symbol);
+                }
                 .invalid(cause) { return ReferenceStatus.invalid(cause); }
                 .deferred(_) { }
             }
@@ -313,6 +312,7 @@ ReferenceStatus callable_status(&inout ProjectBuilder builder,
                                     SymbolId symbol = member.member_symbol();
                                     if (builder.project().frontend().source_map().text_equals(name,
                                         builder.project().name(builder.project().symbol(symbol).symbol_name()))) {
+                                        table.record_target(node, symbol);
                                         return ReferenceStatus.resolved(symbol);
                                     }
                                 }
@@ -327,7 +327,14 @@ ReferenceStatus callable_status(&inout ProjectBuilder builder,
             }
             return existing;
         }
-        _ { return builder.project().latest_status_for(node); }
+        _ {
+            ReferenceStatus status = builder.project().latest_status_for(node);
+            match (&in status) {
+                .resolved(symbol) { table.record_target(node, symbol); }
+                _ { }
+            }
+            return status;
+        }
     }
 }
 
@@ -419,6 +426,14 @@ TypeResult resolve_generic(&inout ProjectBuilder builder, &inout TypeTables tabl
     raises CapacityError, LayoutError, AllocationError, BoundsError,
         ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error {
     ReferenceStatus status = builder.project().latest_status_for(node);
+    return resolve_generic_status(builder, table, diagnostics, node, arguments, status);
+}
+
+TypeResult resolve_generic_status(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, ChildRange arguments,
+    ReferenceStatus status)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error {
     match (&in status) {
         .resolved(symbol) {
             SymbolKind base_kind = builder.project().symbol(symbol).symbol_kind();
@@ -513,7 +528,9 @@ TypeResult resolve_generic(&inout ProjectBuilder builder, &inout TypeTables tabl
 }
 
 bool is_expression_syntax(SyntaxKind kind) {
-    return kind == SyntaxKind.name_expression
+    return kind == SyntaxKind.invalid_expression
+        || kind == SyntaxKind.match_expression
+        || kind == SyntaxKind.name_expression
         || kind == SyntaxKind.integer_literal
         || kind == SyntaxKind.floating_literal
         || kind == SyntaxKind.string_literal
@@ -547,6 +564,18 @@ TypeResult infer_expression(&inout ProjectBuilder builder, &inout TypeTables tab
     raises CapacityError, LayoutError, AllocationError, BoundsError,
         ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
         NameReferenceError {
+    table.requested_expression();
+    if (table.has_result(node) == false) {
+        infer_expression_tree(builder, table, diagnostics, node);
+    }
+    return table.result_for(node);
+}
+
+TypeResult infer_expression_inner(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
     SyntaxData data = builder.project().frontend().node(node).payload();
     match (&in data) {
         .integer_literal(_) { return primitive_result(builder, table, "i32"); }
@@ -572,10 +601,7 @@ TypeResult infer_expression(&inout ProjectBuilder builder, &inout TypeTables tab
                         || kind == SymbolKind.match_binding) {
                         match (&in origin) {
                             .source(declaration, _) {
-                                try { return table.result_for(declaration); }
-                                catch ProjectReferenceError {
-                                    return TypeResult.deferred(TypeDeferred.generic_body);
-                                }
+                                return table.result_for(declaration);
                             }
                             .builtin { }
                         }
@@ -625,23 +651,27 @@ TypeResult infer_expression(&inout ProjectBuilder builder, &inout TypeTables tab
                 .invalid(cause) { return TypeResult.invalid(cause); }
             }
         }
-        .call_expression(callee, _) {
+        .call_expression(callee, arguments) {
             NodeRef target = linked_child(builder.project(), node, callee);
             ReferenceStatus status = callable_status(builder, table, diagnostics, target);
             match (&in status) {
                 .resolved(symbol) {
+                    table.record_target(node, symbol);
                     SymbolKind kind = builder.project().symbol(symbol).symbol_kind();
                     if (kind == SymbolKind.builtin_type || kind == SymbolKind.structure
                         || kind == SymbolKind.sum_type || kind == SymbolKind.view_type) {
-                        return resolve_named(builder, table, diagnostics, target);
+                        if (generic_arity(builder.project(), symbol) > usize(0)) {
+                            return resolve_generic_status(builder, table, diagnostics,
+                                node, arguments, status);
+                        }
+                        return symbol_type(builder, table, diagnostics, target, symbol);
                     }
-                    try {
+                    if (table.has_signature(symbol)) {
                         SignatureId signature_id = table.signature_for(symbol);
                         &in SignatureRecord signature = table.signature(signature_id);
                         return signature.result_type();
-                    } catch ProjectReferenceError {
-                        return TypeResult.deferred(TypeDeferred.dependent_member);
                     }
+                    return TypeResult.deferred(TypeDeferred.dependent_member);
                 }
                 .deferred(reason) { return TypeResult.deferred(TypeDeferred.dependent_member); }
                 .invalid(cause) { return TypeResult.invalid(cause); }
@@ -652,7 +682,7 @@ TypeResult infer_expression(&inout ProjectBuilder builder, &inout TypeTables tab
             if (is_type_syntax(builder.project().frontend().node(type_node).kind())) {
                 return resolve_type(builder, table, diagnostics, type_node);
             }
-            return resolve_named(builder, table, diagnostics, type_node);
+            return infer_expression(builder, table, diagnostics, type_node);
         }
         .index_expression(target, _) {
             TypeResult target_type = infer_expression(builder, table, diagnostics,
@@ -708,6 +738,7 @@ TypeResult infer_expression(&inout ProjectBuilder builder, &inout TypeTables tab
                                     }
                                     if (builder.project().frontend().source_map().text_equals(
                                         member_span, builder.project().name(member_name))) {
+                                        table.record_target(node, member.member_symbol());
                                         if (member_kind == SymbolKind.field) {
                                             match (&in member_origin) {
                                                 .source(field_node, _) {
@@ -753,7 +784,7 @@ TypeResult infer_expression(&inout ProjectBuilder builder, &inout TypeTables tab
             match (&in inner) {
                 .known(id) {
                     return TypeResult.known(table.intern(TypeShape.borrow(
-                        id, access_for(builder.project(), node, mode))));
+                        id, access_for(mode))));
                 }
                 .deferred(reason) { return TypeResult.deferred(reason); }
                 .invalid(cause) { return TypeResult.invalid(cause); }
@@ -775,6 +806,9 @@ TypeResult infer_expression(&inout ProjectBuilder builder, &inout TypeTables tab
                 .invalid(cause) { return TypeResult.invalid(cause); }
             }
         }
+        .match_expression(_, _) {
+            return TypeResult.deferred(TypeDeferred.dependent_match);
+        }
         .union_variant_expression(_, _) {
             return TypeResult.deferred(TypeDeferred.dependent_match);
         }
@@ -787,6 +821,11 @@ void infer_expression_tree(&inout ProjectBuilder builder, &inout TypeTables tabl
     raises CapacityError, LayoutError, AllocationError, BoundsError,
         ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
         NameReferenceError {
+    if (is_expression_syntax(builder.project().frontend().node(node).kind())) {
+        table.requested_expression();
+    }
+    if (is_expression_syntax(builder.project().frontend().node(node).kind())
+        && table.has_result(node)) { return; }
     bool include = true;
     TypeCategory category = TypeCategory.value;
     bool writable = false;
@@ -821,7 +860,8 @@ void infer_expression_tree(&inout ProjectBuilder builder, &inout TypeTables tabl
                         if (kind == SymbolKind.builtin_type || kind == SymbolKind.structure
                             || kind == SymbolKind.sum_type || kind == SymbolKind.view_type
                             || kind == SymbolKind.interface_type
-                            || kind == SymbolKind.self_type) {
+                            || kind == SymbolKind.self_type || kind == SymbolKind.type_parameter
+                            || kind == SymbolKind.computed_type) {
                             category = TypeCategory.type_name;
                         } else {
                             include = false;
@@ -847,10 +887,11 @@ void infer_expression_tree(&inout ProjectBuilder builder, &inout TypeTables tabl
             if (category == TypeCategory.type_name) {
                 result = resolve_named(builder, table, diagnostics, node);
             } else {
-                result = infer_expression(builder, table, diagnostics, node);
+                result = infer_expression_inner(builder, table, diagnostics, node);
             }
         }
         table.record_category(node, result, category, writable);
+        table.checked_expression();
     }
     usize children;
     {
@@ -975,6 +1016,14 @@ void collect_declaration(&inout ProjectBuilder builder, &inout TypeTables table,
                 validate_storage_type(builder, table, diagnostics, node, result),
                 true, false);
         }
+        .catch_clause(_, declared_type, _) {
+            TypeResult result = resolve_type(builder, table, diagnostics,
+                linked_child(builder.project(), node, declared_type));
+            table.record(node, result, true, true);
+        }
+        .binding_pattern(_) {
+            table.record(node, TypeResult.deferred(TypeDeferred.dependent_match), true, true);
+        }
         _ { }
     }
     usize index = usize(0);
@@ -985,9 +1034,7 @@ void collect_declaration(&inout ProjectBuilder builder, &inout TypeTables table,
     }
     while (index < children) {
         NodeRef child = builder.project().frontend().child(node, index);
-        if (is_type_syntax(builder.project().frontend().node(child).kind()) == false) {
-            collect_declaration(builder, table, diagnostics, child);
-        }
+        collect_declaration(builder, table, diagnostics, child);
         index = index + usize(1);
     }
 }
@@ -1431,11 +1478,9 @@ void validate_stored_layouts(&inout ProjectBuilder builder,
             || declaration_kind == SyntaxKind.field_declaration
             || declaration_kind == SyntaxKind.parameter
             || declaration_kind == SyntaxKind.constant_declaration) {
-            TypeResult result;
-            bool has_type = true;
-            try { result = table.result_for(declaration_node); }
-            catch ProjectReferenceError { has_type = false; }
+            bool has_type = table.has_result(declaration_node);
             if (has_type) {
+                TypeResult result = table.result_for(declaration_node);
                 match (&in result) {
                     .known(id) {
                         visit_stored_layout(builder, table, diagnostics, marks,
@@ -1461,9 +1506,8 @@ void validate_call_types(&inout ProjectBuilder builder, &inout TypeTables table,
             ReferenceStatus status = callable_status(builder, table, diagnostics, callee_node);
             match (&in status) {
                 .resolved(symbol) {
-                    SignatureId signature_id;
-                    try { signature_id = table.signature_for(symbol); }
-                    catch ProjectReferenceError { return; }
+                    if (table.has_signature(symbol) == false) { return; }
+                    SignatureId signature_id = table.signature_for(symbol);
                     SignatureRecord signature = table.signature(signature_id);
                     usize parameter_count = signature.parameter_count();
                     usize parameter_offset = usize(0);
@@ -1514,17 +1558,6 @@ void validate_call_types(&inout ProjectBuilder builder, &inout TypeTables table,
         }
         _ { }
     }
-    usize children;
-    {
-        &in SyntaxNode syntax = builder.project().frontend().node(node);
-        children = child_count(syntax);
-    }
-    usize child_index = usize(0);
-    while (child_index < children) {
-        validate_call_types(builder, table, diagnostics,
-            builder.project().frontend().child(node, child_index));
-        child_index = child_index + usize(1);
-    }
 }
 
 void check_call_argument(&inout ProjectBuilder builder, &inout TypeTables table,
@@ -1537,6 +1570,8 @@ void check_call_argument(&inout ProjectBuilder builder, &inout TypeTables table,
         .known(expected_id) {
             match (&in actual) {
                 .known(actual_id) {
+                    if (table.category_for(argument) == TypeCategory.type_name
+                        && is_primitive_type(builder, table, expected_id, "type")) { return; }
                     TypeShape shape = table.shape(expected_id);
                     match (&in shape) {
                         .borrow(element, access) {
@@ -1570,6 +1605,8 @@ void check_call_argument(&inout ProjectBuilder builder, &inout TypeTables table,
                         }
                         record_check_error(builder, table, diagnostics,
                             argument, TypeCheckKind.call, code, message);
+                    } else {
+                        table.add_conversion(argument, actual_id, expected_id, TypeCheckKind.call);
                     }
                 }
                 .deferred(reason) {
@@ -1618,6 +1655,9 @@ void validate_initializer_value(&inout ProjectBuilder builder,
                                     }
                                     _ { }
                                 }
+                            } else {
+                                table.add_conversion(value, actual_id, expected_id,
+                                    TypeCheckKind.initializer);
                             }
                         }
                         .deferred(reason) {
@@ -1654,17 +1694,6 @@ void validate_initializer_types(&inout ProjectBuilder builder,
             validate_initializer_value(builder, table, diagnostics, node, initializer);
         }
         _ { }
-    }
-    usize index = usize(0);
-    usize children;
-    {
-        &in SyntaxNode syntax = builder.project().frontend().node(node);
-        children = child_count(syntax);
-    }
-    while (index < children) {
-        validate_initializer_types(builder, table, diagnostics,
-            builder.project().frontend().child(node, index));
-        index = index + usize(1);
     }
 }
 
@@ -1705,14 +1734,8 @@ void validate_binary_operator(&inout ProjectBuilder builder,
         .binary_expression(_, operation, left, right) {
             NodeRef left_node = linked_child(builder.project(), node, left);
             NodeRef right_node = linked_child(builder.project(), node, right);
-            TypeResult left_result;
-            TypeResult right_result;
-            bool known = true;
-            try {
-                left_result = table.result_for(left_node);
-                right_result = table.result_for(right_node);
-            } catch ProjectReferenceError { known = false; }
-            if (known == false) { return; }
+            TypeResult left_result = table.result_for(left_node);
+            TypeResult right_result = table.result_for(right_node);
             match (&in left_result) {
                 .known(left_id) {
                     match (&in right_result) {
@@ -1784,11 +1807,8 @@ void validate_integer_index(&inout ProjectBuilder builder, &inout TypeTables tab
         ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
         NameReferenceError {
     NodeRef value = linked_child(builder.project(), owner, index);
-    TypeResult result;
-    bool found = true;
-    try { result = table.result_for(value); }
-    catch ProjectReferenceError { found = false; }
-    if (found) {
+    TypeResult result = table.result_for(value);
+    {
         match (&in result) {
             .known(id) {
                 u32 family = primitive_family(builder, table, id);
@@ -1947,11 +1967,8 @@ void check_return_statement(&inout ProjectBuilder builder, &inout TypeTables tab
                             "void function cannot return a value");
                     } elif (has_value) {
                         NodeRef expression = linked_child(builder.project(), node, value);
-                        TypeResult actual;
-                        bool resolved = true;
-                        try { actual = table.result_for(expression); }
-                        catch ProjectReferenceError { resolved = false; }
-                        if (resolved) {
+                        TypeResult actual = table.result_for(expression);
+                        {
                             match (&in actual) {
                                 .known(actual_id) {
                                     if (nullable_pointer_requires_refinement(table,
@@ -1972,6 +1989,9 @@ void check_return_statement(&inout ProjectBuilder builder, &inout TypeTables tab
                                         record_check_error(builder, table, diagnostics,
                                             expression, TypeCheckKind.return_value,
                                             code, message);
+                                    } else {
+                                        table.add_conversion(expression, actual_id, expected_id,
+                                            TypeCheckKind.return_value);
                                     }
                                 }
                                 _ { }
@@ -1989,9 +2009,19 @@ void check_return_statement(&inout ProjectBuilder builder, &inout TypeTables tab
     }
 }
 
+pub union CheckingSignature { none; present(SignatureId id); }
+
+pub struct CheckingContext {
+    CheckingSignature signature;
+    TypeResult expected_return;
+    bool in_function;
+    bool unsafe_context;
+    bool generic_region;
+    bool comptime_region;
+}
+
 void validate_statement_types(&inout ProjectBuilder builder, &inout TypeTables table,
-    &inout DiagnosticBag diagnostics, NodeRef node, TypeResult expected_return,
-    bool in_function)
+    &inout DiagnosticBag diagnostics, NodeRef node, CheckingContext context)
     raises CapacityError, LayoutError, AllocationError, BoundsError,
         ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
         NameReferenceError {
@@ -2000,17 +2030,11 @@ void validate_statement_types(&inout ProjectBuilder builder, &inout TypeTables t
         .function_declaration(_, _, _, _, _, body) {
             match (&in body) {
                 .present(_) {
-                    SignatureId id;
-                    bool found = true;
-                    try { id = table.signature_for(
-                        builder.project().declaration_symbol(node)); }
-                    catch ProjectReferenceError { found = false; }
-                    if (found) {
+                    SignatureId id = table.signature_for(builder.project().declaration_symbol(node));
+                    {
                         SignatureRecord signature = table.signature(id);
                         TypeResult result_type = signature.result_type();
                         NodeRef body_node = linked_child(builder.project(), node, body);
-                        validate_statement_types(builder, table, diagnostics,
-                            body_node, result_type, true);
                         bool nonvoid = false;
                         match (&in result_type) {
                             .known(result_id) {
@@ -2038,7 +2062,7 @@ void validate_statement_types(&inout ProjectBuilder builder, &inout TypeTables t
         }
         .return_statement(_) {
             check_return_statement(builder, table, diagnostics, node,
-                expected_return, in_function);
+                context.expected_return, context.in_function);
         }
         .assignment_statement(target, value) {
             NodeRef target_node = linked_child(builder.project(), node, target);
@@ -2048,14 +2072,9 @@ void validate_statement_types(&inout ProjectBuilder builder, &inout TypeTables t
                     TypeCheckKind.assignment, "type.invalid-assignment-target",
                     "assignment target is not a writable place");
             } else {
-                TypeResult target_type;
-                TypeResult value_type;
-                bool resolved = true;
-                try {
-                    target_type = table.result_for(target_node);
-                    value_type = table.result_for(value_node);
-                } catch ProjectReferenceError { resolved = false; }
-                if (resolved) {
+                TypeResult target_type = table.result_for(target_node);
+                TypeResult value_type = table.result_for(value_node);
+                {
                     match (&in target_type) {
                         .known(expected_id) {
                             match (&in value_type) {
@@ -2072,6 +2091,9 @@ void validate_statement_types(&inout ProjectBuilder builder, &inout TypeTables t
                                         record_check_error(builder, table, diagnostics,
                                             value_node, TypeCheckKind.assignment,
                                             code, message);
+                                    } else {
+                                        table.add_conversion(value_node, actual_id, expected_id,
+                                            TypeCheckKind.assignment);
                                     }
                                 }
                                 _ { }
@@ -2105,11 +2127,8 @@ void validate_statement_types(&inout ProjectBuilder builder, &inout TypeTables t
         .unary_expression(_, operation, operand) {
             if (operation == SyntaxOperator.bit_not) {
                 NodeRef value = linked_child(builder.project(), node, operand);
-                TypeResult result;
-                bool found = true;
-                try { result = table.result_for(value); }
-                catch ProjectReferenceError { found = false; }
-                if (found) {
+                TypeResult result = table.result_for(value);
+                {
                     match (&in result) {
                         .known(id) {
                             u32 family = primitive_family(builder, table, id);
@@ -2140,18 +2159,49 @@ void validate_statement_types(&inout ProjectBuilder builder, &inout TypeTables t
         }
         _ { }
     }
-    usize children;
-    {
-        &in SyntaxNode syntax = builder.project().frontend().node(node);
-        children = child_count(syntax);
+}
+
+void check_body(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics, NodeRef node, CheckingContext context)
+    raises CapacityError, LayoutError, AllocationError, BoundsError,
+        ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
+        NameReferenceError {
+    SyntaxData data = builder.project().frontend().node(node).payload();
+    CheckingContext child_context = context;
+    match (&in data) {
+        .function_declaration(_, modifiers, _, _, _, _) {
+            SignatureId signature = table.signature_for(builder.project().declaration_symbol(node));
+            child_context.signature = CheckingSignature.present(signature);
+            child_context.expected_return = table.signature(signature).result_type();
+            child_context.in_function = true;
+            child_context.unsafe_context = modifiers.unsafe_flag();
+            child_context.comptime_region = modifiers.comptime_flag();
+            usize parameter = usize(0);
+            while (parameter < table.signature(signature).parameter_count()) {
+                if (table.parameter(signature, parameter).is_comptime()) {
+                    child_context.generic_region = true;
+                }
+                parameter = parameter + usize(1);
+            }
+        }
+        .unsafe_block(_) { child_context.unsafe_context = true; }
+        .comptime_statement(_) { child_context.comptime_region = true; }
+        _ { }
     }
+    usize children;
+    { &in SyntaxNode syntax = builder.project().frontend().node(node); children = child_count(syntax); }
     usize index = usize(0);
     while (index < children) {
-        validate_statement_types(builder, table, diagnostics,
-            builder.project().frontend().child(node, index),
-            expected_return, in_function);
+        check_body(builder, table, diagnostics,
+            builder.project().frontend().child(node, index), child_context);
         index = index + usize(1);
     }
+    if (is_expression_syntax(builder.project().frontend().node(node).kind())) {
+        infer_expression_tree(builder, table, diagnostics, node);
+    }
+    validate_call_types(builder, table, diagnostics, node);
+    validate_initializer_types(builder, table, diagnostics, node);
+    validate_statement_types(builder, table, diagnostics, node, context);
 }
 
 void validate_boolean_condition(&inout ProjectBuilder builder,
@@ -2161,11 +2211,8 @@ void validate_boolean_condition(&inout ProjectBuilder builder,
         ProjectReferenceError, FrontendReferenceError, SourceMapError, Utf8Error,
         NameReferenceError {
     NodeRef value = linked_child(builder.project(), owner, condition);
-    TypeResult result;
-    bool resolved = true;
-    try { result = table.result_for(value); }
-    catch ProjectReferenceError { resolved = false; }
-    if (resolved) {
+    TypeResult result = table.result_for(value);
+    {
         match (&in result) {
             .known(id) {
                 if (is_boolean_type(builder, table, id) == false) {
@@ -2182,17 +2229,12 @@ void validate_boolean_condition(&inout ProjectBuilder builder,
     }
 }
 
-pub TypedProject analyze_typed_project(str entry, &in ProjectOptions options,
+pub TypeTables collect_project_types(&inout ProjectBuilder builder,
     &inout DiagnosticBag diagnostics)
     raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
-        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
-        ProjectReferenceError, NameReferenceError, Utf8Error {
-    ProjectBuilder builder = project_builder();
-    load_module_graph_into(builder, entry, options, diagnostics);
-    AnalysisState state = index_project(builder, diagnostics);
-    resolve_project(builder, state, diagnostics);
-    validate_analysis(builder.project());
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
     TypeTables table = type_tables(builder.project().identity_value());
+    table.prepare(builder.project());
     usize module_index = usize(0);
     while (module_index < builder.project().module_count()) {
         ModuleId module_id = builder.project().module_at(module_index);
@@ -2206,35 +2248,47 @@ pub TypedProject analyze_typed_project(str entry, &in ProjectOptions options,
         module_index = module_index + usize(1);
     }
     validate_stored_layouts(builder, table, diagnostics);
-    module_index = usize(0);
+    return table;
+}
+
+pub void check_project_bodies(&inout ProjectBuilder builder, &inout TypeTables table,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        FrontendReferenceError, ProjectReferenceError, NameReferenceError, Utf8Error {
+    table.enter_bodies(builder.project().identity_value());
+    CheckingContext context = CheckingContext {
+        signature = CheckingSignature.none,
+        expected_return = TypeResult.deferred(TypeDeferred.generic_body),
+        in_function = false, unsafe_context = false,
+        generic_region = false, comptime_region = false
+    };
+    usize module_index = usize(0);
     while (module_index < builder.project().module_count()) {
         ModuleId module_id = builder.project().module_at(module_index);
         ParsedFileId file = builder.project().module_record(module_id).parsed_file();
         usize root_index = usize(0);
         while (root_index < builder.project().frontend().file(file).root_count()) {
-            infer_expression_tree(builder, table, diagnostics,
-                builder.project().frontend().root(file, root_index));
+            check_body(builder, table, diagnostics,
+                builder.project().frontend().root(file, root_index), context);
             root_index = root_index + usize(1);
         }
         module_index = module_index + usize(1);
     }
-    module_index = usize(0);
-    while (module_index < builder.project().module_count()) {
-        ModuleId module_id = builder.project().module_at(module_index);
-        ParsedFileId file = builder.project().module_record(module_id).parsed_file();
-        usize root_index = usize(0);
-        while (root_index < builder.project().frontend().file(file).root_count()) {
-            validate_call_types(builder, table, diagnostics,
-                builder.project().frontend().root(file, root_index));
-            validate_statement_types(builder, table, diagnostics,
-                builder.project().frontend().root(file, root_index),
-                TypeResult.deferred(TypeDeferred.generic_body), false);
-            validate_initializer_types(builder, table, diagnostics,
-                builder.project().frontend().root(file, root_index));
-            root_index = root_index + usize(1);
-        }
-        module_index = module_index + usize(1);
-    }
+    table.finish_bodies(builder.project().identity_value());
+}
+
+pub TypedProject analyze_typed_project(str entry, &in ProjectOptions options,
+    &inout DiagnosticBag diagnostics)
+    raises CapacityError, LayoutError, AllocationError, BoundsError, SourceMapError,
+        ArenaHandleError, SyntaxValidationError, FrontendReferenceError,
+        ProjectReferenceError, NameReferenceError, Utf8Error {
+    ProjectBuilder builder = project_builder();
+    load_module_graph_into(builder, entry, options, diagnostics);
+    AnalysisState state = index_project(builder, diagnostics);
+    resolve_project(builder, state, diagnostics);
+    validate_analysis(builder.project());
+    TypeTables table = collect_project_types(builder, diagnostics);
+    check_project_bodies(builder, table, diagnostics);
     FrontendProject project = finish_project(builder);
     return finish_typed_project(project, table);
 }
